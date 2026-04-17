@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
@@ -35,10 +35,85 @@ impl PathPolicy {
 }
 
 pub fn validate_repo_path(
-    _path: impl AsRef<Path>,
-    _policy: &PathPolicy,
+    path: impl AsRef<Path>,
+    policy: &PathPolicy,
 ) -> Result<PathBuf, PathValidationError> {
-    todo!("RED: implemented after tests")
+    let path = path.as_ref();
+    let display = path.display().to_string();
+
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(PathValidationError::Traversal { path: display });
+    }
+
+    reject_symlink_components(path)?;
+
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| PathValidationError::DoesNotExist {
+            path: path.display().to_string(),
+        })?;
+
+    for root in forbidden_roots(policy) {
+        if canonical == root || canonical.starts_with(&root) {
+            return Err(PathValidationError::ForbiddenRoot {
+                path: canonical.display().to_string(),
+                root: root.display().to_string(),
+            });
+        }
+    }
+
+    let home = policy
+        .home
+        .canonicalize()
+        .unwrap_or_else(|_| policy.home.clone());
+    if !policy.allow_outside_home && !canonical.starts_with(&home) {
+        return Err(PathValidationError::OutsideHome {
+            path: canonical.display().to_string(),
+        });
+    }
+
+    Ok(canonical)
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), PathValidationError> {
+    let mut current = PathBuf::new();
+
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if let Ok(meta) = std::fs::symlink_metadata(&current) {
+            if meta.file_type().is_symlink() {
+                return Err(PathValidationError::Symlink {
+                    path: current.display().to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn forbidden_roots(policy: &PathPolicy) -> Vec<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from("/etc"),
+        PathBuf::from("/root"),
+        PathBuf::from("/proc"),
+        PathBuf::from("/sys"),
+        PathBuf::from("/dev"),
+        policy.home.join(".ssh"),
+        policy.home.join(".gnupg"),
+        policy.agent_bus_dir.clone(),
+    ];
+
+    for root in &mut roots {
+        if let Ok(canonical) = root.canonicalize() {
+            *root = canonical;
+        }
+    }
+
+    roots
 }
 
 #[cfg(test)]

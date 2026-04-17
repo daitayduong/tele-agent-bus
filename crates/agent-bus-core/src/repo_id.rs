@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -12,8 +13,45 @@ pub enum RepoIdError {
     },
 }
 
-pub fn compute_repo_id(_display_slug: &str, _path: impl AsRef<Path>) -> Result<String, RepoIdError> {
-    todo!("RED: implemented after tests")
+pub fn compute_repo_id(display_slug: &str, path: impl AsRef<Path>) -> Result<String, RepoIdError> {
+    let path_ref = path.as_ref();
+    let canonical = path_ref
+        .canonicalize()
+        .map_err(|source| RepoIdError::Canonicalize {
+            path: path_ref.display().to_string(),
+            source,
+        })?;
+    let slug = slugify(display_slug);
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let hash = hex::encode(digest);
+
+    Ok(format!("{slug}_{}", &hash[..8]))
+}
+
+fn slugify(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+
+    for byte in input.bytes() {
+        let ch = byte.to_ascii_lowercase() as char;
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+
+    while out.ends_with('-') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        "repo".to_string()
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]

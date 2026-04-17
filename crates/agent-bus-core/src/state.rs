@@ -81,7 +81,11 @@ impl Default for StateSnapshot {
     }
 }
 
-#[derive(Clone)]
+/// Handle to the state actor.
+///
+/// Invariant: this actor is the only code path that writes `state.json`.
+/// Callers send mutations through the channel; readers receive cloned snapshots.
+#[derive(Clone, Debug)]
 pub struct StateHandle {
     snapshot: Arc<RwLock<StateSnapshot>>,
     tx: mpsc::Sender<StateCmd>,
@@ -107,23 +111,175 @@ impl StateHandle {
 
     pub async fn set_default_repo(
         &self,
-        _chat_id: impl Into<String>,
-        _repo_id: impl Into<String>,
+        chat_id: impl Into<String>,
+        repo_id: impl Into<String>,
     ) -> Result<(), StateError> {
-        todo!("RED: implemented after tests")
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetDefaultRepo {
+                chat_id: chat_id.into(),
+                repo_id: repo_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
     }
 
     pub async fn upsert_pending_perm(
         &self,
-        _req_id: impl Into<String>,
-        _perm: PendingPerm,
+        req_id: impl Into<String>,
+        perm: PendingPerm,
     ) -> Result<(), StateError> {
-        todo!("RED: implemented after tests")
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::UpsertPendingPerm {
+                req_id: req_id.into(),
+                perm,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
     }
 }
 
-pub async fn spawn_state_actor(_path: PathBuf) -> Result<StateHandle, StateError> {
-    todo!("RED: implemented after tests")
+pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError> {
+    let state = load_state(&path)?;
+    let snapshot = Arc::new(RwLock::new(state.clone()));
+    let (tx, mut rx) = mpsc::channel(1000);
+    let actor_snapshot = Arc::clone(&snapshot);
+
+    tokio::spawn(async move {
+        let mut state = state;
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                StateCmd::SetDefaultRepo {
+                    chat_id,
+                    repo_id,
+                    reply,
+                } => {
+                    state.default_repo_by_chat.insert(chat_id, repo_id);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::UpsertPendingPerm {
+                    req_id,
+                    perm,
+                    reply,
+                } => {
+                    state.pending_perms.insert(req_id, perm);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    });
+
+    Ok(StateHandle { snapshot, tx })
+}
+
+async fn publish_and_flush(
+    snapshot: &Arc<RwLock<StateSnapshot>>,
+    path: &std::path::Path,
+    state: &StateSnapshot,
+) -> Result<(), StateError> {
+    {
+        let mut guard = snapshot.write().await;
+        *guard = state.clone();
+    }
+
+    atomic_write_state(path, state)
+}
+
+fn load_state(path: &std::path::Path) -> Result<StateSnapshot, StateError> {
+    let tmp = tmp_path(path);
+    if tmp.exists() {
+        std::fs::remove_file(&tmp).map_err(|source| StateError::Io {
+            path: tmp.display().to_string(),
+            source,
+        })?;
+    }
+
+    if !path.exists() {
+        return Ok(StateSnapshot::default());
+    }
+
+    let bytes = std::fs::read(path).map_err(|source| StateError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let state: StateSnapshot =
+        serde_json::from_slice(&bytes).map_err(|source| StateError::Json {
+            path: path.display().to_string(),
+            source,
+        })?;
+
+    if state.schema_version != STATE_SCHEMA_VERSION {
+        return Err(StateError::SchemaVersion {
+            expected: STATE_SCHEMA_VERSION,
+            actual: state.schema_version,
+        });
+    }
+
+    Ok(state)
+}
+
+fn atomic_write_state(path: &std::path::Path, state: &StateSnapshot) -> Result<(), StateError> {
+    let tmp = tmp_path(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| StateError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+
+    let bytes = serde_json::to_vec(state).map_err(|source| StateError::Json {
+        path: path.display().to_string(),
+        source,
+    })?;
+    {
+        let mut file = std::fs::File::create(&tmp).map_err(|source| StateError::Io {
+            path: tmp.display().to_string(),
+            source,
+        })?;
+        use std::io::Write;
+        file.write_all(&bytes).map_err(|source| StateError::Io {
+            path: tmp.display().to_string(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| StateError::Io {
+            path: tmp.display().to_string(),
+            source,
+        })?;
+    }
+
+    std::fs::rename(&tmp, path).map_err(|source| StateError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent).map_err(|source| StateError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+        dir.sync_all().map_err(|source| StateError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+
+    Ok(())
+}
+
+fn tmp_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension(
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some(extension) => format!("{extension}.tmp"),
+            None => "tmp".to_string(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -188,7 +344,11 @@ mod tests {
         let path = dir.path().join("state.json");
         let original = StateSnapshot::default();
         std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
-        std::fs::write(path.with_extension("json.tmp"), br#"{"schema_version":"partial""#).unwrap();
+        std::fs::write(
+            path.with_extension("json.tmp"),
+            br#"{"schema_version":"partial""#,
+        )
+        .unwrap();
 
         let handle = spawn_state_actor(path.clone()).await.unwrap();
         let snapshot = handle.snapshot().await;
