@@ -39,6 +39,7 @@ dependencies = [
  "agent-bus-proto",
  "anyhow",
  "hex",
+ "libc",
  "mockall",
  "regex",
  "serde",

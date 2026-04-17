@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 pub mod path_validate;
+pub mod peer_uid;
 pub mod redact;
 pub mod repo_id;
 pub mod state;
