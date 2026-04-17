@@ -19,6 +19,9 @@ pub struct PermCheckRequest {
     pub session_id: String,
     pub tool: String,
     pub command: String,
+    #[serde(default)]
+    pub repo_id: Option<String>,
+    #[serde(default)]
     pub repo_hint: Option<String>,
     pub timeout_ms: u64,
 }
@@ -99,6 +102,7 @@ mod tests {
             session_id: "sess-456".to_string(),
             tool: "Bash".to_string(),
             command: "ls".to_string(),
+            repo_id: Some("rallyup_a1b2c3d4".to_string()),
             repo_hint: Some("rallyup".to_string()),
             timeout_ms: 10000,
         };
@@ -132,7 +136,10 @@ mod tests {
 
     #[test]
     fn test_decision_serialization() {
-        assert_eq!(serde_json::to_value(Decision::Approve).unwrap(), json!("approve"));
+        assert_eq!(
+            serde_json::to_value(Decision::Approve).unwrap(),
+            json!("approve")
+        );
         assert_eq!(serde_json::to_value(Decision::Deny).unwrap(), json!("deny"));
     }
 

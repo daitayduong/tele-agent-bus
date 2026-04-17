@@ -36,6 +36,17 @@ where
     }
 }
 
+#[cfg(unix)]
+pub fn current_euid() -> u32 {
+    // SAFETY: `geteuid` takes no pointers and has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+pub fn current_euid() -> u32 {
+    0
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StdPeerUid;
 

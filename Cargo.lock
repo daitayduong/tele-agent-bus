@@ -53,11 +53,8 @@ dependencies = [
 name = "agent-bus-hook"
 version = "0.1.0"
 dependencies = [
- "agent-bus-proto",
- "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
 ]
 

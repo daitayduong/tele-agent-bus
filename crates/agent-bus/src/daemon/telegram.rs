@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
-use agent_bus_core::state::StateHandle;
+use agent_bus_core::state::{PendingPermStatus, StateHandle};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
 use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
@@ -71,7 +71,7 @@ pub trait BotClient: Send + Sync {
         chat_id: i64,
         text: String,
         keyboard: Option<InlineKeyboard>,
-    ) -> BoxFuture<'a, Result<(), TelegramError>>;
+    ) -> BoxFuture<'a, Result<MessageRef, TelegramError>>;
 
     fn edit_message_text<'a>(
         &'a self,
@@ -129,7 +129,8 @@ pub async fn handle_list_rp_command<B: BotClient + ?Sized>(
             .collect(),
     };
 
-    bot.send_message(chat_id, text, Some(keyboard)).await
+    bot.send_message(chat_id, text, Some(keyboard)).await?;
+    Ok(())
 }
 
 pub async fn handle_switch_rp_command<B: BotClient + ?Sized>(
@@ -153,7 +154,8 @@ pub async fn handle_switch_rp_command<B: BotClient + ?Sized>(
         format!("Default repo set to {}", repo.display),
         None,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 pub async fn handle_callback_switch<B: BotClient + ?Sized>(
@@ -203,7 +205,8 @@ pub async fn handle_current_command<B: BotClient + ?Sized>(
         Some(repo) => format!("Current default repo: {}", repo.display),
         None => "Current default repo: none".to_string(),
     };
-    bot.send_message(chat_id, text, None).await
+    bot.send_message(chat_id, text, None).await?;
+    Ok(())
 }
 
 pub async fn handle_text_command<B: BotClient + ?Sized>(
@@ -229,6 +232,86 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
         }
         _ => Ok(()),
     }
+}
+
+pub async fn send_perm_prompt<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    repo_id: &str,
+    perm_id: &str,
+    command_hash: &str,
+    matched_pattern: &str,
+) -> Result<Option<MessageRef>, TelegramError> {
+    let Some(chat_id) = config
+        .allowed_chats
+        .first()
+        .and_then(|chat| chat.parse::<i64>().ok())
+    else {
+        return Ok(None);
+    };
+
+    let repo = repo_by_id(config, repo_id)
+        .map(|repo| repo.display.as_str())
+        .unwrap_or(repo_id);
+    let text = format!(
+        "Permission requested\nRepo: {repo}\nCommand: {command_hash}\nMatched: {matched_pattern}"
+    );
+    let keyboard = InlineKeyboard {
+        rows: vec![vec![
+            ("Approve".to_string(), format!("perm:approve:{perm_id}")),
+            ("Deny".to_string(), format!("perm:deny:{perm_id}")),
+        ]],
+    };
+
+    bot.send_message(chat_id, text, Some(keyboard))
+        .await
+        .map(Some)
+}
+
+pub async fn handle_callback_perm<B: BotClient + ?Sized>(
+    bot: &B,
+    state: StateHandle,
+    registry: crate::daemon::perm::PendingPermRegistry,
+    message: MessageRef,
+    callback_id: String,
+    callback_data: String,
+    user_name: Option<String>,
+) -> Result<(), TelegramError> {
+    let (action, perm_id) = callback_data
+        .strip_prefix("perm:")
+        .and_then(|rest| rest.split_once(':'))
+        .ok_or_else(|| TelegramError::InvalidCallback(callback_data.clone()))?;
+
+    let (status, verdict, text) = match action {
+        "approve" => (
+            PendingPermStatus::Approved,
+            crate::daemon::perm::PermVerdict::Approve,
+            "Approved",
+        ),
+        "deny" => (
+            PendingPermStatus::Denied,
+            crate::daemon::perm::PermVerdict::Deny,
+            "Denied",
+        ),
+        _ => return Err(TelegramError::InvalidCallback(callback_data)),
+    };
+
+    registry.resolve(perm_id, verdict).await;
+    state.resolve_pending(perm_id.to_string(), status).await?;
+
+    let snapshot = state.snapshot().await;
+    if snapshot
+        .pending_perms
+        .get(perm_id)
+        .and_then(|perm| perm.message_id)
+        == Some(message.message_id)
+    {
+        let actor = user_name.unwrap_or_else(|| "user".to_string());
+        bot.edit_message_text(message, format!("{text} by @{actor}"))
+            .await?;
+    }
+
+    bot.answer_callback(callback_id, text.to_string()).await
 }
 
 fn is_allowed(config: &TelegramConfig, chat_id: i64) -> bool {
@@ -275,7 +358,7 @@ impl BotClient for MockBot {
         chat_id: i64,
         text: String,
         keyboard: Option<InlineKeyboard>,
-    ) -> BoxFuture<'a, Result<(), TelegramError>> {
+    ) -> BoxFuture<'a, Result<MessageRef, TelegramError>> {
         Box::pin(async move {
             self.sent
                 .lock()
@@ -285,7 +368,10 @@ impl BotClient for MockBot {
                     text,
                     keyboard,
                 });
-            Ok(())
+            Ok(MessageRef {
+                chat_id,
+                message_id: self.sent.lock().expect("mock bot lock poisoned").len() as i32,
+            })
         })
     }
 
@@ -335,7 +421,7 @@ impl BotClient for TeloxideBotClient {
         chat_id: i64,
         text: String,
         keyboard: Option<InlineKeyboard>,
-    ) -> BoxFuture<'a, Result<(), TelegramError>> {
+    ) -> BoxFuture<'a, Result<MessageRef, TelegramError>> {
         Box::pin(async move {
             let mut request = self.bot.send_message(ChatId(chat_id), text);
             if let Some(keyboard) = keyboard {
@@ -343,7 +429,10 @@ impl BotClient for TeloxideBotClient {
             }
             request
                 .await
-                .map(|_| ())
+                .map(|message| MessageRef {
+                    chat_id,
+                    message_id: message.id.0,
+                })
                 .map_err(|err| TelegramError::Send(err.to_string()))
         })
     }
@@ -398,6 +487,7 @@ pub async fn teloxide_callback_handler(
     query: teloxide::types::CallbackQuery,
     config: Arc<TelegramConfig>,
     state: StateHandle,
+    registry: crate::daemon::perm::PendingPermRegistry,
 ) -> ResponseResult<()> {
     let client = TeloxideBotClient::new(bot);
     let Some(data) = query.data else {
@@ -409,20 +499,42 @@ pub async fn teloxide_callback_handler(
     let chat = message.chat();
     let message_id = message.id();
 
-    handle_callback_switch(
-        &client,
-        &config,
-        state,
-        chat.id.0,
-        MessageRef {
-            chat_id: chat.id.0,
-            message_id: message_id.0,
-        },
-        query.id,
-        data,
-    )
-    .await
-    .map_err(to_teloxide_error)?;
+    if data.starts_with("switch:") {
+        handle_callback_switch(
+            &client,
+            &config,
+            state,
+            chat.id.0,
+            MessageRef {
+                chat_id: chat.id.0,
+                message_id: message_id.0,
+            },
+            query.id,
+            data,
+        )
+        .await
+        .map_err(to_teloxide_error)?;
+    } else if data.starts_with("perm:") {
+        let user_name = query
+            .from
+            .username
+            .clone()
+            .or_else(|| Some(query.from.id.0.to_string()));
+        handle_callback_perm(
+            &client,
+            state,
+            registry,
+            MessageRef {
+                chat_id: chat.id.0,
+                message_id: message_id.0,
+            },
+            query.id,
+            data,
+            user_name,
+        )
+        .await
+        .map_err(to_teloxide_error)?;
+    }
     Ok(())
 }
 
