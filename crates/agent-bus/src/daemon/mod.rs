@@ -1,4 +1,6 @@
+pub mod perm;
 pub mod telegram;
+pub mod uds;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +12,8 @@ use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::Dispatcher;
 use teloxide::types::Update;
 
-use self::telegram::{RepoEntry, TelegramConfig};
+use self::perm::{FsBlacklistLoader, PendingPermRegistry, PermService};
+use self::telegram::{RepoEntry, TelegramConfig, TeloxideBotClient};
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -43,18 +46,33 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         .context("failed to start state actor")?;
     let telegram_config = Arc::new(config.telegram);
     let bot = teloxide::Bot::new(config.bot_token);
+    let registry = PendingPermRegistry::default();
+    let bot_client: Arc<dyn telegram::BotClient> = Arc::new(TeloxideBotClient::new(bot.clone()));
+    let loader = Arc::new(FsBlacklistLoader::new(PathBuf::from(
+        "/etc/agent-bus/blacklist.conf",
+    )));
+    let perm = PermService::new(
+        state.clone(),
+        Arc::clone(&telegram_config),
+        bot_client,
+        loader,
+        registry.clone(),
+    );
+    let uds_server = uds::UdsServer::new(config.home.join("daemon.sock"), state.clone(), perm);
+    let uds_task = tokio::spawn(uds::run_uds_server(uds_server));
 
     let handler = teloxide::dptree::entry()
         .branch(Update::filter_message().endpoint(telegram::teloxide_message_handler))
         .branch(Update::filter_callback_query().endpoint(telegram::teloxide_callback_handler));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(teloxide::dptree::deps![telegram_config, state])
+        .dependencies(teloxide::dptree::deps![telegram_config, state, registry])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
         .await;
 
+    uds_task.abort();
     Ok(())
 }
 
@@ -109,12 +127,13 @@ mod tests {
     use std::path::Path;
 
     use super::telegram::{
-        handle_callback_switch, handle_current_command, handle_list_rp_command,
-        handle_switch_rp_command, InlineKeyboard, MessageRef, MockBot, RepoEntry, TelegramConfig,
+        handle_callback_perm, handle_callback_switch, handle_current_command,
+        handle_list_rp_command, handle_switch_rp_command, InlineKeyboard, MessageRef, MockBot,
+        RepoEntry, TelegramConfig,
     };
     use super::{load_daemon_config, DaemonConfig};
     use agent_bus_core::peer_uid::{verify_peer_uid, MockPeerUid};
-    use agent_bus_core::state::spawn_state_actor;
+    use agent_bus_core::state::{spawn_state_actor, PendingPerm, PendingPermStatus};
 
     fn config() -> TelegramConfig {
         TelegramConfig {
@@ -224,6 +243,57 @@ mod tests {
         );
         assert_eq!(bot.answered_callbacks(), vec!["cb-1".to_string()]);
         assert_eq!(bot.edited_messages()[0].text, "Default -> DocPrivy");
+    }
+
+    #[tokio::test]
+    async fn callback_perm_denies_pending_and_edits_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state
+            .insert_pending(PendingPerm {
+                id: "perm-1".to_string(),
+                repo_id: "rallyup_a1b2c3d4".to_string(),
+                command_hash: "sha256:abc".to_string(),
+                status: PendingPermStatus::Sent,
+                created_at: "2026-04-16T00:00:00Z".to_string(),
+                timeout_at: "2026-04-16T00:00:10Z".to_string(),
+                message_id: Some(42),
+            })
+            .await
+            .unwrap();
+        let registry = super::perm::PendingPermRegistry::default();
+        let rx = registry.insert("perm-1".to_string()).await;
+        let bot = MockBot::default();
+
+        handle_callback_perm(
+            &bot,
+            state.clone(),
+            registry,
+            MessageRef {
+                chat_id: 123,
+                message_id: 42,
+            },
+            "cb-perm".to_string(),
+            "perm:deny:perm-1".to_string(),
+            Some("alice".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rx.await.unwrap(), super::perm::PermVerdict::Deny);
+        assert_eq!(
+            state
+                .snapshot()
+                .await
+                .pending_perms
+                .get("perm-1")
+                .map(|perm| &perm.status),
+            Some(&PendingPermStatus::Denied)
+        );
+        assert_eq!(bot.edited_messages()[0].text, "Denied by @alice");
+        assert_eq!(bot.answered_callbacks(), vec!["cb-perm".to_string()]);
     }
 
     #[tokio::test]
