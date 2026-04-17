@@ -56,3 +56,9 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 mockall = "0.12"
 assert_cmd = "2"
 predicates = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = "z"
