@@ -31,6 +31,8 @@ hyper-util = { workspace = true }
 tower = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
+rand = { workspace = true }
+libc = { workspace = true }
 hex = { workspace = true }
 time = { workspace = true }
 

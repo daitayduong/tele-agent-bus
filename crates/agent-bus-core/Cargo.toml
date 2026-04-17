@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 agent-bus-proto = { path = "../agent-bus-proto" }
 serde = { workspace = true }
+hmac = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
