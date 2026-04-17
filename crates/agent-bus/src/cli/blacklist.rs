@@ -1,11 +1,11 @@
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use clap::{Args, Subcommand};
+use clap::Subcommand;
 use anyhow::{Result, Context, anyhow};
 use regex::Regex;
-use agent_bus_core::blacklist_integrity::{self, IntegrityError};
+use agent_bus_core::blacklist_integrity;
 use rand::{RngCore, thread_rng};
 use std::os::unix::fs::PermissionsExt;
 
