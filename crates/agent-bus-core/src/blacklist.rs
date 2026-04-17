@@ -20,6 +20,12 @@ pub struct Blacklist {
     regex_set: Option<RegexSet>,
 }
 
+impl Default for Blacklist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Blacklist {
     pub fn new() -> Self {
         Self {
