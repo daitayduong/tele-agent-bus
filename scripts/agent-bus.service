@@ -1,0 +1,13 @@
+[Unit]
+Description=tele-agent-bus daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agent-bus daemon
+Restart=on-failure
+RestartSec=5
+SupplementaryGroups=agent-bus
+
+[Install]
+WantedBy=default.target

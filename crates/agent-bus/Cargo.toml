@@ -1,41 +1,31 @@
 [package]
 name = "agent-bus"
-description = "tele-agent-bus daemon + CLI. Multi-agent orchestration over Telegram."
+description = "Daemon + CLI entry point. Orchestrates state and Telegram."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "agent-bus"
-path = "src/main.rs"
-
 [dependencies]
-tabled = { workspace = true }
-agent-bus-proto = { path = "../agent-bus-proto" }
 agent-bus-core = { path = "../agent-bus-core" }
+agent-bus-proto = { path = "../agent-bus-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-teloxide = { workspace = true }
 clap = { workspace = true }
-axum = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
-tower = { workspace = true }
+teloxide = { workspace = true }
 regex = { workspace = true }
-sha2 = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
 hex = { workspace = true }
-time = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
-mockall = { workspace = true }

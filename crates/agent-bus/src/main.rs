@@ -5,6 +5,7 @@ mod cli;
 mod daemon;
 
 use clap::{Parser, Subcommand};
+use crate::cli::blacklist::BlacklistCommands;
 
 #[derive(Parser)]
 #[command(name = "agent-bus")]
@@ -27,6 +28,11 @@ enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
+    },
+    /// Blacklist management
+    Blacklist {
+        #[command(subcommand)]
+        command: BlacklistCommands,
     },
     /// Start the agent-bus daemon
     Daemon,
@@ -64,6 +70,7 @@ fn main() -> anyhow::Result<()> {
             ConfigCommands::Show => cli::config::show()?,
             ConfigCommands::Validate => cli::config::validate()?,
         },
+        Commands::Blacklist { command } => cli::blacklist::handle(command)?,
         Commands::Daemon => {
             tracing_subscriber::fmt::init();
             let config = daemon::load_daemon_config()?;
