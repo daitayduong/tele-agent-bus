@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-bus-proto",
+    "crates/agent-bus-core",
+    "crates/agent-bus-hook",
+    "crates/agent-bus",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/daitayduong/tele-agent-bus"
+
+[workspace.dependencies]
+# Proto / serialization (shared by all crates)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+anyhow = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "fs", "signal", "sync", "process"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Telegram
+teloxide = { version = "0.13", default-features = false, features = ["rustls", "ctrlc_handler"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP/UDS server
+axum = { version = "0.7", default-features = false, features = ["json", "tokio"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.4"
+
+# Filesystem
+tempfile = "3"
+sha2 = "0.10"
+hex = "0.4"
+
+# Regex (blacklist matcher)
+regex = "1"
+
+# Time
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+# Testing
+mockall = "0.12"
+assert_cmd = "2"
+predicates = "3"
