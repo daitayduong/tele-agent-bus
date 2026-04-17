@@ -51,22 +51,22 @@ pub struct SessionState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingPermStatus {
-    Created,
+    Pending,
     Sent,
     Approved,
     Denied,
-    Expired,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingPerm {
+    pub id: String,
     pub repo_id: String,
-    pub command: String,
-    pub destructive: bool,
+    pub command_hash: String,
     pub status: PendingPermStatus,
-    pub telegram_message_id: Option<i64>,
-    pub requested_at: String,
+    pub created_at: String,
     pub timeout_at: String,
+    pub message_id: Option<i32>,
 }
 
 impl Default for StateSnapshot {
@@ -97,9 +97,17 @@ enum StateCmd {
         repo_id: String,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
-    UpsertPendingPerm {
-        req_id: String,
+    InsertPending {
         perm: PendingPerm,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ResolvePending {
+        id: String,
+        verdict: PendingPermStatus,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ExpirePending {
+        id: String,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
 }
@@ -126,16 +134,37 @@ impl StateHandle {
         rx.await.map_err(|_| StateError::ActorClosed)?
     }
 
-    pub async fn upsert_pending_perm(
+    pub async fn insert_pending(&self, perm: PendingPerm) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::InsertPending { perm, reply })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn resolve_pending(
         &self,
-        req_id: impl Into<String>,
-        perm: PendingPerm,
+        id: impl Into<String>,
+        verdict: PendingPermStatus,
     ) -> Result<(), StateError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(StateCmd::UpsertPendingPerm {
-                req_id: req_id.into(),
-                perm,
+            .send(StateCmd::ResolvePending {
+                id: id.into(),
+                verdict,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn expire_pending(&self, id: impl Into<String>) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ExpirePending {
+                id: id.into(),
                 reply,
             })
             .await
@@ -163,12 +192,22 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
-                StateCmd::UpsertPendingPerm {
-                    req_id,
-                    perm,
-                    reply,
-                } => {
-                    state.pending_perms.insert(req_id, perm);
+                StateCmd::InsertPending { perm, reply } => {
+                    state.pending_perms.insert(perm.id.clone(), perm);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::ResolvePending { id, verdict, reply } => {
+                    if let Some(perm) = state.pending_perms.get_mut(&id) {
+                        perm.status = verdict;
+                    }
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::ExpirePending { id, reply } => {
+                    if let Some(perm) = state.pending_perms.get_mut(&id) {
+                        perm.status = PendingPermStatus::TimedOut;
+                    }
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
@@ -286,15 +325,15 @@ fn tmp_path(path: &std::path::Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn pending(command: &str) -> PendingPerm {
+    fn pending(id: &str) -> PendingPerm {
         PendingPerm {
+            id: id.to_string(),
             repo_id: "rallyup_a1b2c3d4".to_string(),
-            command: command.to_string(),
-            destructive: true,
-            status: PendingPermStatus::Created,
-            telegram_message_id: None,
-            requested_at: "2026-04-16T00:00:00Z".to_string(),
+            command_hash: "sha256:abc".to_string(),
+            status: PendingPermStatus::Pending,
+            created_at: "2026-04-16T00:00:00Z".to_string(),
             timeout_at: "2026-04-16T00:00:10Z".to_string(),
+            message_id: None,
         }
     }
 
@@ -358,18 +397,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_perm_schema_includes_status_and_telegram_message_id() {
+    async fn pending_perm_insert_resolve_expire_persists_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let handle = spawn_state_actor(path.clone()).await.unwrap();
 
+        handle.insert_pending(pending("perm-1")).await.unwrap();
         handle
-            .upsert_pending_perm("req-1", pending("git reset --hard"))
+            .resolve_pending("perm-1", PendingPermStatus::Approved)
             .await
             .unwrap();
+        handle.expire_pending("perm-1").await.unwrap();
 
         let json = std::fs::read_to_string(path).unwrap();
-        assert!(json.contains(r#""status":"created""#));
-        assert!(json.contains(r#""telegram_message_id":null"#));
+        assert!(json.contains(r#""id":"perm-1""#));
+        assert!(json.contains(r#""status":"timed_out""#));
+        assert!(json.contains(r#""message_id":null"#));
+
+        let reloaded: StateSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reloaded
+                .pending_perms
+                .get("perm-1")
+                .map(|perm| &perm.status),
+            Some(&PendingPermStatus::TimedOut)
+        );
     }
 }
