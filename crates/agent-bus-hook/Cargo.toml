@@ -19,7 +19,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "io-util", "macros"] }
-regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [profile.release]
 lto = "thin"

@@ -10,10 +10,9 @@
 
 #![deny(unsafe_code)]
 
-// TODO: declare modules once contributors start filling them in.
+pub mod path_validate;
+pub mod redact;
+pub mod repo_id;
+pub mod state;
 // pub mod config;
-// pub mod state;
 // pub mod blacklist;
-// pub mod redact;
-// pub mod path_validate;
-// pub mod repo_id;
