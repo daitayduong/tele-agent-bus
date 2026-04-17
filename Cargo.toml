@@ -43,6 +43,10 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.4"
 
 # Filesystem
+hmac = "0.12"
+rand = "0.8"
+nix = { version = "0.28", features = ["socket", "user"] }
+hyperlocal = "0.9"
 tempfile = "3"
 sha2 = "0.10"
 hex = "0.4"
