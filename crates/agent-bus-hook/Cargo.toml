@@ -14,10 +14,7 @@ path = "src/main.rs"
 # IMPORTANT: hook binary must stay minimal. Only add deps that survive the <2MB, <50ms cold-start target.
 # DO NOT pull in: teloxide, serde_yaml, axum, reqwest.
 [dependencies]
-agent-bus-proto = { path = "../agent-bus-proto" }
-serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "io-util", "macros"] }
 
 [dev-dependencies]
