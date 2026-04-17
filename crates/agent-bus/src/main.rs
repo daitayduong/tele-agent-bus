@@ -2,6 +2,7 @@
 #![deny(unsafe_code)]
 
 mod cli;
+mod daemon;
 
 use clap::{Parser, Subcommand};
 
@@ -64,8 +65,12 @@ fn main() -> anyhow::Result<()> {
             ConfigCommands::Validate => cli::config::validate()?,
         },
         Commands::Daemon => {
-            println!("daemon not yet wired");
-            std::process::exit(0);
+            tracing_subscriber::fmt::init();
+            let config = daemon::load_daemon_config()?;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(daemon::run_daemon(config))?;
         }
     }
 
