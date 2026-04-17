@@ -39,6 +39,7 @@ dependencies = [
  "agent-bus-proto",
  "anyhow",
  "hex",
+ "libc",
  "mockall",
  "regex",
  "serde",
@@ -57,9 +58,9 @@ name = "agent-bus-hook"
 version = "0.1.0"
 dependencies = [
  "agent-bus-proto",
- "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
