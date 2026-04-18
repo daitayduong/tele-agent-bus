@@ -13,7 +13,7 @@ use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::Dispatcher;
 use teloxide::types::Update;
 
-use self::perm::{FsBlacklistLoader, PendingPermRegistry, PermService};
+use self::perm::{FsBlacklistLoader, MergedBlacklistLoader, PendingPermRegistry, PermService};
 use self::telegram::{RepoEntry, TelegramConfig, TeloxideBotClient};
 
 #[derive(Debug, Clone)]
@@ -65,12 +65,26 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let bot = teloxide::Bot::new(config.bot_token);
     let registry = PendingPermRegistry::default();
     let bot_client: Arc<dyn telegram::BotClient> = Arc::new(TeloxideBotClient::new(bot.clone()));
-    let etc = PathBuf::from("/etc/agent-bus");
-    let loader = Arc::new(FsBlacklistLoader::new(
-        etc.join("blacklist.conf"),
-        etc.join("blacklist.conf.hmac"),
-        etc.join("blacklist.key"),
+    
+    let etc_dir = PathBuf::from("/etc/agent-bus");
+    let global_loader = Arc::new(FsBlacklistLoader::new(
+        etc_dir.join("blacklist.conf"),
+        etc_dir.join("blacklist.conf.hmac"),
+        etc_dir.join("blacklist.key"),
     ));
+
+    let home_dir = config.home.clone();
+    let repo_loader_fn = move |repo_id: &agent_bus_core::repo_id::RepoId| {
+        let repo_dir = home_dir.join("repos").join(repo_id.as_str());
+        Arc::new(FsBlacklistLoader::new(
+            repo_dir.join("blacklist.conf"),
+            repo_dir.join("blacklist.conf.hmac"),
+            etc_dir.join("blacklist.key"),
+        )) as Arc<dyn perm::BlacklistLoader>
+    };
+
+    let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(repo_loader_fn)));
+
     let perm = PermService::new(
         state.clone(),
         Arc::clone(&telegram_config),

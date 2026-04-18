@@ -1,5 +1,5 @@
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use clap::Subcommand;
@@ -8,28 +8,48 @@ use regex::Regex;
 use agent_bus_core::blacklist_integrity;
 use rand::{RngCore, thread_rng};
 use std::os::unix::fs::PermissionsExt;
+use agent_bus_core::repo_id::RepoId;
 
 const DEFAULT_ETC_DIR: &str = "/etc/agent-bus";
+const DEFAULT_HOME_DIR: &str = "~/.agent-bus";
 
 #[derive(Subcommand, Debug)]
 pub enum BlacklistCommands {
     /// Initialize /etc/agent-bus/ with key and empty signed blacklist (requires sudo)
     Init,
-    /// Add a regex pattern to the blacklist (requires sudo)
-    Add { pattern: String },
-    /// Remove a regex pattern from the blacklist (requires sudo)
-    Remove { pattern: String },
+    /// Add a regex pattern to the blacklist
+    Add {
+        pattern: String,
+        #[clap(long)]
+        repo: Option<String>,
+    },
+    /// Remove a regex pattern from the blacklist
+    Remove {
+        pattern: String,
+        #[clap(long)]
+        repo: Option<String>,
+    },
     /// List current blacklist patterns
-    List,
+    List {
+        #[clap(long)]
+        repo: Option<String>,
+    },
     /// Verify HMAC signature of the blacklist
-    Verify,
+    Verify {
+        #[clap(long)]
+        repo: Option<String>,
+    },
     /// Generate new HMAC key and re-sign the blacklist (requires sudo)
     #[command(name = "rotate-key")]
     RotateKey,
 }
 
 pub fn handle(command: BlacklistCommands) -> Result<()> {
-    handle_inner(command, Path::new(DEFAULT_ETC_DIR), get_euid)
+    let etc_dir: PathBuf = std::env::var("AGENT_BUS_ETC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ETC_DIR));
+    let home_dir: PathBuf = crate::cli::get_bus_home();
+    handle_inner(command, &etc_dir, &home_dir, get_euid)
 }
 
 #[allow(unsafe_code)]
@@ -37,13 +57,13 @@ fn get_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn handle_inner(command: BlacklistCommands, etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
+fn handle_inner(command: BlacklistCommands, etc_dir: &Path, home_dir: &Path, euid: fn() -> u32) -> Result<()> {
     match command {
         BlacklistCommands::Init => init_inner(etc_dir, euid),
-        BlacklistCommands::Add { pattern } => add_inner(&pattern, etc_dir, euid),
-        BlacklistCommands::Remove { pattern } => remove_inner(&pattern, etc_dir, euid),
-        BlacklistCommands::List => list_inner(etc_dir),
-        BlacklistCommands::Verify => verify_inner(etc_dir),
+        BlacklistCommands::Add { pattern, repo } => add_inner(&pattern, repo, etc_dir, home_dir, euid),
+        BlacklistCommands::Remove { pattern, repo } => remove_inner(&pattern, repo, etc_dir, home_dir, euid),
+        BlacklistCommands::List { repo } => list_inner(repo, etc_dir, home_dir, euid),
+        BlacklistCommands::Verify { repo } => verify_inner(repo, etc_dir, home_dir, euid),
         BlacklistCommands::RotateKey => rotate_key_inner(etc_dir, euid),
     }
 }
@@ -67,23 +87,28 @@ fn init_inner(etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
     if !key_path.exists() {
         let mut key = [0u8; 32];
         thread_rng().fill_bytes(&mut key);
-        write_protected(&key_path, &key)?;
+        write_protected(&key_path, &key, true)?;
     }
 
     let conf_path = etc_dir.join("blacklist.conf");
     if !conf_path.exists() {
-        mutate_blacklist(etc_dir, |_| Ok(vec![]))?;
+        let home_dir = PathBuf::from(shellexpand::tilde(DEFAULT_HOME_DIR).into_owned());
+        mutate_blacklist(etc_dir, &home_dir, None, |_| Ok(vec![]))?;
     }
 
     println!("Initialized blacklist in {}", etc_dir.display());
     Ok(())
 }
 
-fn add_inner(pattern: &str, etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
-    check_root(euid)?;
+fn add_inner(pattern: &str, repo: Option<String>, etc_dir: &Path, home_dir: &Path, euid: fn() -> u32) -> Result<()> {
+    if repo.is_none() {
+        check_root(euid)?;
+    }
     Regex::new(pattern).with_context(|| format!("invalid regex: {}", pattern))?;
 
-    mutate_blacklist(etc_dir, |mut patterns| {
+    let repo_id = repo.map(RepoId::new).transpose()?;
+
+    mutate_blacklist(etc_dir, home_dir, repo_id.as_ref(), |mut patterns| {
         if !patterns.contains(&pattern.to_string()) {
             patterns.push(pattern.to_string());
         }
@@ -94,10 +119,13 @@ fn add_inner(pattern: &str, etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
     Ok(())
 }
 
-fn remove_inner(pattern: &str, etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
-    check_root(euid)?;
+fn remove_inner(pattern: &str, repo: Option<String>, etc_dir: &Path, home_dir: &Path, euid: fn() -> u32) -> Result<()> {
+    if repo.is_none() {
+        check_root(euid)?;
+    }
+    let repo_id = repo.map(RepoId::new).transpose()?;
 
-    mutate_blacklist(etc_dir, |mut patterns| {
+    mutate_blacklist(etc_dir, home_dir, repo_id.as_ref(), |mut patterns| {
         let before = patterns.len();
         patterns.retain(|p| p != pattern);
         if patterns.len() == before {
@@ -110,8 +138,8 @@ fn remove_inner(pattern: &str, etc_dir: &Path, euid: fn() -> u32) -> Result<()> 
     Ok(())
 }
 
-fn list_inner(etc_dir: &Path) -> Result<()> {
-    let conf_path = etc_dir.join("blacklist.conf");
+fn list_inner(repo: Option<String>, etc_dir: &Path, home_dir: &Path, _euid: fn() -> u32) -> Result<()> {
+    let (conf_path, _) = get_blacklist_paths(etc_dir, home_dir, repo.as_ref().map(|s| s.as_str()))?;
     if !conf_path.exists() {
         println!("Blacklist empty (file missing)");
         return Ok(());
@@ -125,10 +153,10 @@ fn list_inner(etc_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_inner(etc_dir: &Path) -> Result<()> {
-    let conf_path = etc_dir.join("blacklist.conf");
-    let hmac_path = etc_dir.join("blacklist.conf.hmac");
-    let key_path = etc_dir.join("blacklist.key");
+fn verify_inner(repo: Option<String>, etc_dir: &Path, home_dir: &Path, _euid: fn() -> u32) -> Result<()> {
+    let repo_id = repo.as_ref().map(|r| RepoId::new(r.clone())).transpose()?;
+    let (conf_path, hmac_path) = get_blacklist_paths(etc_dir, home_dir, repo_id.as_ref().map(|r| r.as_str()))?;
+    let key_path = get_key_path(etc_dir, repo.is_some())?;
 
     blacklist_integrity::load_and_verify(&conf_path, &hmac_path, &key_path)
         .map_err(|e| anyhow!("integrity check FAILED: {}", e))?;
@@ -140,22 +168,24 @@ fn verify_inner(etc_dir: &Path) -> Result<()> {
 fn rotate_key_inner(etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
     check_root(euid)?;
 
+    let home_dir = PathBuf::from(shellexpand::tilde(DEFAULT_HOME_DIR).into_owned());
+
     // 1. Verify and load with OLD key
-    let patterns = load_and_verify(etc_dir)?;
+    let patterns = load_and_verify(etc_dir, &home_dir, None)?;
 
     // 2. Generate NEW key
     let mut new_key = [0u8; 32];
     thread_rng().fill_bytes(&mut new_key);
     let key_path = etc_dir.join("blacklist.key");
-    
+
     // We need to lock during the whole process
     let lock = Lock::new(etc_dir)?;
 
     // 3. Write NEW key
-    write_protected(&key_path, &new_key)?;
+    write_protected(&key_path, &new_key, true)?;
 
     // 4. Re-sign with NEW key
-    save_blacklist(etc_dir, &patterns)?;
+    save_blacklist(etc_dir, &home_dir, None, &patterns)?;
 
     drop(lock);
     println!("WARNING: HMAC key rotated and blacklist re-signed.");
@@ -164,10 +194,57 @@ fn rotate_key_inner(etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
 
 // Low-level helpers
 
-fn load_and_verify(etc_dir: &Path) -> Result<Vec<String>> {
-    let conf_path = etc_dir.join("blacklist.conf");
-    let hmac_path = etc_dir.join("blacklist.conf.hmac");
+fn get_repo_dir(home_dir: &Path, repo_id: &str) -> Result<PathBuf> {
+    let repos_dir = home_dir.join("repos");
+    let repo_dir = repos_dir.join(repo_id);
+    let repos_conf_path = home_dir.join("repos.yaml");
+    let repos = agent_bus_core::config::load_repos_from_path(&repos_conf_path)?;
+    if !repos.iter().any(|r| r.id == repo_id) {
+        return Err(anyhow!("unknown repo: {} (register with: agent-bus repo add <path>)", repo_id));
+    }
+    Ok(repo_dir)
+}
+
+fn get_blacklist_paths(etc_dir: &Path, home_dir: &Path, repo_id: Option<&str>) -> Result<(PathBuf, PathBuf)> {
+    if let Some(repo_id) = repo_id {
+        let repo_dir = get_repo_dir(home_dir, repo_id)?;
+        if !repo_dir.exists() {
+            fs::create_dir_all(&repo_dir)?;
+        }
+        Ok((
+            repo_dir.join("blacklist.conf"),
+            repo_dir.join("blacklist.conf.hmac"),
+        ))
+    } else {
+        Ok((
+            etc_dir.join("blacklist.conf"),
+            etc_dir.join("blacklist.conf.hmac"),
+        ))
+    }
+}
+
+fn get_key_path(etc_dir: &Path, is_repo: bool) -> Result<PathBuf> {
     let key_path = etc_dir.join("blacklist.key");
+    if is_repo {
+        // Per-repo operations run as the user; surface a friendly error if the
+        // shared key is missing or unreadable (user not in agent-bus group).
+        match fs::File::open(&key_path) {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(anyhow!(
+                    "cannot read /etc/agent-bus/blacklist.key ({}): add current user to the agent-bus group (sudo usermod -aG agent-bus $USER) and re-login",
+                    e
+                ));
+            }
+        }
+    }
+    Ok(key_path)
+}
+
+
+fn load_and_verify(etc_dir: &Path, home_dir: &Path, repo: Option<&RepoId>) -> Result<Vec<String>> {
+    let (conf_path, hmac_path) = get_blacklist_paths(etc_dir, home_dir, repo.map(|r| r.as_str()))?;
+    let key_path = get_key_path(etc_dir, repo.is_some())?;
 
     if !conf_path.exists() {
         return Ok(vec![]);
@@ -177,52 +254,67 @@ fn load_and_verify(etc_dir: &Path) -> Result<Vec<String>> {
         .map_err(|e| anyhow!("failed to load blacklist: {}", e))
 }
 
-fn mutate_blacklist<F>(etc_dir: &Path, f: F) -> Result<()>
+fn mutate_blacklist<F>(etc_dir: &Path, home_dir: &Path, repo: Option<&RepoId>, f: F) -> Result<()>
 where
     F: FnOnce(Vec<String>) -> Result<Vec<String>>,
 {
-    let _lock = Lock::new(etc_dir)?;
+    let lock_dir = if let Some(repo) = repo {
+        get_repo_dir(home_dir, repo.as_str())?
+    } else {
+        etc_dir.to_path_buf()
+    };
+    if !lock_dir.exists() {
+        fs::create_dir_all(&lock_dir)?;
+    }
+    let _lock = Lock::new(&lock_dir)?;
 
     // 1. Verify current (if exists)
-    let patterns = load_and_verify(etc_dir)?;
+    let patterns = load_and_verify(etc_dir, home_dir, repo)?;
 
     // 2. Mutate
     let new_patterns = f(patterns)?;
 
     // 3. Save (atomic write + re-sign)
-    save_blacklist(etc_dir, &new_patterns)
+    save_blacklist(etc_dir, home_dir, repo, &new_patterns)
 }
 
-fn save_blacklist(etc_dir: &Path, patterns: &[String]) -> Result<()> {
+fn save_blacklist(etc_dir: &Path, home_dir: &Path, repo: Option<&RepoId>, patterns: &[String]) -> Result<()> {
+    let (conf_path, hmac_path) = get_blacklist_paths(etc_dir, home_dir, repo.map(|r| r.as_str()))?;
+    let key_path = get_key_path(etc_dir, repo.is_some())?;
+    let key = fs::read(&key_path).context(format!("missing or unreadable {}", key_path.display()))?;
+
     let body = patterns.join("\n");
-    let key_path = etc_dir.join("blacklist.key");
-    let key = fs::read(&key_path).context("missing blacklist.key")?;
-    
     let hmac = blacklist_integrity::compute_hmac(&key, body.as_bytes());
 
-    let conf_path = etc_dir.join("blacklist.conf");
-    let hmac_path = etc_dir.join("blacklist.conf.hmac");
-
-    write_atomic(&conf_path, body.as_bytes())?;
-    write_atomic(&hmac_path, hmac.as_bytes())?;
+    let is_global = repo.is_none();
+    write_atomic(&conf_path, body.as_bytes(), is_global)?;
+    write_atomic(&hmac_path, hmac.as_bytes(), is_global)?;
 
     Ok(())
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+fn write_atomic(path: &Path, data: &[u8], is_global: bool) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    write_protected(&tmp, data)?;
+    write_protected(&tmp, data, is_global)?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
 
-fn write_protected(path: &Path, data: &[u8]) -> Result<()> {
-    let mut f = OpenOptions::new()
+fn write_protected(path: &Path, data: &[u8], is_global: bool) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options
         .write(true)
         .create(true)
-        .truncate(true)
-        .mode(0o640)
-        .open(path)?;
+        .truncate(true);
+
+    if is_global {
+        options.mode(0o640);
+    } else {
+        options.mode(0o640);
+    };
+
+    let mut f = options.open(path)?;
+
     f.write_all(data)?;
     f.sync_all()?;
     Ok(())
@@ -234,8 +326,8 @@ struct Lock {
 
 #[allow(unsafe_code)]
 impl Lock {
-    fn new(etc_dir: &Path) -> Result<Self> {
-        let path = etc_dir.join(".lock");
+    fn new(dir: &Path) -> Result<Self> {
+        let path = dir.join(".lock");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -288,18 +380,19 @@ mod tests {
     #[test]
     fn test_add_remove_flow() {
         let d = tempdir().unwrap();
+        let home = tempdir().unwrap();
         init_inner(d.path(), euid_root).unwrap();
 
-        add_inner("^rm -rf", d.path(), euid_root).unwrap();
-        add_inner("^ls -R", d.path(), euid_root).unwrap();
+        add_inner("^rm -rf", None, d.path(), home.path(), euid_root).unwrap();
+        add_inner("^ls -R", None, d.path(), home.path(), euid_root).unwrap();
         
         let conf = fs::read_to_string(d.path().join("blacklist.conf")).unwrap();
         assert!(conf.contains("^rm -rf"));
         assert!(conf.contains("^ls -R"));
 
-        verify_inner(d.path()).unwrap();
+        verify_inner(None, d.path(), home.path(), euid_root).unwrap();
 
-        remove_inner("^rm -rf", d.path(), euid_root).unwrap();
+        remove_inner("^rm -rf", None, d.path(), home.path(), euid_root).unwrap();
         let conf = fs::read_to_string(d.path().join("blacklist.conf")).unwrap();
         assert!(!conf.contains("^rm -rf"));
         assert!(conf.contains("^ls -R"));
@@ -308,8 +401,9 @@ mod tests {
     #[test]
     fn test_invalid_regex_rejected() {
         let d = tempdir().unwrap();
+        let home = tempdir().unwrap();
         init_inner(d.path(), euid_root).unwrap();
-        let res = add_inner("[[[", d.path(), euid_root);
+        let res = add_inner("[[[", None, d.path(), home.path(), euid_root);
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("invalid regex"));
     }
@@ -317,15 +411,16 @@ mod tests {
     #[test]
     fn test_rotate_key() {
         let d = tempdir().unwrap();
+        let home = tempdir().unwrap();
         init_inner(d.path(), euid_root).unwrap();
-        add_inner("pattern1", d.path(), euid_root).unwrap();
+        add_inner("pattern1", None, d.path(), home.path(), euid_root).unwrap();
 
         let old_key = fs::read(d.path().join("blacklist.key")).unwrap();
         rotate_key_inner(d.path(), euid_root).unwrap();
         let new_key = fs::read(d.path().join("blacklist.key")).unwrap();
 
         assert_ne!(old_key, new_key);
-        verify_inner(d.path()).unwrap();
+        verify_inner(None, d.path(), home.path(), euid_root).unwrap();
         
         let conf = fs::read_to_string(d.path().join("blacklist.conf")).unwrap();
         assert!(conf.contains("pattern1"));
@@ -334,13 +429,14 @@ mod tests {
     #[test]
     fn test_tamper_detection() {
         let d = tempdir().unwrap();
+        let home = tempdir().unwrap();
         init_inner(d.path(), euid_root).unwrap();
-        add_inner("p1", d.path(), euid_root).unwrap();
+        add_inner("p1", None, d.path(), home.path(), euid_root).unwrap();
 
         // Tamper
         fs::write(d.path().join("blacklist.conf"), "tampered").unwrap();
         
-        let res = verify_inner(d.path());
+        let res = verify_inner(None, d.path(), home.path(), euid_root);
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("integrity check FAILED"));
     }

@@ -254,7 +254,7 @@ fn chmod_socket_private(path: &std::path::Path) -> std::io::Result<()> {
 mod tests {
     use std::time::Duration;
     use super::*;
-    use crate::daemon::perm::{BlacklistLoader, PendingPermRegistry};
+    use crate::daemon::perm::{BlacklistLoader, MergedBlacklistLoader, PendingPermRegistry};
     use crate::daemon::telegram::{MockBot, TelegramConfig};
     use agent_bus_core::peer_uid::MockPeerUid;
     use std::os::unix::fs::PermissionsExt;
@@ -279,11 +279,15 @@ mod tests {
             allowed_chats: vec!["123".to_string()],
             repos: vec![],
         });
+        let loader = Arc::new(MergedBlacklistLoader::new(
+            Arc::new(EmptyLoader),
+            Box::new(|_| Arc::new(EmptyLoader)),
+        ));
         let perm = crate::daemon::perm::PermService::new(
             state.clone(),
             config,
             Arc::new(MockBot::default()),
-            Arc::new(EmptyLoader),
+            loader,
             PendingPermRegistry::default(), Duration::from_secs(30),
         );
         let mut server = UdsServer::new(socket.clone(), state, perm);

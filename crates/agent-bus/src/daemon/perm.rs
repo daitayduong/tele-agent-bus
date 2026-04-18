@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_bus_core::blacklist::Blacklist;
+use agent_bus_core::repo_id::RepoId;
 use agent_bus_core::state::{PendingPerm, PendingPermStatus, StateHandle};
 use agent_bus_proto::{Decision, PermCheckRequest, PermCheckResponse, PROTOCOL_VERSION};
 use sha2::{Digest, Sha256};
@@ -15,9 +16,7 @@ const BLACKLIST_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub trait BlacklistLoader: Send + Sync {
     fn load(&self) -> anyhow::Result<Vec<String>>;
-    fn modified(&self) -> anyhow::Result<Option<SystemTime>> {
-        Ok(None)
-    }
+    fn modified(&self) -> anyhow::Result<Option<SystemTime>>;
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +38,9 @@ impl FsBlacklistLoader {
 
 impl BlacklistLoader for FsBlacklistLoader {
     fn load(&self) -> anyhow::Result<Vec<String>> {
+        if !self.conf_path.exists() {
+            return Ok(Vec::new());
+        }
         agent_bus_core::blacklist_integrity::load_and_verify(
             &self.conf_path,
             &self.hmac_path,
@@ -60,6 +62,41 @@ impl BlacklistLoader for FsBlacklistLoader {
             .ok())
     }
 }
+
+pub struct MergedBlacklistLoader {
+    global_loader: Arc<dyn BlacklistLoader>,
+    repo_loader_fn: Box<dyn Fn(&RepoId) -> Arc<dyn BlacklistLoader> + Send + Sync>,
+}
+
+impl MergedBlacklistLoader {
+    pub fn new(
+        global_loader: Arc<dyn BlacklistLoader>,
+        repo_loader_fn: Box<dyn Fn(&RepoId) -> Arc<dyn BlacklistLoader> + Send + Sync>,
+    ) -> Self {
+        Self {
+            global_loader,
+            repo_loader_fn,
+        }
+    }
+
+    fn load_for(&self, repo_id: Option<&RepoId>) -> anyhow::Result<(Vec<String>, Option<SystemTime>)> {
+        let mut global_patterns = self.global_loader.load()?;
+        let global_modified = self.global_loader.modified()?;
+
+        if let Some(repo_id) = repo_id {
+            let repo_loader = (self.repo_loader_fn)(repo_id);
+            let repo_patterns = repo_loader.load()?;
+            let repo_modified = repo_loader.modified()?;
+            global_patterns.extend(repo_patterns);
+
+            let latest_modified = global_modified.max(repo_modified);
+            Ok((global_patterns, latest_modified))
+        } else {
+            Ok((global_patterns, global_modified))
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermVerdict {
@@ -98,12 +135,12 @@ pub struct PermService {
     state: StateHandle,
     telegram_config: Arc<TelegramConfig>,
     bot: Arc<dyn BotClient>,
-    loader: Arc<dyn BlacklistLoader>,
+    loader: Arc<MergedBlacklistLoader>,
     registry: PendingPermRegistry,
-    cache: Arc<Mutex<BlacklistCache>>,
+    cache: Arc<Mutex<HashMap<String, BlacklistCache>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct BlacklistCache {
     lines: Vec<String>,
     modified: Option<SystemTime>,
@@ -116,16 +153,18 @@ impl PermService {
         state: StateHandle,
         telegram_config: Arc<TelegramConfig>,
         bot: Arc<dyn BotClient>,
-        loader: Arc<dyn BlacklistLoader>,
-        registry: PendingPermRegistry, timeout: Duration,
+        loader: Arc<MergedBlacklistLoader>,
+        registry: PendingPermRegistry,
+        timeout: Duration,
     ) -> Self {
         Self {
             state,
             telegram_config,
             bot,
             loader,
-            registry, timeout,
-            cache: Arc::new(Mutex::new(BlacklistCache::default())),
+            registry,
+            timeout,
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -141,8 +180,10 @@ impl PermService {
         if req.protocol_version != PROTOCOL_VERSION {
             anyhow::bail!("protocol mismatch");
         }
+        
+        let repo_id = req.repo_id.as_deref().map(|s| RepoId::new(s.to_string())).transpose()?;
 
-        let lines = match self.blacklist_lines().await {
+        let lines = match self.blacklist_lines_for(repo_id.as_ref()).await {
             Ok(lines) => lines,
             Err(err) => {
                 tracing::error!("CRITICAL: blacklist integrity failure: {err}");
@@ -245,9 +286,12 @@ impl PermService {
         }
     }
 
-    async fn blacklist_lines(&self) -> anyhow::Result<Vec<String>> {
+    async fn blacklist_lines_for(&self, repo_id: Option<&RepoId>) -> anyhow::Result<Vec<String>> {
         let now = SystemTime::now();
-        let mut cache = self.cache.lock().await;
+        let cache_key = repo_id.map(|id| id.to_string()).unwrap_or_else(|| "global".to_string());
+        let mut cache_map = self.cache.lock().await;
+        let cache = cache_map.entry(cache_key).or_default();
+    
         if cache.tampered {
             anyhow::bail!("blacklist_tampered");
         }
@@ -255,23 +299,17 @@ impl PermService {
             .last_checked
             .and_then(|checked| now.duration_since(checked).ok())
             .is_none_or(|elapsed| elapsed >= BLACKLIST_POLL_INTERVAL);
+    
         if !cache.lines.is_empty() && !should_check {
             return Ok(cache.lines.clone());
         }
-
-        let modified = self.loader.modified()?;
+    
+        let (patterns, modified) = self.loader.load_for(repo_id)?;
+    
         if cache.lines.is_empty() || modified != cache.modified {
-            match self.loader.load() {
-                Ok(lines) => {
-                    cache.lines = lines;
-                    cache.modified = modified;
-                    cache.tampered = false;
-                }
-                Err(err) => {
-                    cache.tampered = true;
-                    return Err(err);
-                }
-            }
+            cache.lines = patterns;
+            cache.modified = modified;
+            cache.tampered = false;
         }
         cache.last_checked = Some(now);
         Ok(cache.lines.clone())
@@ -344,7 +382,9 @@ mod tests {
     use super::*;
     use crate::daemon::telegram::{MockBot, RepoEntry, TelegramConfig};
     use agent_bus_core::blacklist_integrity;
+    use std::path::Path;
 
+    #[derive(Clone)]
     struct StaticLoader {
         lines: Vec<String>,
         err: Option<&'static str>,
@@ -356,6 +396,9 @@ mod tests {
                 anyhow::bail!(err);
             }
             Ok(self.lines.clone())
+        }
+        fn modified(&self) -> anyhow::Result<Option<SystemTime>> {
+            Ok(None)
         }
     }
 
@@ -371,32 +414,34 @@ mod tests {
         })
     }
 
-    fn request(command: &str, timeout_ms: u64) -> PermCheckRequest {
+    fn request(command: &str, timeout_ms: u64, repo_id: Option<&str>) -> PermCheckRequest {
         PermCheckRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id: "req-1".to_string(),
             session_id: "sess-1".to_string(),
             tool: "Bash".to_string(),
             command: command.to_string(),
-            repo_id: Some("rallyup".to_string()),
-            repo_hint: Some("rallyup".to_string()),
+            repo_id: repo_id.map(|s| s.to_string()),
+            repo_hint: repo_id.map(|s| s.to_string()),
             timeout_ms,
         }
     }
 
     fn write_blacklist_triplet(
-        dir: &tempfile::TempDir,
+        dir: &Path,
+        name: &str,
         body: &[u8],
     ) -> (PathBuf, PathBuf, PathBuf) {
-        let conf_path = dir.path().join("blacklist.conf");
-        let hmac_path = dir.path().join("blacklist.conf.hmac");
-        let key_path = dir.path().join("blacklist.key");
+        let conf_path = dir.join(format!("{}.conf", name));
+        let hmac_path = dir.join(format!("{}.conf.hmac", name));
+        let key_path = dir.join("blacklist.key");
         let key = b"01234567890123456789012345678901";
+        std::fs::write(&key_path, key).unwrap();
         let sig = blacklist_integrity::compute_hmac(key, body);
 
         std::fs::write(&conf_path, body).unwrap();
         std::fs::write(&hmac_path, sig).unwrap();
-        std::fs::write(&key_path, key).unwrap();
+        
 
         (conf_path, hmac_path, key_path)
     }
@@ -404,8 +449,11 @@ mod tests {
     #[test]
     fn test_fs_loader_accepts_valid_triplet() {
         let dir = tempfile::tempdir().unwrap();
-        let (conf_path, hmac_path, key_path) =
-            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n^git push --force\n");
+        let (conf_path, hmac_path, key_path) = write_blacklist_triplet(
+            dir.path(),
+            "blacklist",
+            b"rm\\s+-rf\tdestructive\n^git push --force\n",
+        );
         let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
 
         let patterns = loader.load().unwrap();
@@ -423,7 +471,7 @@ mod tests {
     fn test_fs_loader_rejects_tampered_conf() {
         let dir = tempfile::tempdir().unwrap();
         let (conf_path, hmac_path, key_path) =
-            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n");
+            write_blacklist_triplet(dir.path(), "blacklist", b"rm\\s+-rf\tdestructive\n");
         std::fs::write(&conf_path, b"git\\s+push\\s+--force\tdestructive\n").unwrap();
         let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
 
@@ -434,7 +482,7 @@ mod tests {
     fn test_fs_loader_rejects_missing_hmac() {
         let dir = tempfile::tempdir().unwrap();
         let (conf_path, hmac_path, key_path) =
-            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n");
+            write_blacklist_triplet(dir.path(), "blacklist", b"rm\\s+-rf\tdestructive\n");
         std::fs::remove_file(&hmac_path).unwrap();
         let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
 
@@ -447,18 +495,22 @@ mod tests {
         let state = agent_bus_core::state::spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
+        
+        let global_loader = Arc::new(StaticLoader {
+            lines: vec![r"rm\s+-rf	destructive".to_string()],
+            err: None,
+        });
+        let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(|_| Arc::new(StaticLoader { lines: vec![], err: None }))));
+
         let service = PermService::new(
             state,
             config(),
             Arc::new(MockBot::default()),
-            Arc::new(StaticLoader {
-                lines: vec!["rm\\s+-rf\tdestructive".to_string()],
-                err: None,
-            }),
+            loader,
             PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
-        let resp = service.check(request("ls /tmp", 1)).await.unwrap();
+        let resp = service.check(request("ls /tmp", 1, Some("rallyup"))).await.unwrap();
 
         assert_eq!(resp.verdict, Decision::Approve);
         assert_eq!(resp.reason, "no_blacklist_match");
@@ -470,18 +522,20 @@ mod tests {
         let state = agent_bus_core::state::spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
+        let global_loader = Arc::new(StaticLoader {
+            lines: vec![r"rm\s+-rf	destructive".to_string()],
+            err: None,
+        });
+        let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(|_| Arc::new(StaticLoader { lines: vec![], err: None }))));
         let service = PermService::new(
             state.clone(),
             config(),
             Arc::new(MockBot::default()),
-            Arc::new(StaticLoader {
-                lines: vec!["rm\\s+-rf\tdestructive".to_string()],
-                err: None,
-            }),
+            loader,
             PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
-        let resp = service.check(request("rm -rf /tmp/foo", 1)).await.unwrap();
+        let resp = service.check(request("rm -rf /tmp/foo", 1, Some("rallyup"))).await.unwrap();
 
         assert_eq!(resp.verdict, Decision::Deny);
         assert_eq!(resp.reason, "timeout_fail_closed");
@@ -504,20 +558,23 @@ mod tests {
             .await
             .unwrap();
         let registry = PendingPermRegistry::default();
+        let global_loader = Arc::new(StaticLoader {
+            lines: vec![r"git\s+push\s+--force".to_string()],
+            err: None,
+        });
+        let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(|_| Arc::new(StaticLoader { lines: vec![], err: None }))));
+
         let service = PermService::new(
             state.clone(),
             config(),
             Arc::new(MockBot::default()),
-            Arc::new(StaticLoader {
-                lines: vec!["git\\s+push\\s+--force".to_string()],
-                err: None,
-            }),
+            loader,
             registry.clone(), Duration::from_secs(30),
         );
 
         let handle = tokio::spawn(async move {
             service
-                .check(request("git push --force origin main", 500))
+                .check(request("git push --force origin main", 500, Some("rallyup")))
                 .await
                 .unwrap()
         });
@@ -541,19 +598,120 @@ mod tests {
         let state = agent_bus_core::state::spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
+        let global_loader = Arc::new(StaticLoader {
+            lines: vec![],
+            err: Some("hmac mismatch"),
+        });
+        let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(|_| Arc::new(StaticLoader { lines: vec![], err: None }))));
         let service = PermService::new(
             state,
             config(),
             Arc::new(MockBot::default()),
-            Arc::new(StaticLoader {
-                lines: vec![],
-                err: Some("hmac mismatch"),
-            }),
+            loader,
             PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
-        let resp = service.check(request("ls", 1)).await.unwrap();
+        let resp = service.check(request("ls", 1, Some("rallyup"))).await.unwrap();
 
+        assert_eq!(resp.verdict, Decision::Deny);
+        assert_eq!(resp.reason, "blacklist_tampered");
+    }
+
+    #[test]
+    fn test_merged_loader_unions_patterns() {
+        let global_loader = StaticLoader {
+            lines: vec!["global_rule".to_string()],
+            err: None,
+        };
+        let repo_loader = StaticLoader {
+            lines: vec!["repo_rule".to_string()],
+            err: None,
+        };
+
+        let loader = MergedBlacklistLoader::new(Arc::new(global_loader), Box::new(move |_| Arc::new(repo_loader.clone())));
+        let repo_id = RepoId::new("test-repo".to_string()).unwrap();
+        let (patterns, _) = loader.load_for(Some(&repo_id)).unwrap();
+        assert_eq!(patterns, vec!["global_rule", "repo_rule"]);
+    }
+
+    #[tokio::test]
+    async fn test_merged_loader_tampered_per_repo_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = agent_bus_core::state::spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        let global_loader = Arc::new(StaticLoader {
+            lines: vec!["global_rule".to_string()],
+            err: None,
+        });
+        let repo_loader = StaticLoader {
+            lines: vec![],
+            err: Some("tampered"),
+        };
+        let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(move |_| Arc::new(repo_loader.clone()))));
+        let service = PermService::new(
+            state,
+            config(),
+            Arc::new(MockBot::default()),
+            loader,
+            PendingPermRegistry::default(),
+            Duration::from_secs(30),
+        );
+
+        let resp = service.check(request("ls", 1, Some("rallyup"))).await.unwrap();
+        assert_eq!(resp.verdict, Decision::Deny);
+        assert_eq!(resp.reason, "blacklist_tampered");
+    }
+
+    #[test]
+    fn test_merged_loader_missing_per_repo_treated_as_empty() {
+        let global_loader = StaticLoader {
+            lines: vec!["global_rule".to_string()],
+            err: None,
+        };
+        // This loader will simulate a file not found error, which should be handled gracefully.
+        #[derive(Clone, Copy)]
+        struct MissingFileLoader;
+        impl BlacklistLoader for MissingFileLoader {
+            fn load(&self) -> anyhow::Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn modified(&self) -> anyhow::Result<Option<SystemTime>> {
+                Ok(None)
+            }
+        }
+        let repo_loader = MissingFileLoader;
+
+        let loader = MergedBlacklistLoader::new(Arc::new(global_loader), Box::new(move |_| Arc::new(repo_loader)));
+        let repo_id = RepoId::new("test-repo".to_string()).unwrap();
+        let (patterns, _) = loader.load_for(Some(&repo_id)).unwrap();
+        assert_eq!(patterns, vec!["global_rule"]);
+    }
+
+    #[tokio::test]
+    async fn test_merged_loader_tampered_global_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = agent_bus_core::state::spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        let global_loader = Arc::new(StaticLoader {
+            lines: vec![],
+            err: Some("tampered"),
+        });
+        let repo_loader = StaticLoader {
+            lines: vec!["repo_rule".to_string()],
+            err: None,
+        };
+        let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(move |_| Arc::new(repo_loader.clone()))));
+        let service = PermService::new(
+            state,
+            config(),
+            Arc::new(MockBot::default()),
+            loader,
+            PendingPermRegistry::default(),
+            Duration::from_secs(30),
+        );
+        let resp = service.check(request("ls", 1, Some("rallyup"))).await.unwrap();
         assert_eq!(resp.verdict, Decision::Deny);
         assert_eq!(resp.reason, "blacklist_tampered");
     }

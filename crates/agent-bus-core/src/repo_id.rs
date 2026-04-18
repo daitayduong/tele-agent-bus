@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::fmt;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -11,7 +12,45 @@ pub enum RepoIdError {
         #[source]
         source: std::io::Error,
     },
+    #[error("invalid repo id: {0}")]
+    Invalid(String),
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RepoId(String);
+
+impl RepoId {
+    pub fn new(id: String) -> Result<Self, RepoIdError> {
+        // Validation logic from AC-R4
+        let is_valid = id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && !id.is_empty()
+            && id.len() <= 64
+            && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+
+        if is_valid {
+            Ok(Self(id))
+        } else {
+            Err(RepoIdError::Invalid(id))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for RepoId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RepoId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 
 pub fn compute_repo_id(display_slug: &str, path: impl AsRef<Path>) -> Result<String, RepoIdError> {
     let path_ref = path.as_ref();
@@ -87,5 +126,15 @@ mod tests {
 
         assert!(id.starts_with("repo_"));
         assert_eq!(id.rsplit_once('_').unwrap().1.len(), 8);
+    }
+
+    #[test]
+    fn test_repo_id_validation() {
+        assert!(RepoId::new("good-id_123".to_string()).is_ok());
+        assert!(RepoId::new("bad/id".to_string()).is_err());
+        assert!(RepoId::new("".to_string()).is_err());
+        let long_id = "a".repeat(65);
+        assert!(RepoId::new(long_id).is_err());
+        assert!(RepoId::new("-bad-start".to_string()).is_err());
     }
 }
