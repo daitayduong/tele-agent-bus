@@ -24,18 +24,35 @@ pub trait BlacklistLoader: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct FsBlacklistLoader {
     conf_path: PathBuf,
+    hmac_path: PathBuf,
+    key_path: PathBuf,
 }
 
 impl FsBlacklistLoader {
-    pub fn new(conf_path: PathBuf) -> Self {
-        Self { conf_path }
+    pub fn new(conf_path: PathBuf, hmac_path: PathBuf, key_path: PathBuf) -> Self {
+        Self {
+            conf_path,
+            hmac_path,
+            key_path,
+        }
     }
 }
 
 impl BlacklistLoader for FsBlacklistLoader {
     fn load(&self) -> anyhow::Result<Vec<String>> {
-        let body = std::fs::read_to_string(&self.conf_path)?;
-        Ok(body.lines().map(str::to_string).collect())
+        agent_bus_core::blacklist_integrity::load_and_verify(
+            &self.conf_path,
+            &self.hmac_path,
+            &self.key_path,
+        )
+        .map_err(|e| {
+            tracing::warn!(
+                event = "blacklist_integrity_failed",
+                path = ?self.conf_path,
+                error = %e
+            );
+            anyhow::anyhow!("blacklist integrity failed: {}", e)
+        })
     }
 
     fn modified(&self) -> anyhow::Result<Option<SystemTime>> {
@@ -325,6 +342,7 @@ fn is_cached_destructive(command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::daemon::telegram::{MockBot, RepoEntry, TelegramConfig};
+    use agent_bus_core::blacklist_integrity;
 
     struct StaticLoader {
         lines: Vec<String>,
@@ -363,6 +381,63 @@ mod tests {
             repo_hint: Some("rallyup".to_string()),
             timeout_ms,
         }
+    }
+
+    fn write_blacklist_triplet(
+        dir: &tempfile::TempDir,
+        body: &[u8],
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let conf_path = dir.path().join("blacklist.conf");
+        let hmac_path = dir.path().join("blacklist.conf.hmac");
+        let key_path = dir.path().join("blacklist.key");
+        let key = b"01234567890123456789012345678901";
+        let sig = blacklist_integrity::compute_hmac(key, body);
+
+        std::fs::write(&conf_path, body).unwrap();
+        std::fs::write(&hmac_path, sig).unwrap();
+        std::fs::write(&key_path, key).unwrap();
+
+        (conf_path, hmac_path, key_path)
+    }
+
+    #[test]
+    fn test_fs_loader_accepts_valid_triplet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conf_path, hmac_path, key_path) =
+            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n^git push --force\n");
+        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+
+        let patterns = loader.load().unwrap();
+
+        assert_eq!(
+            patterns,
+            vec![
+                "rm\\s+-rf\tdestructive".to_string(),
+                "^git push --force".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fs_loader_rejects_tampered_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conf_path, hmac_path, key_path) =
+            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n");
+        std::fs::write(&conf_path, b"git\\s+push\\s+--force\tdestructive\n").unwrap();
+        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+
+        assert!(loader.load().is_err());
+    }
+
+    #[test]
+    fn test_fs_loader_rejects_missing_hmac() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conf_path, hmac_path, key_path) =
+            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n");
+        std::fs::remove_file(&hmac_path).unwrap();
+        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+
+        assert!(loader.load().is_err());
     }
 
     #[tokio::test]
