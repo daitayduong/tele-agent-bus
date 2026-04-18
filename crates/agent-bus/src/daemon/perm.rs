@@ -11,7 +11,6 @@ use tokio::sync::{oneshot, Mutex};
 
 use super::telegram::{send_perm_prompt, BotClient, TelegramConfig};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const BLACKLIST_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub trait BlacklistLoader: Send + Sync {
@@ -78,6 +77,7 @@ impl PendingPermRegistry {
 
 #[derive(Clone)]
 pub struct PermService {
+    pub timeout: Duration,
     state: StateHandle,
     telegram_config: Arc<TelegramConfig>,
     bot: Arc<dyn BotClient>,
@@ -100,15 +100,23 @@ impl PermService {
         telegram_config: Arc<TelegramConfig>,
         bot: Arc<dyn BotClient>,
         loader: Arc<dyn BlacklistLoader>,
-        registry: PendingPermRegistry,
+        registry: PendingPermRegistry, timeout: Duration,
     ) -> Self {
         Self {
             state,
             telegram_config,
             bot,
             loader,
-            registry,
+            registry, timeout,
             cache: Arc::new(Mutex::new(BlacklistCache::default())),
+        }
+    }
+
+    fn timeout_for(&self, req: &PermCheckRequest) -> Duration {
+        if req.timeout_ms == 0 {
+            self.timeout
+        } else {
+            Duration::from_millis(req.timeout_ms).min(self.timeout)
         }
     }
 
@@ -150,7 +158,7 @@ impl PermService {
         let id = next_perm_id();
         let command_hash = command_hash(&req.command);
         let now = now_string();
-        let timeout = timeout_for(&req);
+        let timeout = self.timeout_for(&req);
         let timeout_at = now_plus_string(timeout);
         let rx = self.registry.insert(id.clone()).await;
         let pending = PendingPerm {
@@ -297,13 +305,6 @@ fn now_plus_string(duration: Duration) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn timeout_for(req: &PermCheckRequest) -> Duration {
-    if req.timeout_ms == 0 {
-        DEFAULT_TIMEOUT
-    } else {
-        Duration::from_millis(req.timeout_ms).min(DEFAULT_TIMEOUT)
-    }
-}
 
 fn request_repo_id(req: &PermCheckRequest) -> String {
     req.repo_id
@@ -379,7 +380,7 @@ mod tests {
                 lines: vec!["rm\\s+-rf\tdestructive".to_string()],
                 err: None,
             }),
-            PendingPermRegistry::default(),
+            PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
         let resp = service.check(request("ls /tmp", 1)).await.unwrap();
@@ -402,7 +403,7 @@ mod tests {
                 lines: vec!["rm\\s+-rf\tdestructive".to_string()],
                 err: None,
             }),
-            PendingPermRegistry::default(),
+            PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
         let resp = service.check(request("rm -rf /tmp/foo", 1)).await.unwrap();
@@ -436,7 +437,7 @@ mod tests {
                 lines: vec!["git\\s+push\\s+--force".to_string()],
                 err: None,
             }),
-            registry.clone(),
+            registry.clone(), Duration::from_secs(30),
         );
 
         let handle = tokio::spawn(async move {
@@ -473,7 +474,7 @@ mod tests {
                 lines: vec![],
                 err: Some("hmac mismatch"),
             }),
-            PendingPermRegistry::default(),
+            PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
         let resp = service.check(request("ls", 1)).await.unwrap();

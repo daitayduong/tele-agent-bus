@@ -99,7 +99,7 @@ fn build_request_body(input: &Value, command: &str) -> Value {
         "tool": input.get("tool_name").and_then(Value::as_str).unwrap_or("Bash"),
         "command": command,
         "repo_id": input.get("cwd").and_then(Value::as_str).and_then(repo_hint),
-        "timeout_ms": 10000
+        "timeout_ms": 30000
     })
 }
 

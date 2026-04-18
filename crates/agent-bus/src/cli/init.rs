@@ -20,13 +20,13 @@ pub fn run() -> anyhow::Result<()> {
     if !config_path.exists() {
         let default_config = r#"schema_version: 1
 telegram:
-  bot_token: env:TELE_BUS_TOKEN
+  bot_token: env:TELE_BUS_BOT_TOKEN
   allowed_chats:
     - env:TELE_BUS_CHAT_ID
 fail_mode: hybrid
 log_level: info
 permissions:
-  timeout_seconds: 10
+  timeout_seconds: 30
   fail_mode: hybrid
   blacklist_file: ~/.agent-bus/blacklist.txt
 agents: {}
@@ -46,4 +46,24 @@ repos: []
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_init_writes_bot_token_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENT_BUS_HOME", dir.path());
+        
+        run().unwrap();
+
+        let config_path = dir.path().join("config.yaml");
+        let config = fs::read_to_string(config_path).unwrap();
+
+        assert!(config.contains("bot_token: env:TELE_BUS_BOT_TOKEN"));
+        assert!(config.contains("timeout_seconds: 30"));
+    }
 }
