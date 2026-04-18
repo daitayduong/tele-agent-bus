@@ -48,9 +48,12 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let bot = teloxide::Bot::new(config.bot_token);
     let registry = PendingPermRegistry::default();
     let bot_client: Arc<dyn telegram::BotClient> = Arc::new(TeloxideBotClient::new(bot.clone()));
-    let loader = Arc::new(FsBlacklistLoader::new(PathBuf::from(
-        "/etc/agent-bus/blacklist.conf",
-    )));
+    let etc = PathBuf::from("/etc/agent-bus");
+    let loader = Arc::new(FsBlacklistLoader::new(
+        etc.join("blacklist.conf"),
+        etc.join("blacklist.conf.hmac"),
+        etc.join("blacklist.key"),
+    ));
     let perm = PermService::new(
         state.clone(),
         Arc::clone(&telegram_config),
