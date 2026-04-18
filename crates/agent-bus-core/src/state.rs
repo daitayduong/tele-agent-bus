@@ -37,6 +37,17 @@ pub struct StateSnapshot {
     pub tg_offset: Option<i64>,
     pub sessions: BTreeMap<String, SessionState>,
     pub pending_perms: BTreeMap<String, PendingPerm>,
+    #[serde(default)]
+    pub mobile_sessions: BTreeMap<String, MobileSessionState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MobileSessionState {
+    pub mobile_uuid: String,
+    pub mobile_fork_source: String,
+    pub mobile_forked_at: String,
+    pub project_hash: String,
+    pub repo_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +88,7 @@ impl Default for StateSnapshot {
             tg_offset: None,
             sessions: BTreeMap::new(),
             pending_perms: BTreeMap::new(),
+            mobile_sessions: BTreeMap::new(),
         }
     }
 }
@@ -108,6 +120,15 @@ enum StateCmd {
     },
     ExpirePending {
         id: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetMobileSession {
+        chat_id: String,
+        mobile: MobileSessionState,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ClearMobileSession {
+        chat_id: String,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
 }
@@ -171,6 +192,38 @@ impl StateHandle {
             .map_err(|_| StateError::ActorClosed)?;
         rx.await.map_err(|_| StateError::ActorClosed)?
     }
+
+    pub async fn set_mobile_session(
+        &self,
+        chat_id: impl Into<String>,
+        mobile: MobileSessionState,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetMobileSession {
+                chat_id: chat_id.into(),
+                mobile,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn clear_mobile_session(
+        &self,
+        chat_id: impl Into<String>,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ClearMobileSession {
+                chat_id: chat_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
 }
 
 pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError> {
@@ -208,6 +261,20 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                     if let Some(perm) = state.pending_perms.get_mut(&id) {
                         perm.status = PendingPermStatus::TimedOut;
                     }
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetMobileSession {
+                    chat_id,
+                    mobile,
+                    reply,
+                } => {
+                    state.mobile_sessions.insert(chat_id, mobile);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::ClearMobileSession { chat_id, reply } => {
+                    state.mobile_sessions.remove(&chat_id);
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }

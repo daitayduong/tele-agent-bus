@@ -1,3 +1,4 @@
+pub mod claude_headless;
 pub mod inbox;
 pub mod mobile_session;
 pub mod perm;

@@ -1,12 +1,16 @@
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
+use crate::daemon::claude_headless;
+use crate::daemon::mobile_session::{
+    self, MobileCommand, SessionInfo, ARCHIVE_RETENTION, MOBILE_UUID,
+};
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
-use agent_bus_core::state::{PendingPermStatus, StateHandle};
+use agent_bus_core::state::{MobileSessionState, PendingPermStatus, StateHandle};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
 use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
@@ -221,6 +225,10 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
     username: Option<&str>,
     text: &str,
 ) -> Result<(), TelegramError> {
+    if let Some(cmd) = mobile_session::parse_mobile_command(text) {
+        return handle_mobile_command(bot, config, state, chat_id, cmd).await;
+    }
+
     if text.trim_start().starts_with('@') {
         return handle_routed_message(bot, config, state, chat_id, username, text).await;
     }
@@ -240,6 +248,346 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
             handle_switch_rp_command(bot, config, state, chat_id, repo_id.to_string()).await
         }
         _ => Ok(()),
+    }
+}
+
+async fn handle_mobile_command<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    cmd: MobileCommand,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+    match cmd {
+        MobileCommand::ListClaude => handle_list_claude_command(bot, config, state, chat_id).await,
+        MobileCommand::ClaudeMsg(body) => {
+            handle_claude_mobile_msg(bot, config, state, chat_id, body).await
+        }
+        MobileCommand::FlushMobile => {
+            bot.send_message(
+                chat_id,
+                "@flush_mobile — not implemented yet (Phase 3.5).".to_string(),
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+    }
+}
+
+/// AC-1: List active desktop Claude sessions for the chat's default repo and
+/// reply with an inline keyboard for session selection.
+pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
+        bot.send_message(
+            chat_id,
+            "No default repo. Use /switch_rp <id> first.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.clone()));
+    };
+
+    let project_dir = claude_project_dir(&repo.path);
+    let sessions = match mobile_session::detect_active_sessions(
+        &project_dir,
+        MOBILE_UUID,
+        DEFAULT_MTIME_THRESHOLD_SECS,
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            bot.send_message(
+                chat_id,
+                format!("Failed to scan sessions: {err}"),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if sessions.is_empty() {
+        bot.send_message(
+            chat_id,
+            format!(
+                "No active desktop sessions for {} (scanned {}).",
+                repo.display,
+                project_dir.display()
+            ),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let rows = mobile_session::build_session_cards(&sessions);
+    let text = format!("Active desktop sessions ({}):", repo.display);
+    bot.send_message(chat_id, text, Some(InlineKeyboard { rows }))
+        .await?;
+    Ok(())
+}
+
+/// AC-2 + AC-5 + AC-9 + AC-10: Fork the chosen desktop session into mobile uuid,
+/// archive the previous mobile file, append a marker line to the source desktop
+/// JSONL, rotate archives, and persist state.
+pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    message: MessageRef,
+    callback_id: String,
+    callback_data: String,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let Some(desktop_uuid) = mobile_session::parse_callback_data(&callback_data) else {
+        return Err(TelegramError::InvalidCallback(callback_data));
+    };
+
+    let snapshot = state.snapshot().await;
+    let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
+        bot.answer_callback(callback_id, "No default repo".to_string())
+            .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.clone()));
+    };
+
+    let project_dir = claude_project_dir(&repo.path);
+    let source_path = project_dir.join(format!("{}.jsonl", desktop_uuid));
+    let target_path = project_dir.join(format!("{}.jsonl", MOBILE_UUID));
+
+    // Locate the session to validate cwd (AC-9)
+    let sessions = match mobile_session::detect_active_sessions(
+        &project_dir,
+        MOBILE_UUID,
+        DEFAULT_MTIME_THRESHOLD_SECS,
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            bot.answer_callback(callback_id, format!("Scan failed: {err}"))
+                .await?;
+            return Ok(());
+        }
+    };
+    let Some(session) = sessions.iter().find(|s| s.uuid == desktop_uuid) else {
+        bot.answer_callback(callback_id, "Session not found".to_string())
+            .await?;
+        return Ok(());
+    };
+
+    // AC-9: cwd guard
+    if !cwd_matches_repo(&session.cwd, &repo.path) {
+        bot.edit_message_text(
+            message,
+            format!(
+                "⚠️ Session cwd {} does not match repo {}. Cannot fork across projects.",
+                session.cwd, repo.path
+            ),
+        )
+        .await?;
+        bot.answer_callback(callback_id, "cwd mismatch".to_string())
+            .await?;
+        return Ok(());
+    }
+
+    // Archive previous mobile if it exists
+    let archive_dir = agents_archive_dir(&repo.path);
+    if let Err(err) = std::fs::create_dir_all(&archive_dir) {
+        bot.answer_callback(
+            callback_id,
+            format!("archive dir error: {err}"),
+        )
+        .await?;
+        return Ok(());
+    }
+    if target_path.exists() {
+        let ts = timestamp_tag();
+        let archive_target = archive_dir.join(format!("mobile-{}.jsonl", ts));
+        if let Err(err) = std::fs::rename(&target_path, &archive_target) {
+            bot.answer_callback(callback_id, format!("archive rename failed: {err}"))
+                .await?;
+            return Ok(());
+        }
+    }
+
+    // Fork
+    let fork_stats = match mobile_session::fork_session(&source_path, &target_path, MOBILE_UUID) {
+        Ok(s) => s,
+        Err(err) => {
+            bot.answer_callback(callback_id, format!("fork failed: {err}"))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // AC-5: append marker to source desktop JSONL
+    if let Err(err) = mobile_session::append_fork_marker(&source_path, MOBILE_UUID) {
+        tracing::warn!(target: "agent_bus::mobile", error = %err, "append_fork_marker failed");
+    }
+
+    // AC-10: rotate archives
+    if let Err(err) = mobile_session::rotate_archives(&archive_dir, ARCHIVE_RETENTION) {
+        tracing::warn!(target: "agent_bus::mobile", error = %err, "rotate_archives failed");
+    }
+
+    // Persist state
+    let now = time::OffsetDateTime::now_utc();
+    let forked_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string());
+    let project_hash = project_hash_for_repo(&repo.path);
+    let mobile = MobileSessionState {
+        mobile_uuid: MOBILE_UUID.to_string(),
+        mobile_fork_source: desktop_uuid.clone(),
+        mobile_forked_at: forked_at,
+        project_hash,
+        repo_id: repo.id.clone(),
+    };
+    state
+        .set_mobile_session(chat_id.to_string(), mobile)
+        .await?;
+
+    let title = session.ai_title.clone().unwrap_or_else(|| {
+        desktop_uuid
+            .get(..8)
+            .unwrap_or(&desktop_uuid)
+            .to_string()
+    });
+    let confirm = format!(
+        "✅ Mobile forked from \"{}\" ({} lines rewritten). Send @claude <msg> to continue.",
+        title, fork_stats.lines_rewritten
+    );
+    bot.edit_message_text(message, confirm).await?;
+    bot.answer_callback(callback_id, "Forked".to_string())
+        .await?;
+    Ok(())
+}
+
+/// AC-3 + AC-4: Handle `@claude <msg>` — guard, spawn headless, reply.
+pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    body: String,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let Some(mobile) = snapshot.mobile_sessions.get(&chat_id.to_string()) else {
+        bot.send_message(
+            chat_id,
+            "⚠️ No mobile session. Send @list_claude first to pick a desktop session.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, &mobile.repo_id) else {
+        return Err(TelegramError::UnknownRepo(mobile.repo_id.clone()));
+    };
+
+    let claude_bin = claude_bin_path();
+    let cwd = PathBuf::from(&repo.path);
+    let reply = match claude_headless::spawn_claude_resume(
+        &claude_bin,
+        &cwd,
+        &mobile.mobile_uuid,
+        &body,
+        claude_headless::DEFAULT_CLAUDE_TIMEOUT_SECS,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(err) => {
+            bot.send_message(chat_id, format!("❌ claude failed: {err}"), None)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        bot.send_message(chat_id, "(empty reply from claude)".to_string(), None)
+            .await?;
+        return Ok(());
+    }
+
+    const MAX_CHUNK: usize = 4000; // stay under 4096 Telegram limit
+    for chunk in claude_headless::chunk_for_telegram(trimmed, MAX_CHUNK) {
+        bot.send_message(chat_id, chunk, None).await?;
+    }
+    Ok(())
+}
+
+// ── helpers ───────────────────────────────────────────────────────────
+
+const DEFAULT_MTIME_THRESHOLD_SECS: u64 = 30 * 60; // 30 minutes
+
+fn claude_project_dir(repo_path: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".claude")
+        .join("projects")
+        .join(project_hash_for_repo(repo_path))
+}
+
+fn project_hash_for_repo(repo_path: &str) -> String {
+    repo_path.replace('/', "-")
+}
+
+fn agents_archive_dir(repo_path: &str) -> PathBuf {
+    PathBuf::from(repo_path).join(".agents").join("archive")
+}
+
+fn cwd_matches_repo(session_cwd: &str, repo_path: &str) -> bool {
+    let normalize = |s: &str| s.trim_end_matches('/').to_string();
+    normalize(session_cwd) == normalize(repo_path)
+}
+
+fn timestamp_tag() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    now.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string())
+        .replace(':', "-")
+}
+
+fn claude_bin_path() -> String {
+    std::env::var("AGENT_BUS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+}
+
+// unused in non-test builds — silence when tests disabled
+#[allow(dead_code)]
+fn _session_info_dummy() -> SessionInfo {
+    SessionInfo {
+        uuid: String::new(),
+        cwd: String::new(),
+        ai_title: None,
+        last_modified: time::OffsetDateTime::UNIX_EPOCH,
+        turn_count: 0,
     }
 }
 
@@ -621,6 +969,21 @@ pub async fn teloxide_callback_handler(
         )
         .await
         .map_err(to_teloxide_error)?;
+    } else if data.starts_with("sel_claude:") {
+        handle_callback_sel_claude(
+            &client,
+            &config,
+            state,
+            chat.id.0,
+            MessageRef {
+                chat_id: chat.id.0,
+                message_id: message_id.0,
+            },
+            query.id,
+            data,
+        )
+        .await
+        .map_err(to_teloxide_error)?;
     } else if data.starts_with("perm:") {
         let user_name = query
             .from
@@ -655,4 +1018,141 @@ fn to_teloxide_keyboard(keyboard: InlineKeyboard) -> InlineKeyboardMarkup {
 
 fn to_teloxide_error(err: TelegramError) -> teloxide::RequestError {
     teloxide::RequestError::Io(std::io::Error::other(err.to_string()))
+}
+
+#[cfg(test)]
+mod mobile_tests {
+    use super::*;
+    use agent_bus_core::state::spawn_state_actor;
+    use tempfile::tempdir;
+
+    fn test_config() -> TelegramConfig {
+        TelegramConfig {
+            allowed_chats: vec!["100".to_string()],
+            repos: vec![RepoEntry {
+                id: "rallyup".to_string(),
+                display: "RallyUp".to_string(),
+                path: "/tmp/rallyup-test".to_string(),
+                agents: vec!["claude".to_string()],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn list_claude_with_no_default_repo_warns() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(&bot, &config, state, 100, None, "@list_claude")
+            .await
+            .unwrap();
+
+        let sent = bot.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.to_lowercase().contains("no default repo"));
+    }
+
+    #[tokio::test]
+    async fn claude_msg_without_mobile_session_sends_guard_warning() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(
+            &bot,
+            &config,
+            state,
+            100,
+            None,
+            "@claude hello world",
+        )
+        .await
+        .unwrap();
+
+        let sent = bot.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].text.contains("No mobile session"),
+            "expected guard message, got: {:?}",
+            sent[0].text
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_mobile_reports_not_implemented() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(&bot, &config, state, 100, None, "@flush_mobile")
+            .await
+            .unwrap();
+
+        let sent = bot.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("not implemented"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_chat_is_ignored_for_mobile_commands() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(&bot, &config, state, 999, None, "@list_claude")
+            .await
+            .unwrap();
+
+        assert!(bot.sent_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_mobile_msg_uses_stored_repo_and_uuid() {
+        // Verify the state lookup path — no mobile state → guard warning even
+        // when default_repo_by_chat is set (different guard).
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+
+        handle_text_command(&bot, &config, state, 100, None, "@claude hi")
+            .await
+            .unwrap();
+
+        // Still hits AC-4 guard because no mobile_sessions entry exists.
+        let sent = bot.sent_messages();
+        assert!(sent[0].text.contains("No mobile session"));
+    }
+
+    #[tokio::test]
+    async fn cwd_matches_repo_normalizes_trailing_slash() {
+        assert!(cwd_matches_repo("/a/b", "/a/b"));
+        assert!(cwd_matches_repo("/a/b/", "/a/b"));
+        assert!(cwd_matches_repo("/a/b", "/a/b/"));
+        assert!(!cwd_matches_repo("/a/b/c", "/a/b"));
+    }
+
+    #[tokio::test]
+    async fn project_hash_replaces_slashes() {
+        assert_eq!(
+            project_hash_for_repo("/home/user/Projects/RallyUp"),
+            "-home-user-Projects-RallyUp"
+        );
+    }
 }
