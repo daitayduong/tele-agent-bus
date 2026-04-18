@@ -9,8 +9,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -216,9 +218,43 @@ pub fn detect_active_sessions(
     Ok(sessions)
 }
 
-/// Build the inline keyboard rows for the \`@list_claude\` reply card.
-pub fn build_session_cards(_sessions: &[SessionInfo]) -> Vec<Vec<(String, String)>> {
-    unimplemented!("phase3: build_session_cards")
+/// Build the inline keyboard rows for the `@list_claude` reply card.
+/// Each row is a Vec of (button_text, callback_data) tuples.
+pub fn build_session_cards(sessions: &[SessionInfo]) -> Vec<Vec<(String, String)>> {
+    let now = OffsetDateTime::now_utc();
+    sessions
+        .iter()
+        .map(|s| {
+            let title = match &s.ai_title {
+                Some(t) if !t.trim().is_empty() => t.clone(),
+                _ => {
+                    let short = s.uuid.get(..8).unwrap_or(&s.uuid);
+                    let base = Path::new(&s.cwd)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&s.cwd);
+                    format!("{} ({})", short, base)
+                }
+            };
+            let rel = relative_time(now, s.last_modified);
+            let text = format!("{} · {} turns · {}", title, s.turn_count, rel);
+            let data = format!("sel_claude:{}", s.uuid);
+            vec![(text, data)]
+        })
+        .collect()
+}
+
+fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
+    let secs = (now - then).whole_seconds().max(0);
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 /// Extract mobile turns (user+assistant messages) added after \`since\` from the mobile JSONL.
@@ -276,9 +312,32 @@ pub fn rotate_archives(archive_dir: &Path, keep: usize) -> Result<Vec<PathBuf>> 
     Ok(deleted)
 }
 
-/// Parse a Telegram inbound text into a \`MobileCommand\`. Returns \`None\` if no match.
-pub fn parse_mobile_command(_text: &str) -> Option<MobileCommand> {
-    unimplemented!("phase3: parse_mobile_command")
+/// Parse a Telegram inbound text into a `MobileCommand`. Returns `None` if no match.
+///
+/// Matches:
+///   - `@list_claude` or `@ls_cl_ses` (any case, leading whitespace allowed) → ListClaude
+///   - `@flush_mobile` → FlushMobile
+///   - `@claude <msg>` (with non-empty body) → ClaudeMsg(body.trim())
+pub fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+    if lower == "@list_claude" || lower == "@ls_cl_ses" {
+        return Some(MobileCommand::ListClaude);
+    }
+    if lower == "@flush_mobile" {
+        return Some(MobileCommand::FlushMobile);
+    }
+    if let Some(rest) = lower.strip_prefix("@claude") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            let prefix_len = "@claude".len();
+            let body = trimmed[prefix_len..].trim();
+            if body.is_empty() {
+                return None;
+            }
+            return Some(MobileCommand::ClaudeMsg(body.to_string()));
+        }
+    }
+    None
 }
 
 /// Append a user-type marker JSONL line to a desktop session file (see AC-5).
@@ -317,9 +376,12 @@ pub fn append_fork_marker(desktop_jsonl: &Path, mobile_uuid: &str) -> Result<()>
     Ok(())
 }
 
-/// Validate that callback data matches \`^sel_claude:[0-9a-f-]{36}$\`.
-pub fn parse_callback_data(_data: &str) -> Option<String> {
-    unimplemented!("phase3: parse_callback_data")
+/// Validate that callback data matches `^sel_claude:[0-9a-f-]{36}$`.
+/// Returns Some(uuid) on match, None otherwise.
+pub fn parse_callback_data(data: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"^sel_claude:([0-9a-f-]{36})$").unwrap());
+    re.captures(data).map(|c| c[1].to_string())
 }
 
 #[cfg(test)]
