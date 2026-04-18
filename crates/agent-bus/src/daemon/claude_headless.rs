@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-pub const DEFAULT_CLAUDE_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_CLAUDE_TIMEOUT_SECS: u64 = 180;
 
 /// Spawn `claude --resume <uuid> --print --output-format text` from `cwd`,
 /// pipe `prompt` via stdin, return stdout.

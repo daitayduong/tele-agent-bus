@@ -385,7 +385,7 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     ) {
         Ok(s) => s,
         Err(err) => {
-            bot.answer_callback(callback_id, format!("Scan failed: {err}"))
+            bot.answer_callback(callback_id, short_err("Scan failed", &err.to_string()))
                 .await?;
             return Ok(());
         }
@@ -414,20 +414,37 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     // Archive previous mobile if it exists
     let archive_dir = agents_archive_dir(&repo.path);
     if let Err(err) = std::fs::create_dir_all(&archive_dir) {
-        bot.answer_callback(
-            callback_id,
-            format!("archive dir error: {err}"),
-        )
-        .await?;
+        bot.answer_callback(callback_id, short_err("archive dir error", &err.to_string()))
+            .await?;
         return Ok(());
     }
     if target_path.exists() {
         let ts = timestamp_tag();
         let archive_target = archive_dir.join(format!("mobile-{}.jsonl", ts));
         if let Err(err) = std::fs::rename(&target_path, &archive_target) {
-            bot.answer_callback(callback_id, format!("archive rename failed: {err}"))
-                .await?;
+            bot.answer_callback(
+                callback_id,
+                short_err("archive rename failed", &err.to_string()),
+            )
+            .await?;
             return Ok(());
+        }
+    }
+
+    // Clean up any stale .tmp.* files from prior aborted forks
+    if let Some(dir) = target_path.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let prefix = format!(
+                "{}.tmp.",
+                target_path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            );
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(&prefix) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
         }
     }
 
@@ -435,7 +452,7 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     let fork_stats = match mobile_session::fork_session(&source_path, &target_path, MOBILE_UUID) {
         Ok(s) => s,
         Err(err) => {
-            bot.answer_callback(callback_id, format!("fork failed: {err}"))
+            bot.answer_callback(callback_id, short_err("fork failed", &err.to_string()))
                 .await?;
             return Ok(());
         }
@@ -579,6 +596,18 @@ fn claude_bin_path() -> String {
     std::env::var("AGENT_BUS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
+/// Telegram's answer_callback limit is 200 chars; sanitize errors so control
+/// characters and huge payloads never reach the API.
+fn short_err(label: &str, err: &str) -> String {
+    const MAX: usize = 180;
+    let sanitized: String = err
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let head: String = sanitized.chars().take(MAX).collect();
+    format!("{}: {}", label, head)
+}
+
 // unused in non-test builds — silence when tests disabled
 #[allow(dead_code)]
 fn _session_info_dummy() -> SessionInfo {
@@ -586,6 +615,7 @@ fn _session_info_dummy() -> SessionInfo {
         uuid: String::new(),
         cwd: String::new(),
         ai_title: None,
+        first_prompt: None,
         last_modified: time::OffsetDateTime::UNIX_EPOCH,
         turn_count: 0,
     }

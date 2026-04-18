@@ -18,7 +18,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// Fixed mobile session uuid reused across all forks. See spec §Data Model.
-pub const MOBILE_UUID: &str = "mobile-00000000-0000-0000-0000-000000000001";
+pub const MOBILE_UUID: &str = "00000000-0000-4000-8000-000000000001";
 
 /// Maximum number of mobile archive files retained (see AC-10).
 pub const ARCHIVE_RETENTION: usize = 10;
@@ -29,6 +29,8 @@ pub struct SessionInfo {
     pub uuid: String,
     pub cwd: String,
     pub ai_title: Option<String>,
+    /// First real user prompt (IDE/tool wrappers stripped), used as card label fallback.
+    pub first_prompt: Option<String>,
     pub last_modified: OffsetDateTime,
     pub turn_count: usize,
 }
@@ -53,21 +55,24 @@ pub enum MobileCommand {
 /// - Lines that don't contain \`sessionId\` are returned unchanged.
 /// - Other fields (cwd, gitBranch, uuid, parentUuid, promptId) are preserved.
 /// - Returns error if the line is not valid JSON.
+/// - Strips leading NUL/whitespace padding that appears in torn concurrent writes.
 pub fn rewrite_session_id(line: &str, new_uuid: &str) -> Result<String> {
-    if line.trim().is_empty() {
+    let stripped = line.trim_start_matches(|c: char| c == '\0' || c.is_whitespace());
+    if stripped.is_empty() {
         return Ok(line.to_string());
     }
-    let mut v: Value = serde_json::from_str(line)
-        .with_context(|| format!("invalid JSON line: {}", line))?;
-    
+    let preview: String = stripped.chars().take(120).collect();
+    let mut v: Value = serde_json::from_str(stripped)
+        .with_context(|| format!("invalid JSON line (len={}): {}…", stripped.len(), preview))?;
+
     if let Some(obj) = v.as_object_mut() {
         if obj.contains_key("sessionId") {
             obj.insert("sessionId".to_string(), json!(new_uuid));
             return Ok(serde_json::to_string(&v)?);
         }
     }
-    
-    Ok(line.trim().to_string())
+
+    Ok(stripped.to_string())
 }
 
 /// Fork a source JSONL session into a target file, rewriting sessionId to \`new_uuid\`.
@@ -92,6 +97,7 @@ pub fn fork_session(source: &Path, target: &Path, new_uuid: &str) -> Result<Fork
         std::process::id()));
     
     let mut lines_rewritten = 0;
+    let mut lines_skipped = 0;
     {
         let mut dest_file = OpenOptions::new()
             .create(true)
@@ -102,14 +108,32 @@ pub fn fork_session(source: &Path, target: &Path, new_uuid: &str) -> Result<Fork
         for line in reader.lines() {
             let line = line?;
             if line.contains("\"sessionId\"") {
-                let rewritten = rewrite_session_id(&line, new_uuid)?;
-                writeln!(dest_file, "{}", rewritten)?;
-                lines_rewritten += 1;
+                match rewrite_session_id(&line, new_uuid) {
+                    Ok(rewritten) => {
+                        writeln!(dest_file, "{}", rewritten)?;
+                        lines_rewritten += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "agent_bus::mobile",
+                            error = %err,
+                            "skipping unparseable jsonl line during fork"
+                        );
+                        lines_skipped += 1;
+                    }
+                }
             } else {
                 writeln!(dest_file, "{}", line)?;
             }
         }
         dest_file.sync_all()?;
+    }
+    if lines_skipped > 0 {
+        tracing::warn!(
+            target: "agent_bus::mobile",
+            skipped = lines_skipped,
+            "fork_session skipped corrupt lines"
+        );
     }
 
     fs::rename(&tmp_path, target)?;
@@ -179,17 +203,27 @@ pub fn detect_active_sessions(
                     
                     let mut cwd = String::new();
                     let mut ai_title = None;
+                    let mut first_prompt: Option<String> = None;
                     let mut turn_count = 0;
 
                     for line in reader.lines() {
                         if let Ok(line) = line {
-                            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                            let stripped = line
+                                .trim_start_matches(|c: char| c == '\0' || c.is_whitespace());
+                            if let Ok(v) = serde_json::from_str::<Value>(stripped) {
                                 let t = v["type"].as_str().unwrap_or("");
                                 if t == "user" || t == "assistant" {
                                     turn_count += 1;
                                     if cwd.is_empty() {
                                         if let Some(c) = v["cwd"].as_str() {
                                             cwd = c.to_string();
+                                        }
+                                    }
+                                }
+                                if t == "user" && first_prompt.is_none() {
+                                    if let Some(text) = extract_user_text(&v) {
+                                        if let Some(cleaned) = clean_prompt_snippet(&text) {
+                                            first_prompt = Some(cleaned);
                                         }
                                     }
                                 }
@@ -206,6 +240,7 @@ pub fn detect_active_sessions(
                         uuid: stem.to_string(),
                         cwd,
                         ai_title,
+                        first_prompt,
                         last_modified: mtime,
                         turn_count,
                     });
@@ -225,23 +260,79 @@ pub fn build_session_cards(sessions: &[SessionInfo]) -> Vec<Vec<(String, String)
     sessions
         .iter()
         .map(|s| {
-            let title = match &s.ai_title {
-                Some(t) if !t.trim().is_empty() => t.clone(),
-                _ => {
-                    let short = s.uuid.get(..8).unwrap_or(&s.uuid);
-                    let base = Path::new(&s.cwd)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(&s.cwd);
-                    format!("{} ({})", short, base)
-                }
-            };
+            let title = pick_session_label(s);
             let rel = relative_time(now, s.last_modified);
             let text = format!("{} · {} turns · {}", title, s.turn_count, rel);
             let data = format!("sel_claude:{}", s.uuid);
             vec![(text, data)]
         })
         .collect()
+}
+
+/// Pick a concise label for the session card: ai-title → first-prompt → uuid fallback.
+fn pick_session_label(s: &SessionInfo) -> String {
+    const MAX: usize = 52;
+    if let Some(t) = s.ai_title.as_ref() {
+        if !t.trim().is_empty() {
+            return truncate_label(t.trim(), MAX);
+        }
+    }
+    if let Some(p) = s.first_prompt.as_ref() {
+        if !p.trim().is_empty() {
+            return truncate_label(p.trim(), MAX);
+        }
+    }
+    let short = s.uuid.get(..8).unwrap_or(&s.uuid);
+    let base = Path::new(&s.cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&s.cwd);
+    format!("{} ({})", short, base)
+}
+
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    let single_line: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect();
+    let collapsed = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let head: String = collapsed.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", head)
+}
+
+/// Extract text content from a Claude `type:"user"` JSONL record.
+/// Handles both `message.content: "str"` and `message.content: [{type:"text",text:"..."}]`.
+fn extract_user_text(v: &Value) -> Option<String> {
+    let c = v.get("message")?.get("content")?;
+    if let Some(s) = c.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = c.as_array() {
+        for block in arr {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Drop IDE/command wrappers (`<ide_selection>`, `<command-name>`, etc.) and return
+/// the first non-empty text chunk, or None if nothing usable remains.
+fn clean_prompt_snippet(text: &str) -> Option<String> {
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TAG_RE.get_or_init(|| Regex::new(r"(?s)<[a-zA-Z_][a-zA-Z0-9_-]*>.*?</[a-zA-Z_][a-zA-Z0-9_-]*>").unwrap());
+    let stripped = re.replace_all(text, " ");
+    let cleaned = stripped.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.to_string())
 }
 
 fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
@@ -519,6 +610,7 @@ mod tests {
                 uuid: "11111111-1111-1111-1111-111111111111".to_string(),
                 cwd: "/repo".to_string(),
                 ai_title: Some("2FA implementation".to_string()),
+                first_prompt: None,
                 last_modified: OffsetDateTime::now_utc(),
                 turn_count: 47,
             },
@@ -526,6 +618,7 @@ mod tests {
                 uuid: "22222222-2222-2222-2222-222222222222".to_string(),
                 cwd: "/other".to_string(),
                 ai_title: None,
+                first_prompt: None,
                 last_modified: OffsetDateTime::now_utc() - Duration::minutes(5),
                 turn_count: 12,
             },
@@ -545,6 +638,7 @@ mod tests {
             uuid: "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
             cwd: "/a".to_string(),
             ai_title: None,
+            first_prompt: None,
             last_modified: OffsetDateTime::now_utc(),
             turn_count: 1,
         }];
@@ -687,5 +781,41 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(last_line).unwrap();
         assert_eq!(parsed["isSidechain"], serde_json::Value::Bool(true));
         assert!(parsed["message"].to_string().contains("Mobile session"));
+    }
+
+    #[test]
+    #[ignore = "requires live ~/.claude/projects — run with --ignored"]
+    fn real_sessions_smoke() {
+        let home = std::env::var("HOME").unwrap();
+        let dir = PathBuf::from(format!(
+            "{}/.claude/projects/-home-john-chuong-Projects-RallyUp",
+            home
+        ));
+        if !dir.exists() {
+            panic!("project dir missing: {}", dir.display());
+        }
+
+        let sessions = detect_active_sessions(&dir, MOBILE_UUID, 30 * 60).unwrap();
+        println!("found {} active sessions", sessions.len());
+        for s in &sessions {
+            println!(
+                "  {} turns={} mtime={} title={:?} cwd={}",
+                s.uuid, s.turn_count, s.last_modified, s.ai_title, s.cwd
+            );
+        }
+
+        let cards = build_session_cards(&sessions);
+        println!("cards:");
+        for row in &cards {
+            for (text, data) in row {
+                println!("  text={:?} data={:?}", text, data);
+            }
+        }
+
+        assert_eq!(cards.len(), sessions.len());
+        for (row, s) in cards.iter().zip(sessions.iter()) {
+            let (_text, data) = &row[0];
+            assert_eq!(data, &format!("sel_claude:{}", s.uuid));
+        }
     }
 }
