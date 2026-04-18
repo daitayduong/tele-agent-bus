@@ -39,6 +39,57 @@ pub struct StateSnapshot {
     pub pending_perms: BTreeMap<String, PendingPerm>,
     #[serde(default)]
     pub mobile_sessions: BTreeMap<String, MobileSessionState>,
+    // Phase 4 additions (AC-Q9 backward-compat via serde defaults):
+    #[serde(default)]
+    pub auth_context_status: BTreeMap<String, BTreeMap<String, AuthContextStatus>>,
+    #[serde(default)]
+    pub active_auth_context: BTreeMap<String, String>,
+    #[serde(default)]
+    pub pending_rotations: BTreeMap<String, PendingRotation>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthContextStatusKind {
+    Available,
+    QuotaExhausted,
+    RateLimited,
+    AuthExpired,
+    ManualReauthRequired,
+    Disabled,
+    UnknownFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthContextStatus {
+    pub status: AuthContextStatusKind,
+    #[serde(default)]
+    pub cooldown_until: Option<String>, // RFC3339
+    #[serde(default)]
+    pub last_event_id: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingRotationStatus {
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingRotation {
+    pub id: String,
+    pub agent: String,
+    pub from: String,
+    pub to: String,
+    pub repo_id: String,
+    pub request_id: String,
+    pub chat_id: i64,
+    pub expires_at: String,
+    pub status: PendingRotationStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +140,9 @@ impl Default for StateSnapshot {
             sessions: BTreeMap::new(),
             pending_perms: BTreeMap::new(),
             mobile_sessions: BTreeMap::new(),
+            auth_context_status: BTreeMap::new(),
+            active_auth_context: BTreeMap::new(),
+            pending_rotations: BTreeMap::new(),
         }
     }
 }
@@ -129,6 +183,26 @@ enum StateCmd {
     },
     ClearMobileSession {
         chat_id: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetAuthContextStatus {
+        agent: String,
+        id: String,
+        status: AuthContextStatus,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetActiveAuthContext {
+        agent: String,
+        id: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    InsertPendingRotation {
+        rotation: PendingRotation,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ResolvePendingRotation {
+        id: String,
+        status: PendingRotationStatus,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
 }
@@ -224,6 +298,71 @@ impl StateHandle {
             .map_err(|_| StateError::ActorClosed)?;
         rx.await.map_err(|_| StateError::ActorClosed)?
     }
+
+    pub async fn set_auth_context_status(
+        &self,
+        agent: impl Into<String>,
+        id: impl Into<String>,
+        status: AuthContextStatus,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetAuthContextStatus {
+                agent: agent.into(),
+                id: id.into(),
+                status,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_active_auth_context(
+        &self,
+        agent: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetActiveAuthContext {
+                agent: agent.into(),
+                id: id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn insert_pending_rotation(
+        &self,
+        rotation: PendingRotation,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::InsertPendingRotation { rotation, reply })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn resolve_pending_rotation(
+        &self,
+        id: impl Into<String>,
+        status: PendingRotationStatus,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ResolvePendingRotation {
+                id: id.into(),
+                status,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
 }
 
 pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError> {
@@ -275,6 +414,39 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                 }
                 StateCmd::ClearMobileSession { chat_id, reply } => {
                     state.mobile_sessions.remove(&chat_id);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetAuthContextStatus {
+                    agent,
+                    id,
+                    status,
+                    reply,
+                } => {
+                    state
+                        .auth_context_status
+                        .entry(agent)
+                        .or_default()
+                        .insert(id, status);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetActiveAuthContext { agent, id, reply } => {
+                    state.active_auth_context.insert(agent, id);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::InsertPendingRotation { rotation, reply } => {
+                    state
+                        .pending_rotations
+                        .insert(rotation.id.clone(), rotation);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::ResolvePendingRotation { id, status, reply } => {
+                    if let Some(rot) = state.pending_rotations.get_mut(&id) {
+                        rot.status = status;
+                    }
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
@@ -461,6 +633,107 @@ mod tests {
 
         assert_eq!(snapshot, original);
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn backward_compat_loads_state_without_phase4_fields() {
+        // AC-Q9: old state.json without auth_context_status etc. must deserialize.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"default_repo_by_chat":{},"tg_offset":null,"sessions":{},"pending_perms":{}}"#,
+        )
+        .unwrap();
+
+        let handle = spawn_state_actor(path).await.unwrap();
+        let snap = handle.snapshot().await;
+        assert!(snap.auth_context_status.is_empty());
+        assert!(snap.active_auth_context.is_empty());
+        assert!(snap.pending_rotations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_auth_context_status_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        let status = AuthContextStatus {
+            status: AuthContextStatusKind::QuotaExhausted,
+            cooldown_until: Some("2026-04-18T19:00:00Z".to_string()),
+            last_event_id: Some("qevt_01HV".to_string()),
+            updated_at: "2026-04-18T14:10:00Z".to_string(),
+        };
+        handle
+            .set_auth_context_status("claude", "john", status.clone())
+            .await
+            .unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(
+            snap.auth_context_status["claude"]["john"], status
+        );
+
+        drop(handle);
+        let reloaded: StateSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.auth_context_status["claude"]["john"].status,
+            AuthContextStatusKind::QuotaExhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn set_active_auth_context_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        handle
+            .set_active_auth_context("claude", "partner")
+            .await
+            .unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(snap.active_auth_context.get("claude").unwrap(), "partner");
+    }
+
+    #[tokio::test]
+    async fn pending_rotation_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        let rot = PendingRotation {
+            id: "rot_01".to_string(),
+            agent: "claude".to_string(),
+            from: "john".to_string(),
+            to: "partner".to_string(),
+            repo_id: "rallyup".to_string(),
+            request_id: "req_01".to_string(),
+            chat_id: 123456789,
+            expires_at: "2026-04-18T14:20:00Z".to_string(),
+            status: PendingRotationStatus::Pending,
+        };
+        handle.insert_pending_rotation(rot.clone()).await.unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(
+            snap.pending_rotations["rot_01"].status,
+            PendingRotationStatus::Pending
+        );
+
+        handle
+            .resolve_pending_rotation("rot_01", PendingRotationStatus::Approved)
+            .await
+            .unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(
+            snap.pending_rotations["rot_01"].status,
+            PendingRotationStatus::Approved
+        );
     }
 
     #[tokio::test]

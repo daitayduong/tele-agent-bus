@@ -529,12 +529,22 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
 
     let claude_bin = claude_bin_path();
     let cwd = PathBuf::from(&repo.path);
+    let timeout_secs = claude_headless::resolved_timeout_secs();
+
+    bot.send_message(
+        chat_id,
+        format!("⏳ thinking... (timeout {}s)", timeout_secs),
+        None,
+    )
+    .await
+    .ok();
+
     let reply = match claude_headless::spawn_claude_resume(
         &claude_bin,
         &cwd,
         &mobile.mobile_uuid,
         &body,
-        claude_headless::DEFAULT_CLAUDE_TIMEOUT_SECS,
+        timeout_secs,
     )
     .await
     {

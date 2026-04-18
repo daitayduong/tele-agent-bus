@@ -2,7 +2,7 @@
 //! via stdin, capture stdout.
 //!
 //! Behavior:
-//! - Timeout after `timeout_secs` (default 30s).
+//! - Timeout after `timeout_secs` (default 600s, override via `AGENT_BUS_CLAUDE_TIMEOUT_SECS`).
 //! - Returns stdout on success.
 //! - Returns error with tail of stderr on failure.
 
@@ -15,7 +15,17 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-pub const DEFAULT_CLAUDE_TIMEOUT_SECS: u64 = 180;
+pub const DEFAULT_CLAUDE_TIMEOUT_SECS: u64 = 600;
+
+/// Resolve effective timeout: env `AGENT_BUS_CLAUDE_TIMEOUT_SECS` if set and
+/// parseable, else `DEFAULT_CLAUDE_TIMEOUT_SECS`.
+pub fn resolved_timeout_secs() -> u64 {
+    std::env::var("AGENT_BUS_CLAUDE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CLAUDE_TIMEOUT_SECS)
+}
 
 /// Spawn `claude --resume <uuid> --print --output-format text` from `cwd`,
 /// pipe `prompt` via stdin, return stdout.

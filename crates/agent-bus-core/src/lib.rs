@@ -11,8 +11,10 @@
 
 #![deny(unsafe_code)]
 
+pub mod auth_context;
 pub mod blacklist;
 pub mod blacklist_integrity;
+pub mod classifier;
 pub mod config;
 pub mod path_validate;
 pub mod peer_uid;
