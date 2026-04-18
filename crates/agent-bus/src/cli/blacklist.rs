@@ -1,13 +1,13 @@
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use agent_bus_core::blacklist_integrity;
+use anyhow::{anyhow, Context, Result};
+use clap::Subcommand;
+use rand::{thread_rng, RngCore};
+use regex::Regex;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use clap::Subcommand;
-use anyhow::{Result, Context, anyhow};
-use regex::Regex;
-use agent_bus_core::blacklist_integrity;
-use rand::{RngCore, thread_rng};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 const DEFAULT_ETC_DIR: &str = "/etc/agent-bus";
 
@@ -147,7 +147,7 @@ fn rotate_key_inner(etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
     let mut new_key = [0u8; 32];
     thread_rng().fill_bytes(&mut new_key);
     let key_path = etc_dir.join("blacklist.key");
-    
+
     // We need to lock during the whole process
     let lock = Lock::new(etc_dir)?;
 
@@ -197,7 +197,7 @@ fn save_blacklist(etc_dir: &Path, patterns: &[String]) -> Result<()> {
     let body = patterns.join("\n");
     let key_path = etc_dir.join("blacklist.key");
     let key = fs::read(&key_path).context("missing blacklist.key")?;
-    
+
     let hmac = blacklist_integrity::compute_hmac(&key, body.as_bytes());
 
     let conf_path = etc_dir.join("blacklist.conf");
@@ -240,8 +240,9 @@ impl Lock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
-        
+
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
         let res = unsafe { libc::flock(fd, libc::LOCK_EX) };
         if res != 0 {
@@ -256,7 +257,9 @@ impl Lock {
 impl Drop for Lock {
     fn drop(&mut self) {
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&self._file);
-        unsafe { libc::flock(fd, libc::LOCK_UN); }
+        unsafe {
+            libc::flock(fd, libc::LOCK_UN);
+        }
     }
 }
 
@@ -265,8 +268,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn euid_root() -> u32 { 0 }
-    fn euid_user() -> u32 { 1000 }
+    fn euid_root() -> u32 {
+        0
+    }
+    fn euid_user() -> u32 {
+        1000
+    }
 
     #[test]
     fn test_init_as_root() {
@@ -292,7 +299,7 @@ mod tests {
 
         add_inner("^rm -rf", d.path(), euid_root).unwrap();
         add_inner("^ls -R", d.path(), euid_root).unwrap();
-        
+
         let conf = fs::read_to_string(d.path().join("blacklist.conf")).unwrap();
         assert!(conf.contains("^rm -rf"));
         assert!(conf.contains("^ls -R"));
@@ -326,7 +333,7 @@ mod tests {
 
         assert_ne!(old_key, new_key);
         verify_inner(d.path()).unwrap();
-        
+
         let conf = fs::read_to_string(d.path().join("blacklist.conf")).unwrap();
         assert!(conf.contains("pattern1"));
     }
@@ -339,9 +346,12 @@ mod tests {
 
         // Tamper
         fs::write(d.path().join("blacklist.conf"), "tampered").unwrap();
-        
+
         let res = verify_inner(d.path());
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("integrity check FAILED"));
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("integrity check FAILED"));
     }
 }

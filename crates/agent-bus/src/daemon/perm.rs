@@ -117,14 +117,16 @@ impl PermService {
         telegram_config: Arc<TelegramConfig>,
         bot: Arc<dyn BotClient>,
         loader: Arc<dyn BlacklistLoader>,
-        registry: PendingPermRegistry, timeout: Duration,
+        registry: PendingPermRegistry,
+        timeout: Duration,
     ) -> Self {
         Self {
             state,
             telegram_config,
             bot,
             loader,
-            registry, timeout,
+            registry,
+            timeout,
             cache: Arc::new(Mutex::new(BlacklistCache::default())),
         }
     }
@@ -254,7 +256,7 @@ impl PermService {
         let should_check = cache
             .last_checked
             .and_then(|checked| now.duration_since(checked).ok())
-            .is_none_or(|elapsed| elapsed >= BLACKLIST_POLL_INTERVAL);
+            .map_or(true, |elapsed| elapsed >= BLACKLIST_POLL_INTERVAL);
         if !cache.lines.is_empty() && !should_check {
             return Ok(cache.lines.clone());
         }
@@ -321,7 +323,6 @@ fn now_plus_string(duration: Duration) -> String {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
-
 
 fn request_repo_id(req: &PermCheckRequest) -> String {
     req.repo_id
@@ -455,7 +456,8 @@ mod tests {
                 lines: vec!["rm\\s+-rf\tdestructive".to_string()],
                 err: None,
             }),
-            PendingPermRegistry::default(), Duration::from_secs(30),
+            PendingPermRegistry::default(),
+            Duration::from_secs(30),
         );
 
         let resp = service.check(request("ls /tmp", 1)).await.unwrap();
@@ -478,7 +480,8 @@ mod tests {
                 lines: vec!["rm\\s+-rf\tdestructive".to_string()],
                 err: None,
             }),
-            PendingPermRegistry::default(), Duration::from_secs(30),
+            PendingPermRegistry::default(),
+            Duration::from_secs(30),
         );
 
         let resp = service.check(request("rm -rf /tmp/foo", 1)).await.unwrap();
@@ -512,7 +515,8 @@ mod tests {
                 lines: vec!["git\\s+push\\s+--force".to_string()],
                 err: None,
             }),
-            registry.clone(), Duration::from_secs(30),
+            registry.clone(),
+            Duration::from_secs(30),
         );
 
         let handle = tokio::spawn(async move {
@@ -549,7 +553,8 @@ mod tests {
                 lines: vec![],
                 err: Some("hmac mismatch"),
             }),
-            PendingPermRegistry::default(), Duration::from_secs(30),
+            PendingPermRegistry::default(),
+            Duration::from_secs(30),
         );
 
         let resp = service.check(request("ls", 1)).await.unwrap();

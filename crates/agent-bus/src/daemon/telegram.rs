@@ -1,9 +1,11 @@
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
+use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
 use agent_bus_core::state::{PendingPermStatus, StateHandle};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
@@ -63,6 +65,8 @@ pub enum TelegramError {
     InvalidCallback(String),
     #[error(transparent)]
     State(#[from] agent_bus_core::state::StateError),
+    #[error(transparent)]
+    Inbox(#[from] anyhow::Error),
 }
 
 pub trait BotClient: Send + Sync {
@@ -214,8 +218,13 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
     config: &TelegramConfig,
     state: StateHandle,
     chat_id: i64,
+    username: Option<&str>,
     text: &str,
 ) -> Result<(), TelegramError> {
+    if text.trim_start().starts_with('@') {
+        return handle_routed_message(bot, config, state, chat_id, username, text).await;
+    }
+
     let mut parts = text.split_whitespace();
     match parts.next() {
         Some("/list_rp") => handle_list_rp_command(bot, config, state, chat_id).await,
@@ -232,6 +241,103 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
         }
         _ => Ok(()),
     }
+}
+
+pub async fn handle_routed_message<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    username: Option<&str>,
+    text: &str,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let default_repo = snapshot
+        .default_repo_by_chat
+        .get(&chat_id.to_string())
+        .map(String::as_str);
+    let routed = match RoutingParser::parse(text, default_repo) {
+        Ok(routed) => routed,
+        Err(err) => {
+            log_routing_rejected(&err, text);
+            if err != RoutingError::NoMatch {
+                bot.send_message(chat_id, routing_error_message(&err).to_string(), None)
+                    .await?;
+            }
+            return Ok(());
+        }
+    };
+
+    let Some(repo) = repo_by_id(config, &routed.repo) else {
+        log_routing_rejected_reason("unknown_repo", text);
+        bot.send_message(
+            chat_id,
+            format!("Unknown agent or repo: {}", text.trim_start()),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    if !repo.agents.iter().any(|agent| agent == &routed.agent) {
+        log_routing_rejected_reason("unknown_agent", text);
+        bot.send_message(
+            chat_id,
+            format!("Unknown agent or repo: {}", text.trim_start()),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    write_routed(repo, &routed, username.unwrap_or("unknown"))?;
+    bot.send_message(
+        chat_id,
+        format!("✓ routed to {}@{}", routed.agent, routed.repo),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+fn write_routed(repo: &RepoEntry, routed: &Routed, username: &str) -> Result<(), TelegramError> {
+    crate::daemon::inbox::append_inbox(
+        Path::new(&repo.path),
+        &routed.agent,
+        username,
+        &routed.body,
+    )?;
+    Ok(())
+}
+
+fn routing_error_message(err: &RoutingError) -> &'static str {
+    match err {
+        RoutingError::NoMatch => "",
+        RoutingError::NoDefaultRepo => {
+            "No default repo for this chat. Use /switch_rp <id> or @agent:repo msg"
+        }
+        RoutingError::InvalidAgentName => "Invalid agent name",
+        RoutingError::InvalidRepoName => "Invalid repo name",
+        RoutingError::EmptyBody => "Empty message body",
+        RoutingError::MessageTooLong => "Message too long",
+    }
+}
+
+fn log_routing_rejected(err: &RoutingError, raw: &str) {
+    log_routing_rejected_reason(err.reason(), raw);
+}
+
+fn log_routing_rejected_reason(reason: &'static str, raw: &str) {
+    let raw_snippet = raw.chars().take(80).collect::<String>();
+    tracing::warn!(
+        target: "agent_bus::routing",
+        reason = %reason,
+        raw_snippet,
+        "routing_rejected"
+    );
 }
 
 pub async fn send_perm_prompt<B: BotClient + ?Sized>(
@@ -475,7 +581,8 @@ pub async fn teloxide_message_handler(
 ) -> ResponseResult<()> {
     let client = TeloxideBotClient::new(bot);
     if let Some(text) = msg.text() {
-        handle_text_command(&client, &config, state, msg.chat.id.0, text)
+        let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
+        handle_text_command(&client, &config, state, msg.chat.id.0, username, text)
             .await
             .map_err(to_teloxide_error)?;
     }
