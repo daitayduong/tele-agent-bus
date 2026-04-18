@@ -43,3 +43,4 @@ tempfile = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 mockall = { workspace = true }
+filetime = "0.2"
