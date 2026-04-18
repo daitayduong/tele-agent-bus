@@ -5,9 +5,14 @@
 //! This module implements session forking, active-session detection, delta extraction,
 //! and command parsing for the Telegram-controlled mobile Claude workflow.
 
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// Fixed mobile session uuid reused across all forks. See spec §Data Model.
@@ -16,7 +21,7 @@ pub const MOBILE_UUID: &str = "mobile-00000000-0000-0000-0000-000000000001";
 /// Maximum number of mobile archive files retained (see AC-10).
 pub const ARCHIVE_RETENTION: usize = 10;
 
-/// One active Claude desktop session discovered in `~/.claude/projects/<hash>/`.
+/// One active Claude desktop session discovered in \`~/.claude/projects/<hash>/\`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub uuid: String,
@@ -41,74 +46,278 @@ pub enum MobileCommand {
     ClaudeMsg(String),
 }
 
-/// Rewrite the `sessionId` field in a single JSONL line to `new_uuid`.
+/// Rewrite the \`sessionId\` field in a single JSONL line to \`new_uuid\`.
 ///
-/// - Lines that don't contain `sessionId` are returned unchanged.
+/// - Lines that don't contain \`sessionId\` are returned unchanged.
 /// - Other fields (cwd, gitBranch, uuid, parentUuid, promptId) are preserved.
 /// - Returns error if the line is not valid JSON.
-pub fn rewrite_session_id(_line: &str, _new_uuid: &str) -> Result<String> {
-    unimplemented!("phase3: rewrite_session_id")
+pub fn rewrite_session_id(line: &str, new_uuid: &str) -> Result<String> {
+    if line.trim().is_empty() {
+        return Ok(line.to_string());
+    }
+    let mut v: Value = serde_json::from_str(line)
+        .with_context(|| format!("invalid JSON line: {}", line))?;
+    
+    if let Some(obj) = v.as_object_mut() {
+        if obj.contains_key("sessionId") {
+            obj.insert("sessionId".to_string(), json!(new_uuid));
+            return Ok(serde_json::to_string(&v)?);
+        }
+    }
+    
+    Ok(line.trim().to_string())
 }
 
-/// Fork a source JSONL session into a target file, rewriting sessionId to `new_uuid`.
+/// Fork a source JSONL session into a target file, rewriting sessionId to \`new_uuid\`.
 ///
-/// If `target` already exists, it MUST be archived (caller responsibility or inside impl
-/// depending on final design). Returns stats for logging/Telegram reply.
-pub fn fork_session(_source: &Path, _target: &Path, _new_uuid: &str) -> Result<ForkStats> {
-    unimplemented!("phase3: fork_session")
+/// If \`target\` already exists, it MUST be archived. Returns stats for logging/Telegram reply.
+pub fn fork_session(source: &Path, target: &Path, new_uuid: &str) -> Result<ForkStats> {
+    let mut archived_previous = false;
+    if target.exists() {
+        let mtime = fs::metadata(target)?.modified()?;
+        let dt: OffsetDateTime = mtime.into();
+        let ts = dt.format(&Rfc3339)?.replace(':', "-");
+        let archive_path = target.with_extension(format!("archive-{}.jsonl", ts));
+        fs::rename(target, &archive_path)?;
+        archived_previous = true;
+    }
+
+    let src_file = File::open(source)?;
+    let reader = BufReader::new(src_file);
+
+    let tmp_path = target.with_file_name(format!("{}.tmp.{}", 
+        target.file_name().unwrap().to_str().unwrap(), 
+        std::process::id()));
+    
+    let mut lines_rewritten = 0;
+    {
+        let mut dest_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.contains("\"sessionId\"") {
+                let rewritten = rewrite_session_id(&line, new_uuid)?;
+                writeln!(dest_file, "{}", rewritten)?;
+                lines_rewritten += 1;
+            } else {
+                writeln!(dest_file, "{}", line)?;
+            }
+        }
+        dest_file.sync_all()?;
+    }
+
+    fs::rename(&tmp_path, target)?;
+    
+    if let Some(parent) = target.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+
+    Ok(ForkStats {
+        lines_rewritten,
+        archived_previous,
+    })
 }
 
-/// Discover active desktop sessions in `project_dir`, excluding `exclude_uuid` (mobile).
-///
-/// A session is considered "active" if any of:
-///   - A running `claude` process has `--resume <uuid>` arg matching the file (via /proc)
-///   - File mtime within `mtime_threshold` (default 30 min in caller)
-///
-/// Returns sessions sorted by last_modified DESC.
+/// Discover active desktop sessions in \`project_dir\`, excluding \`exclude_uuid\` (mobile).
 pub fn detect_active_sessions(
-    _project_dir: &Path,
-    _exclude_uuid: &str,
-    _mtime_threshold_secs: u64,
+    project_dir: &Path,
+    exclude_uuid: &str,
+    mtime_threshold_secs: u64,
 ) -> Result<Vec<SessionInfo>> {
-    unimplemented!("phase3: detect_active_sessions")
+    let mut active_uuids = std::collections::HashSet::new();
+    
+    // Scan /proc for running claude processes
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if name.chars().all(|c| c.is_ascii_digit()) {
+                    let cmdline_path = entry.path().join("cmdline");
+                    if let Ok(cmdline) = fs::read(cmdline_path) {
+                        let args: Vec<String> = cmdline
+                            .split(|&b| b == 0)
+                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        
+                        for i in 0..args.len() {
+                            if args[i] == "--resume" && i + 1 < args.len() {
+                                active_uuids.insert(args[i+1].clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sessions = Vec::new();
+    let now = OffsetDateTime::now_utc();
+
+    if let Ok(entries) = fs::read_dir(project_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if stem == exclude_uuid {
+                    continue;
+                }
+
+                let metadata = fs::metadata(&path)?;
+                let mtime: OffsetDateTime = metadata.modified()?.into();
+                let is_fresh = (now - mtime).whole_seconds() < mtime_threshold_secs as i64;
+                let is_active = active_uuids.contains(stem);
+
+                if is_fresh || is_active {
+                    let file = File::open(&path)?;
+                    let reader = BufReader::new(file);
+                    
+                    let mut cwd = String::new();
+                    let mut ai_title = None;
+                    let mut turn_count = 0;
+
+                    for line in reader.lines() {
+                        if let Ok(line) = line {
+                            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                                let t = v["type"].as_str().unwrap_or("");
+                                if t == "user" || t == "assistant" {
+                                    turn_count += 1;
+                                    if cwd.is_empty() {
+                                        if let Some(c) = v["cwd"].as_str() {
+                                            cwd = c.to_string();
+                                        }
+                                    }
+                                }
+                                if t == "ai-title" {
+                                    if let Some(title) = v["title"].as_str() {
+                                        ai_title = Some(title.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    sessions.push(SessionInfo {
+                        uuid: stem.to_string(),
+                        cwd,
+                        ai_title,
+                        last_modified: mtime,
+                        turn_count,
+                    });
+                }
+            }
+        }
+    }
+
+    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    Ok(sessions)
 }
 
-/// Build the inline keyboard rows for the `@list_claude` reply card.
-/// Each row is a Vec of (button_text, callback_data) tuples.
+/// Build the inline keyboard rows for the \`@list_claude\` reply card.
 pub fn build_session_cards(_sessions: &[SessionInfo]) -> Vec<Vec<(String, String)>> {
     unimplemented!("phase3: build_session_cards")
 }
 
-/// Extract mobile turns (user+assistant messages) added after `since` from the mobile JSONL.
-/// Returns markdown-formatted delta content suitable for writing to pending-merge/.
-pub fn extract_delta(_jsonl_path: &Path, _since: OffsetDateTime) -> Result<String> {
-    unimplemented!("phase3: extract_delta")
+/// Extract mobile turns (user+assistant messages) added after \`since\` from the mobile JSONL.
+pub fn extract_delta(jsonl_path: &Path, since: OffsetDateTime) -> Result<String> {
+    let file = File::open(jsonl_path)?;
+    let reader = BufReader::new(file);
+    let mut turns = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            let t = v["type"].as_str().unwrap_or("");
+            if t == "user" || t == "assistant" {
+                if let Some(ts_str) = v["timestamp"].as_str() {
+                    if let Ok(ts) = OffsetDateTime::parse(ts_str, &Rfc3339) {
+                        if ts > since {
+                            let role = if t == "user" { "User" } else { "Assistant" };
+                            let content = v["message"]["content"].as_str().unwrap_or("");
+                            turns.push(format!("**{}:** {}", role, content));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(turns.join("\n\n"))
 }
 
-/// Keep only the `keep` most-recent files in `archive_dir` (matching `mobile-*.jsonl`).
-/// Returns the paths of deleted files.
-pub fn rotate_archives(_archive_dir: &Path, _keep: usize) -> Result<Vec<PathBuf>> {
-    unimplemented!("phase3: rotate_archives")
+/// Keep only the \`keep\` most-recent files in \`archive_dir\` (matching \`mobile-*.jsonl\`).
+pub fn rotate_archives(archive_dir: &Path, keep: usize) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(archive_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("mobile-") && name.ends_with(".jsonl") {
+                    let mtime = fs::metadata(&path)?.modified()?;
+                    files.push((path, mtime));
+                }
+            }
+        }
+    }
+
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut deleted = Vec::new();
+    if files.len() > keep {
+        for (path, _) in files.iter().skip(keep) {
+            fs::remove_file(path)?;
+            deleted.push(path.clone());
+        }
+    }
+
+    Ok(deleted)
 }
 
-/// Parse a Telegram inbound text into a `MobileCommand`. Returns `None` if no match.
-///
-/// Matches:
-///   - `@list_claude` or `@ls_cl_ses` (any case, leading whitespace allowed) → ListClaude
-///   - `@flush_mobile` → FlushMobile
-///   - `@claude <msg>` (with non-empty body) → ClaudeMsg(body.trim())
+/// Parse a Telegram inbound text into a \`MobileCommand\`. Returns \`None\` if no match.
 pub fn parse_mobile_command(_text: &str) -> Option<MobileCommand> {
     unimplemented!("phase3: parse_mobile_command")
 }
 
 /// Append a user-type marker JSONL line to a desktop session file (see AC-5).
-/// The line has `isSidechain: true` and does NOT affect the live process.
-pub fn append_fork_marker(_desktop_jsonl: &Path, _mobile_uuid: &str) -> Result<()> {
-    unimplemented!("phase3: append_fork_marker")
+pub fn append_fork_marker(desktop_jsonl: &Path, mobile_uuid: &str) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(desktop_jsonl)?;
+
+    // Ensure we start on a new line if the file doesn't end with one
+    let metadata = file.metadata()?;
+    if metadata.len() > 0 {
+        let mut last_byte = [0u8; 1];
+        file.read_exact_at(&mut last_byte, metadata.len() - 1)?;
+        if last_byte[0] != b'\n' {
+            writeln!(file)?;
+        }
+    }
+
+    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let msg = format!("[Mobile session {} forked at {}. Pending merge available on next prompt.]", mobile_uuid, now);
+    
+    let line = json!({
+        "type": "user",
+        "isSidechain": true,
+        "timestamp": now,
+        "message": {
+            "role": "user",
+            "content": msg
+        }
+    });
+
+    writeln!(file, "{}", serde_json::to_string(&line)?)?;
+    file.sync_all()?;
+
+    Ok(())
 }
 
-/// Validate that callback data matches `^sel_claude:[0-9a-f-]{36}$`.
-/// Returns Some(uuid) on match, None otherwise.
+/// Validate that callback data matches \`^sel_claude:[0-9a-f-]{36}$\`.
 pub fn parse_callback_data(_data: &str) -> Option<String> {
     unimplemented!("phase3: parse_callback_data")
 }
