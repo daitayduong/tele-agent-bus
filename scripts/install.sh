@@ -15,12 +15,14 @@ if [ -n "$SUDO_USER" ]; then
 fi
 
 echo "Creating /etc/agent-bus..."
-install -d -o root -g agent-bus -m 0750 /etc/agent-bus
+install -d -o root -g agent-bus -m 2750 /etc/agent-bus
 
 # Initialize blacklist if binary is present
 if [ -f "/usr/local/bin/agent-bus" ]; then
   echo "Initializing blacklist via binary..."
   /usr/local/bin/agent-bus blacklist init
+  # Binary creates files with root's primary group; fix to agent-bus
+  chgrp agent-bus /etc/agent-bus/blacklist.conf /etc/agent-bus/blacklist.conf.hmac /etc/agent-bus/blacklist.key 2>/dev/null || true
 else
   echo "Binary not found at /usr/local/bin/agent-bus, performing manual init..."
   if [ ! -f "/etc/agent-bus/blacklist.key" ]; then
