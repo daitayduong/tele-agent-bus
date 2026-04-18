@@ -11,7 +11,6 @@ use tokio::sync::{oneshot, Mutex};
 
 use super::telegram::{send_perm_prompt, BotClient, TelegramConfig};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const BLACKLIST_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub trait BlacklistLoader: Send + Sync {
@@ -24,18 +23,35 @@ pub trait BlacklistLoader: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct FsBlacklistLoader {
     conf_path: PathBuf,
+    hmac_path: PathBuf,
+    key_path: PathBuf,
 }
 
 impl FsBlacklistLoader {
-    pub fn new(conf_path: PathBuf) -> Self {
-        Self { conf_path }
+    pub fn new(conf_path: PathBuf, hmac_path: PathBuf, key_path: PathBuf) -> Self {
+        Self {
+            conf_path,
+            hmac_path,
+            key_path,
+        }
     }
 }
 
 impl BlacklistLoader for FsBlacklistLoader {
     fn load(&self) -> anyhow::Result<Vec<String>> {
-        let body = std::fs::read_to_string(&self.conf_path)?;
-        Ok(body.lines().map(str::to_string).collect())
+        agent_bus_core::blacklist_integrity::load_and_verify(
+            &self.conf_path,
+            &self.hmac_path,
+            &self.key_path,
+        )
+        .map_err(|e| {
+            tracing::warn!(
+                event = "blacklist_integrity_failed",
+                path = ?self.conf_path,
+                error = %e
+            );
+            anyhow::anyhow!("blacklist integrity failed: {}", e)
+        })
     }
 
     fn modified(&self) -> anyhow::Result<Option<SystemTime>> {
@@ -78,6 +94,7 @@ impl PendingPermRegistry {
 
 #[derive(Clone)]
 pub struct PermService {
+    pub timeout: Duration,
     state: StateHandle,
     telegram_config: Arc<TelegramConfig>,
     bot: Arc<dyn BotClient>,
@@ -100,15 +117,23 @@ impl PermService {
         telegram_config: Arc<TelegramConfig>,
         bot: Arc<dyn BotClient>,
         loader: Arc<dyn BlacklistLoader>,
-        registry: PendingPermRegistry,
+        registry: PendingPermRegistry, timeout: Duration,
     ) -> Self {
         Self {
             state,
             telegram_config,
             bot,
             loader,
-            registry,
+            registry, timeout,
             cache: Arc::new(Mutex::new(BlacklistCache::default())),
+        }
+    }
+
+    fn timeout_for(&self, req: &PermCheckRequest) -> Duration {
+        if req.timeout_ms == 0 {
+            self.timeout
+        } else {
+            Duration::from_millis(req.timeout_ms).min(self.timeout)
         }
     }
 
@@ -150,7 +175,7 @@ impl PermService {
         let id = next_perm_id();
         let command_hash = command_hash(&req.command);
         let now = now_string();
-        let timeout = timeout_for(&req);
+        let timeout = self.timeout_for(&req);
         let timeout_at = now_plus_string(timeout);
         let rx = self.registry.insert(id.clone()).await;
         let pending = PendingPerm {
@@ -297,13 +322,6 @@ fn now_plus_string(duration: Duration) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn timeout_for(req: &PermCheckRequest) -> Duration {
-    if req.timeout_ms == 0 {
-        DEFAULT_TIMEOUT
-    } else {
-        Duration::from_millis(req.timeout_ms).min(DEFAULT_TIMEOUT)
-    }
-}
 
 fn request_repo_id(req: &PermCheckRequest) -> String {
     req.repo_id
@@ -325,6 +343,7 @@ fn is_cached_destructive(command: &str) -> bool {
 mod tests {
     use super::*;
     use crate::daemon::telegram::{MockBot, RepoEntry, TelegramConfig};
+    use agent_bus_core::blacklist_integrity;
 
     struct StaticLoader {
         lines: Vec<String>,
@@ -365,6 +384,63 @@ mod tests {
         }
     }
 
+    fn write_blacklist_triplet(
+        dir: &tempfile::TempDir,
+        body: &[u8],
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let conf_path = dir.path().join("blacklist.conf");
+        let hmac_path = dir.path().join("blacklist.conf.hmac");
+        let key_path = dir.path().join("blacklist.key");
+        let key = b"01234567890123456789012345678901";
+        let sig = blacklist_integrity::compute_hmac(key, body);
+
+        std::fs::write(&conf_path, body).unwrap();
+        std::fs::write(&hmac_path, sig).unwrap();
+        std::fs::write(&key_path, key).unwrap();
+
+        (conf_path, hmac_path, key_path)
+    }
+
+    #[test]
+    fn test_fs_loader_accepts_valid_triplet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conf_path, hmac_path, key_path) =
+            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n^git push --force\n");
+        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+
+        let patterns = loader.load().unwrap();
+
+        assert_eq!(
+            patterns,
+            vec![
+                "rm\\s+-rf\tdestructive".to_string(),
+                "^git push --force".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fs_loader_rejects_tampered_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conf_path, hmac_path, key_path) =
+            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n");
+        std::fs::write(&conf_path, b"git\\s+push\\s+--force\tdestructive\n").unwrap();
+        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+
+        assert!(loader.load().is_err());
+    }
+
+    #[test]
+    fn test_fs_loader_rejects_missing_hmac() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conf_path, hmac_path, key_path) =
+            write_blacklist_triplet(&dir, b"rm\\s+-rf\tdestructive\n");
+        std::fs::remove_file(&hmac_path).unwrap();
+        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+
+        assert!(loader.load().is_err());
+    }
+
     #[tokio::test]
     async fn no_match_approves_immediately() {
         let dir = tempfile::tempdir().unwrap();
@@ -379,7 +455,7 @@ mod tests {
                 lines: vec!["rm\\s+-rf\tdestructive".to_string()],
                 err: None,
             }),
-            PendingPermRegistry::default(),
+            PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
         let resp = service.check(request("ls /tmp", 1)).await.unwrap();
@@ -402,7 +478,7 @@ mod tests {
                 lines: vec!["rm\\s+-rf\tdestructive".to_string()],
                 err: None,
             }),
-            PendingPermRegistry::default(),
+            PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
         let resp = service.check(request("rm -rf /tmp/foo", 1)).await.unwrap();
@@ -436,7 +512,7 @@ mod tests {
                 lines: vec!["git\\s+push\\s+--force".to_string()],
                 err: None,
             }),
-            registry.clone(),
+            registry.clone(), Duration::from_secs(30),
         );
 
         let handle = tokio::spawn(async move {
@@ -473,7 +549,7 @@ mod tests {
                 lines: vec![],
                 err: Some("hmac mismatch"),
             }),
-            PendingPermRegistry::default(),
+            PendingPermRegistry::default(), Duration::from_secs(30),
         );
 
         let resp = service.check(request("ls", 1)).await.unwrap();

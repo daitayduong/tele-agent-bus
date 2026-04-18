@@ -30,6 +30,7 @@ pub struct TelegramConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PermissionsConfig {
+    #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
     pub fail_mode: FailMode,
     pub blacklist_file: String,
@@ -150,4 +151,26 @@ repos:
         assert!(config.agents.contains_key("claude"));
         assert_eq!(config.repos[0].id, "rallyup");
     }
+
+    #[test]
+    fn test_default_timeout_is_30_seconds() {
+        let yaml = "
+version: 1
+telegram:
+  bot_token: plain-token
+  allowed_chats: [\"123\"]
+permissions:
+  fail_mode: hybrid
+  blacklist_file: ~/.agent-bus/blacklist.txt
+agents: {}
+repos: []
+";
+        let config = Config::load_from_str(yaml).unwrap();
+        assert_eq!(config.permissions.timeout_seconds, 30);
+    
+    }
+}
+
+fn default_timeout_seconds() -> u64 {
+    30
 }

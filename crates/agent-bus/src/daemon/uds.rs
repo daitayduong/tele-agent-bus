@@ -252,6 +252,7 @@ fn chmod_socket_private(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use super::*;
     use crate::daemon::perm::{BlacklistLoader, PendingPermRegistry};
     use crate::daemon::telegram::{MockBot, TelegramConfig};
@@ -283,7 +284,7 @@ mod tests {
             config,
             Arc::new(MockBot::default()),
             Arc::new(EmptyLoader),
-            PendingPermRegistry::default(),
+            PendingPermRegistry::default(), Duration::from_secs(30),
         );
         let mut server = UdsServer::new(socket.clone(), state, perm);
         server.daemon_uid = current_euid();

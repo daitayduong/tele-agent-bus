@@ -2,6 +2,7 @@ pub mod perm;
 pub mod telegram;
 pub mod uds;
 
+use std::time::Duration;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use self::telegram::{RepoEntry, TelegramConfig, TeloxideBotClient};
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
+    pub timeout_seconds: u64,
     pub home: PathBuf,
     pub bot_token: String,
     pub telegram: TelegramConfig,
@@ -24,7 +26,22 @@ pub struct DaemonConfig {
 
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
+    #[serde(default = "default_permissions")]
+    pub permissions: PermissionsFile,
     telegram: TelegramFile,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PermissionsFile {
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+fn default_timeout_seconds() -> u64 { 30 }
+    fn default_permissions() -> PermissionsFile {
+    PermissionsFile {
+        timeout_seconds: default_timeout_seconds(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,15 +65,19 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let bot = teloxide::Bot::new(config.bot_token);
     let registry = PendingPermRegistry::default();
     let bot_client: Arc<dyn telegram::BotClient> = Arc::new(TeloxideBotClient::new(bot.clone()));
-    let loader = Arc::new(FsBlacklistLoader::new(PathBuf::from(
-        "/etc/agent-bus/blacklist.conf",
-    )));
+    let etc = PathBuf::from("/etc/agent-bus");
+    let loader = Arc::new(FsBlacklistLoader::new(
+        etc.join("blacklist.conf"),
+        etc.join("blacklist.conf.hmac"),
+        etc.join("blacklist.key"),
+    ));
     let perm = PermService::new(
         state.clone(),
         Arc::clone(&telegram_config),
         bot_client,
         loader,
         registry.clone(),
+        Duration::from_secs(config.timeout_seconds),
     );
     let uds_server = uds::UdsServer::new(config.home.join("daemon.sock"), state.clone(), perm);
     let uds_task = tokio::spawn(uds::run_uds_server(uds_server));
@@ -88,7 +109,7 @@ pub fn load_daemon_config() -> anyhow::Result<DaemonConfig> {
     let repos_file: ReposFile =
         serde_yaml::from_str(&repos_text).context("failed to parse repos.yaml")?;
 
-    let bot_token = resolve_env_value(&config_file.telegram.bot_token)?;
+    let bot_token = resolve_bot_token(&config_file.telegram.bot_token, |name| std::env::var(name).ok())?;
     let allowed_chats = config_file
         .telegram
         .allowed_chats
@@ -97,6 +118,7 @@ pub fn load_daemon_config() -> anyhow::Result<DaemonConfig> {
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(DaemonConfig {
+        timeout_seconds: config_file.permissions.timeout_seconds,
         home,
         bot_token,
         telegram: TelegramConfig {
@@ -112,6 +134,24 @@ fn agent_bus_home() -> anyhow::Result<PathBuf> {
     }
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".agent-bus"))
+}
+
+fn resolve_bot_token(value: &str, getenv: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
+    if let Some(name) = value.strip_prefix("env:") {
+        if name == "TELE_BUS_BOT_TOKEN" || name == "TELE_BUS_TOKEN" {
+            if let Some(val) = getenv("TELE_BUS_BOT_TOKEN") {
+                return Ok(val);
+            }
+            if let Some(val) = getenv("TELE_BUS_TOKEN") {
+                tracing::warn!("TELE_BUS_TOKEN is deprecated, use TELE_BUS_BOT_TOKEN");
+                return Ok(val);
+            }
+            anyhow::bail!("missing environment variable TELE_BUS_BOT_TOKEN");
+        }
+        getenv(name).with_context(|| format!("missing environment variable {name}"))
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 fn resolve_env_value(value: &str) -> anyhow::Result<String> {
@@ -369,6 +409,27 @@ repos:
     #[test]
     fn daemon_side_peer_uid_trait_is_usable_for_future_uds_server() {
         verify_peer_uid(&MockPeerUid::new(1000), &(), 1000).unwrap();
+    }
+
+    #[test]
+    fn test_bot_token_prefers_new_env_var() {
+        let getenv = |name: &str| match name {
+            "TELE_BUS_BOT_TOKEN" => Some("new".to_string()),
+            "TELE_BUS_TOKEN" => Some("old".to_string()),
+            _ => None,
+        };
+        let token = super::resolve_bot_token("env:TELE_BUS_TOKEN", getenv).unwrap();
+        assert_eq!(token, "new");
+    }
+
+    #[test]
+    fn test_bot_token_falls_back_to_legacy() {
+        let getenv = |name: &str| match name {
+            "TELE_BUS_TOKEN" => Some("legacy".to_string()),
+            _ => None,
+        };
+        let token = super::resolve_bot_token("env:TELE_BUS_TOKEN", getenv).unwrap();
+        assert_eq!(token, "legacy");
     }
 
     fn assert_daemon_config_home(config: &DaemonConfig, home: &Path) {
