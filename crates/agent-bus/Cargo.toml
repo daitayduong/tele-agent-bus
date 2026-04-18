@@ -12,6 +12,7 @@ name = "agent-bus"
 path = "src/main.rs"
 
 [dependencies]
+tabled = { workspace = true }
 agent-bus-proto = { path = "../agent-bus-proto" }
 agent-bus-core = { path = "../agent-bus-core" }
 serde = { workspace = true }
@@ -32,6 +33,8 @@ regex = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 time = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
