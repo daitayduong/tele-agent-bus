@@ -45,8 +45,8 @@ pub fn remove(id: &str) -> anyhow::Result<()> {
 
 fn add_inner(path: &str, home: &Path, bus_home: &Path) -> anyhow::Result<()> {
     let policy = PathPolicy::for_home(home);
-    let canonical = validate_repo_path(path, &policy)
-        .with_context(|| format!("invalid repo path: {path}"))?;
+    let canonical =
+        validate_repo_path(path, &policy).with_context(|| format!("invalid repo path: {path}"))?;
 
     let display = derive_display(&canonical);
     let id = compute_repo_id(&display, &canonical)
@@ -91,7 +91,13 @@ fn list_inner(bus_home: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let id_w = file.repos.iter().map(|r| r.id.len()).max().unwrap_or(2).max(2);
+    let id_w = file
+        .repos
+        .iter()
+        .map(|r| r.id.len())
+        .max()
+        .unwrap_or(2)
+        .max(2);
     let disp_w = file
         .repos
         .iter()
@@ -100,7 +106,7 @@ fn list_inner(bus_home: &Path) -> anyhow::Result<()> {
         .unwrap_or(7)
         .max(7);
 
-    println!("{:<id_w$}  {:<disp_w$}  {}", "ID", "DISPLAY", "PATH");
+    println!("{:<id_w$}  {:<disp_w$}  PATH", "ID", "DISPLAY");
     for r in &file.repos {
         println!("{:<id_w$}  {:<disp_w$}  {}", r.id, r.display, r.path);
     }
@@ -127,8 +133,8 @@ fn load_repos(path: &Path) -> anyhow::Result<ReposFile> {
             repos: Vec::new(),
         });
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let file: ReposFile = serde_yaml::from_str(&text)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(file)

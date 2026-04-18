@@ -1,10 +1,12 @@
+pub mod inbox;
 pub mod perm;
+pub mod routing;
 pub mod telegram;
 pub mod uds;
 
-use std::time::Duration;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_bus_core::state::spawn_state_actor;
 use anyhow::Context;
@@ -13,7 +15,7 @@ use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::Dispatcher;
 use teloxide::types::Update;
 
-use self::perm::{FsBlacklistLoader, PendingPermRegistry, PermService};
+use self::perm::{FsBlacklistLoader, MergedBlacklistLoader, PendingPermRegistry, PermService};
 use self::telegram::{RepoEntry, TelegramConfig, TeloxideBotClient};
 
 #[derive(Debug, Clone)]
@@ -37,8 +39,10 @@ pub struct PermissionsFile {
     pub timeout_seconds: u64,
 }
 
-fn default_timeout_seconds() -> u64 { 30 }
-    fn default_permissions() -> PermissionsFile {
+fn default_timeout_seconds() -> u64 {
+    30
+}
+fn default_permissions() -> PermissionsFile {
     PermissionsFile {
         timeout_seconds: default_timeout_seconds(),
     }
@@ -65,12 +69,26 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let bot = teloxide::Bot::new(config.bot_token);
     let registry = PendingPermRegistry::default();
     let bot_client: Arc<dyn telegram::BotClient> = Arc::new(TeloxideBotClient::new(bot.clone()));
-    let etc = PathBuf::from("/etc/agent-bus");
-    let loader = Arc::new(FsBlacklistLoader::new(
-        etc.join("blacklist.conf"),
-        etc.join("blacklist.conf.hmac"),
-        etc.join("blacklist.key"),
+    
+    let etc_dir = PathBuf::from("/etc/agent-bus");
+    let global_loader = Arc::new(FsBlacklistLoader::new(
+        etc_dir.join("blacklist.conf"),
+        etc_dir.join("blacklist.conf.hmac"),
+        etc_dir.join("blacklist.key"),
     ));
+
+    let home_dir = config.home.clone();
+    let repo_loader_fn = move |repo_id: &agent_bus_core::repo_id::RepoId| {
+        let repo_dir = home_dir.join("repos").join(repo_id.as_str());
+        Arc::new(FsBlacklistLoader::new(
+            repo_dir.join("blacklist.conf"),
+            repo_dir.join("blacklist.conf.hmac"),
+            etc_dir.join("blacklist.key"),
+        )) as Arc<dyn perm::BlacklistLoader>
+    };
+
+    let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(repo_loader_fn)));
+
     let perm = PermService::new(
         state.clone(),
         Arc::clone(&telegram_config),
@@ -109,7 +127,9 @@ pub fn load_daemon_config() -> anyhow::Result<DaemonConfig> {
     let repos_file: ReposFile =
         serde_yaml::from_str(&repos_text).context("failed to parse repos.yaml")?;
 
-    let bot_token = resolve_bot_token(&config_file.telegram.bot_token, |name| std::env::var(name).ok())?;
+    let bot_token = resolve_bot_token(&config_file.telegram.bot_token, |name| {
+        std::env::var(name).ok()
+    })?;
     let allowed_chats = config_file
         .telegram
         .allowed_chats
@@ -136,7 +156,10 @@ fn agent_bus_home() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".agent-bus"))
 }
 
-fn resolve_bot_token(value: &str, getenv: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
+fn resolve_bot_token(
+    value: &str,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<String> {
     if let Some(name) = value.strip_prefix("env:") {
         if name == "TELE_BUS_BOT_TOKEN" || name == "TELE_BUS_TOKEN" {
             if let Some(val) = getenv("TELE_BUS_BOT_TOKEN") {
@@ -165,11 +188,12 @@ fn resolve_env_value(value: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     use super::telegram::{
         handle_callback_perm, handle_callback_switch, handle_current_command,
-        handle_list_rp_command, handle_switch_rp_command, InlineKeyboard, MessageRef, MockBot,
-        RepoEntry, TelegramConfig,
+        handle_list_rp_command, handle_switch_rp_command, handle_text_command, InlineKeyboard,
+        MessageRef, MockBot, RepoEntry, TelegramConfig,
     };
     use super::{load_daemon_config, DaemonConfig};
     use agent_bus_core::peer_uid::{verify_peer_uid, MockPeerUid};
@@ -196,6 +220,18 @@ mod tests {
                     agents: vec!["claude".to_string()],
                 },
             ],
+        }
+    }
+
+    fn config_with_repo_path(path: &Path) -> TelegramConfig {
+        TelegramConfig {
+            allowed_chats: vec!["123".to_string()],
+            repos: vec![RepoEntry {
+                id: "rallyup".to_string(),
+                display: "RallyUp".to_string(),
+                path: path.display().to_string(),
+                agents: vec!["codex".to_string()],
+            }],
         }
     }
 
@@ -364,6 +400,85 @@ mod tests {
             .unwrap();
 
         assert!(bot.sent_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_routing_unknown_agent_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        let bot = MockBot::default();
+
+        handle_text_command(
+            &bot,
+            &config_with_repo_path(dir.path()),
+            state,
+            123,
+            Some("alice"),
+            "@bogus:rallyup foo",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            bot.sent_messages()[0].text,
+            "Unknown agent or repo: @bogus:rallyup foo"
+        );
+        assert!(!dir.path().join(".agents/inbox/bogus.md").exists());
+    }
+
+    #[test]
+    fn test_routing_logs_reject_reason_with_snippet() {
+        #[derive(Clone)]
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let logs = Arc::clone(&logs);
+                move || SharedWriter(Arc::clone(&logs))
+            })
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let state = spawn_state_actor(dir.path().join("state.json"))
+                    .await
+                    .unwrap();
+                let bot = MockBot::default();
+                handle_text_command(
+                    &bot,
+                    &config_with_repo_path(dir.path()),
+                    state,
+                    123,
+                    Some("alice"),
+                    "@codex:rallyup     ",
+                )
+                .await
+                .unwrap();
+            });
+        });
+
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("routing_rejected"));
+        assert!(logs.contains("reason=empty_body"));
+        assert!(logs.contains("raw_snippet=\"@codex:rallyup     \""));
     }
 
     #[test]

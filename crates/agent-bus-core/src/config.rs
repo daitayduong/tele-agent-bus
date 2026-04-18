@@ -171,6 +171,20 @@ repos: []
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct ReposFile {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    repos: Vec<RepoConfig>,
+}
+
+pub fn load_repos_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<RepoConfig>, ConfigError> {
+    let s = std::fs::read_to_string(path)?;
+    let file: ReposFile = serde_yaml::from_str(&s)?;
+    Ok(file.repos)
+}
+
 fn default_timeout_seconds() -> u64 {
     30
 }
