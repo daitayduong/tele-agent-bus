@@ -2,7 +2,9 @@ use agent_bus_core::auth_context::AuthContextsConfig;
 use agent_bus_core::state::{
     AuthContextStatusKind, PendingRotation, PendingRotationStatus, StateHandle,
 };
+use agent_bus_core::token_expiry::{self, ExpiryStatus};
 use crate::daemon::telegram::{BotClient, InlineKeyboard, MessageRef, TelegramError};
+use time::OffsetDateTime;
 
 /// 4a.5: handle /quota <agent>
 pub async fn handle_quota_command<B: BotClient + ?Sized>(
@@ -34,6 +36,7 @@ pub async fn handle_quota_command<B: BotClient + ?Sized>(
                 AuthContextStatusKind::Available => "available".to_string(),
                 AuthContextStatusKind::QuotaExhausted => "quota_exhausted".to_string(),
                 AuthContextStatusKind::RateLimited => "rate_limited".to_string(),
+                AuthContextStatusKind::AuthExpiringSoon => "auth_expiring_soon".to_string(),
                 AuthContextStatusKind::AuthExpired => "auth_expired".to_string(),
                 AuthContextStatusKind::ManualReauthRequired => "reauth_required".to_string(),
                 AuthContextStatusKind::Disabled => "disabled".to_string(),
@@ -61,9 +64,10 @@ pub async fn handle_quota_command<B: BotClient + ?Sized>(
     Ok(())
 }
 
-/// 4a.5: handle /auth_list
+/// 4a.12: handle /auth_list enrichment
 pub async fn handle_auth_list_command<B: BotClient + ?Sized>(
     bot: &B,
+    state: StateHandle,
     cfg: &AuthContextsConfig,
     chat_id: i64,
 ) -> Result<(), TelegramError> {
@@ -73,25 +77,75 @@ pub async fn handle_auth_list_command<B: BotClient + ?Sized>(
         return Ok(());
     }
 
-    let mut text = String::new();
+    let snapshot = state.snapshot().await;
+    let now = OffsetDateTime::now_utc();
+
+    let mut text = "AGENT   ID       STATUS               AUTO   APPROVAL   EXPIRES      LABEL".to_string();
     for (agent, contexts) in &cfg.agents {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&format!("{}:", agent));
         for ctx in contexts {
-            text.push_str(&format!("\n  {:<8} {}", ctx.id, ctx.profile_dir.display()));
-            if ctx.auto_rotate {
-                text.push_str("  auto_rotate=true");
-            }
-            if ctx.require_owner_approval {
-                text.push_str("  require_approval=true");
-            }
+            let status_kind = snapshot.auth_context_status.get(agent)
+                .and_then(|m| m.get(&ctx.id))
+                .map(|st| st.status)
+                .unwrap_or(AuthContextStatusKind::Available);
+            
+            let status_str = match status_kind {
+                AuthContextStatusKind::Available => "available",
+                AuthContextStatusKind::QuotaExhausted => "quota_exhausted",
+                AuthContextStatusKind::RateLimited => "rate_limited",
+                AuthContextStatusKind::AuthExpired => "auth_expired",
+                AuthContextStatusKind::AuthExpiringSoon => "auth_expiring_soon",
+                AuthContextStatusKind::ManualReauthRequired => "reauth_required",
+                AuthContextStatusKind::Disabled => "disabled",
+                AuthContextStatusKind::UnknownFailure => "failed",
+            };
+
+            let auto = if ctx.auto_rotate || cfg.defaults.auto_rotate { "yes" } else { "no " };
+            let approval = if ctx.require_owner_approval { "yes" } else { "no " };
+            
+            let expiry_status = token_expiry::read_for_agent(agent, &ctx.profile_dir);
+            let expires_str = format_expiry(expiry_status, now);
+            
+            let label = ctx.label.as_deref().unwrap_or("");
+            
+            text.push('\n');
+            text.push_str(&format!(
+                "{:<7} {:<8} {:<20} {:<6} {:<10} {:<12} {}",
+                agent, ctx.id, status_str, auto, approval, expires_str, label
+            ));
         }
     }
 
-    bot.send_message(chat_id, text, None).await?;
+    // Split if too long (Telegram limit 4096)
+    if text.len() > 4000 {
+        for chunk in text.as_bytes().chunks(4000) {
+            if let Ok(s) = std::str::from_utf8(chunk) {
+                bot.send_message(chat_id, s.to_string(), None).await?;
+            }
+        }
+    } else {
+        bot.send_message(chat_id, text, None).await?;
+    }
+    
     Ok(())
+}
+
+fn format_expiry(status: ExpiryStatus, now: OffsetDateTime) -> String {
+    match status {
+        ExpiryStatus::Healthy { expires_at } | ExpiryStatus::ExpiringSoon { expires_at } => {
+            let diff = expires_at - now;
+            if diff.is_negative() || diff.is_zero() {
+                "expired".to_string()
+            } else if diff.whole_hours() >= 72 {
+                format!("in {} days", diff.whole_days())
+            } else if diff.whole_hours() >= 1 {
+                format!("in {}h {}m", diff.whole_hours(), (diff.whole_minutes() % 60).abs())
+            } else {
+                format!("in {}m", diff.whole_minutes().abs())
+            }
+        }
+        ExpiryStatus::Expired { .. } => "expired".to_string(),
+        ExpiryStatus::Unknown => "—".to_string(),
+    }
 }
 
 /// 4a.5: handle /auth_rotate <agent>
@@ -253,7 +307,7 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
-    fn test_cfg() -> AuthContextsConfig {
+    fn test_cfg(home: &Path) -> AuthContextsConfig {
         let yaml = r#"
 version: 1
 defaults:
@@ -263,15 +317,18 @@ agents:
     contexts:
       - id: john
         profile_dir: ~/.agent-bus/auth/claude/john
+        label: "Claude Pro - John"
       - id: partner
         profile_dir: ~/.agent-bus/auth/claude/partner
         require_owner_approval: true
+        label: "Claude Pro - Partner"
   codex:
     contexts:
       - id: main
         profile_dir: ~/.agent-bus/auth/codex/main
+        label: "Codex - Main"
 "#;
-        AuthContextsConfig::parse(yaml, Path::new("/home/user")).unwrap()
+        AuthContextsConfig::parse(yaml, home).unwrap()
     }
 
     #[tokio::test]
@@ -281,7 +338,7 @@ agents:
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        let cfg = test_cfg();
+        let cfg = test_cfg(dir.path());
 
         state
             .set_auth_context_status(
@@ -317,21 +374,51 @@ agents:
     }
 
     #[tokio::test]
-    async fn auth_list_formats_all_agents() {
+    async fn auth_list_formats_table_with_expiry() {
         let bot = MockBot::default();
-        let cfg = test_cfg();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        let cfg = test_cfg(dir.path());
 
-        handle_auth_list_command(&bot, &cfg, 100).await.unwrap();
+        // Setup a dummy credential file for claude/john
+        let john_dir = dir.path().join(".agent-bus/auth/claude/john");
+        std::fs::create_dir_all(&john_dir).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + time::Duration::days(42);
+        let expires_at_ms = expires_at.unix_timestamp_nanos() / 1_000_000;
+        let json = format!(r#"{{"claudeAiOauth": {{"expiresAt": {}}}}}"#, expires_at_ms);
+        std::fs::write(john_dir.join(".credentials.json"), json).unwrap();
+
+        handle_auth_list_command(&bot, state, &cfg, 100).await.unwrap();
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
         let text = &sent[0].text;
-        assert!(text.contains("claude:"));
+        assert!(text.contains("AGENT   ID       STATUS"));
+        assert!(text.contains("claude"));
         assert!(text.contains("john"));
-        assert!(text.contains("partner"));
-        assert!(text.contains("codex:"));
-        assert!(text.contains("main"));
-        assert!(text.contains("require_approval=true"));
+        // Using "in 4" to match either "in 42 days" or "in 41 days" if there's rounding
+        assert!(text.contains("in 4")); 
+        assert!(text.contains("Claude Pro - John"));
+    }
+
+    #[tokio::test]
+    async fn auth_list_shows_dash_when_credentials_missing() {
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        let cfg = test_cfg(dir.path());
+
+        handle_auth_list_command(&bot, state, &cfg, 100).await.unwrap();
+
+        let sent = bot.sent_messages();
+        assert_eq!(sent.len(), 1);
+        let text = &sent[0].text;
+        assert!(text.contains("—")); // EXPIRES column for missing creds
     }
 
     #[tokio::test]
@@ -341,17 +428,13 @@ agents:
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        let cfg = test_cfg();
+        let cfg = test_cfg(dir.path());
 
         // Rotate codex: none -> main
         handle_auth_rotate_command(&bot, state.clone(), &cfg, 100, "codex")
             .await
             .unwrap();
         let snap = state.snapshot().await;
-        // Debugging
-        if snap.active_auth_context.get("codex") != Some(&"main".to_string()) {
-             println!("DEBUG: active_auth_context: {:?}", snap.active_auth_context);
-        }
         assert_eq!(snap.active_auth_context.get("codex").map(|s| s.as_str()), Some("main"));
 
         // Rotate claude: none -> john (no approval req for john)
