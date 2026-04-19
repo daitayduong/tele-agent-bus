@@ -24,10 +24,6 @@ use serde::Deserialize;
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::Dispatcher;
 use teloxide::types::Update;
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
 
 use self::perm::{FsBlacklistLoader, MergedBlacklistLoader, PendingPermRegistry, PermService};
 use self::telegram::{RepoEntry, TelegramConfig, TeloxideBotClient};
@@ -87,6 +83,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     // `agents.<agent>.active` becomes the initial active context.
     if let Some(ref auth_cfg) = config.auth_contexts {
         for (agent, id) in &auth_cfg.active {
+            state.set_active_auth_context(agent, id).await.ok();
+        }
 
         // Phase 4a.12: Token expiry detection on startup
         for (agent_name, contexts) in &auth_cfg.agents {
@@ -100,18 +98,16 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                     _ => None,
                 };
                 if let Some(k) = kind {
-                    let now = OffsetDateTime::now_utc();
+                    let now = time::OffsetDateTime::now_utc();
                     let st = AuthContextStatus {
                         status: k,
                         cooldown_until: None,
                         last_event_id: None,
-                        updated_at: now.format(&Rfc3339).unwrap_or_default(),
+                        updated_at: now.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                     };
                     state.set_auth_context_status(agent_name, &ctx.id, st).await.ok();
                 }
             }
-        }
-            state.set_active_auth_context(agent, id).await.ok();
         }
     }
 
@@ -499,11 +495,7 @@ mod tests {
             .unwrap();
         let bot = MockBot::default();
 
-        handle_text_command(
-            &bot,
-            &config_with_repo_path(dir.path()),
-            state,
-            123,
+        handle_text_command(&bot, &config_with_repo_path(dir.path()), state, &None, 123,
             Some("alice"),
             "@bogus:rallyup foo",
         )
@@ -551,11 +543,7 @@ mod tests {
                     .await
                     .unwrap();
                 let bot = MockBot::default();
-                handle_text_command(
-                    &bot,
-                    &config_with_repo_path(dir.path()),
-                    state,
-                    123,
+                handle_text_command(&bot, &config_with_repo_path(dir.path()), state, &None, 123,
                     Some("alice"),
                     "@codex:rallyup     ",
                 )

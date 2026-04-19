@@ -852,6 +852,10 @@ impl MockBot {
     pub fn edited_messages(&self) -> Vec<EditedMessage> {
         self.edited.lock().expect("mock bot lock poisoned").clone()
     }
+
+    pub fn answered_callbacks(&self) -> Vec<String> {
+        self.callbacks.lock().expect("mock bot lock poisoned").clone()
+    }
 }
 
 #[cfg(test)]

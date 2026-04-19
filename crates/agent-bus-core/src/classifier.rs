@@ -293,6 +293,19 @@ pub fn default_classifier(agent: &str) -> Option<ProviderClassifier> {
     ProviderClassifier::from_specs(agent, specs).ok()
 }
 
+/// Classify arbitrary text using the default rules for an agent. Returns
+/// `(kind, rule_name)` if a match is found.
+pub fn classify_text(agent: &str, text: &str) -> Option<(ResultKind, String)> {
+    let classifier = default_classifier(agent)?;
+    for rule in classifier.rules() {
+        if rule.pattern.is_match(text) {
+            return Some((rule.kind, rule.name.clone()));
+        }
+    }
+    None
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
