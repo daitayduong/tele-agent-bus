@@ -2,6 +2,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -10,6 +11,9 @@ use crate::daemon::mobile_session::{
     self, MobileCommand, SessionInfo, ARCHIVE_RETENTION, MOBILE_UUID,
 };
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
+use crate::daemon::runner::{
+    AgentRunMode, AgentRunRequest, RunnerError, SharedAgentRunner,
+};
 use agent_bus_core::state::{MobileSessionState, PendingPermStatus, StateHandle};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
@@ -224,9 +228,10 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
     chat_id: i64,
     username: Option<&str>,
     text: &str,
+    agent_runner: Option<&Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>>,
 ) -> Result<(), TelegramError> {
     if let Some(cmd) = mobile_session::parse_mobile_command(text) {
-        return handle_mobile_command(bot, config, state, chat_id, cmd).await;
+        return handle_mobile_command(bot, config, state, chat_id, cmd, agent_runner).await;
     }
 
     if text.trim_start().starts_with('@') {
@@ -257,6 +262,7 @@ async fn handle_mobile_command<B: BotClient + ?Sized>(
     state: StateHandle,
     chat_id: i64,
     cmd: MobileCommand,
+    agent_runner: Option<&Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>>,
 ) -> Result<(), TelegramError> {
     if !is_allowed(config, chat_id) {
         return Ok(());
@@ -264,7 +270,7 @@ async fn handle_mobile_command<B: BotClient + ?Sized>(
     match cmd {
         MobileCommand::ListClaude => handle_list_claude_command(bot, config, state, chat_id).await,
         MobileCommand::ClaudeMsg(body) => {
-            handle_claude_mobile_msg(bot, config, state, chat_id, body).await
+            handle_claude_mobile_msg(bot, config, state, chat_id, body, agent_runner).await
         }
         MobileCommand::FlushMobile => {
             bot.send_message(
@@ -501,13 +507,16 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     Ok(())
 }
 
-/// AC-3 + AC-4: Handle `@claude <msg>` — guard, spawn headless, reply.
+/// AC-3 + AC-4 + Phase 4a.8: Handle `@claude <msg>` — when an `AgentRunner`
+/// is present, dispatch through it for quota tracking + rotation; otherwise
+/// fall back to the legacy `spawn_claude_resume` path (AC-Q9).
 pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
     state: StateHandle,
     chat_id: i64,
     body: String,
+    agent_runner: Option<&Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>>,
 ) -> Result<(), TelegramError> {
     if !is_allowed(config, chat_id) {
         return Ok(());
@@ -527,7 +536,6 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
         return Err(TelegramError::UnknownRepo(mobile.repo_id.clone()));
     };
 
-    let claude_bin = claude_bin_path();
     let cwd = PathBuf::from(&repo.path);
     let timeout_secs = claude_headless::resolved_timeout_secs();
 
@@ -539,19 +547,25 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
     .await
     .ok();
 
-    let reply = match claude_headless::spawn_claude_resume(
-        &claude_bin,
-        &cwd,
-        &mobile.mobile_uuid,
-        &body,
-        timeout_secs,
-    )
-    .await
-    {
+    let reply = if let Some(runner) = agent_runner {
+        run_claude_via_runner(
+            runner,
+            &mobile.repo_id,
+            cwd.clone(),
+            mobile.mobile_uuid.clone(),
+            body.clone(),
+            Duration::from_secs(timeout_secs),
+            chat_id,
+        )
+        .await
+    } else {
+        run_claude_legacy(&cwd, &mobile.mobile_uuid, &body, timeout_secs).await
+    };
+
+    let reply = match reply {
         Ok(out) => out,
-        Err(err) => {
-            bot.send_message(chat_id, format!("❌ claude failed: {err}"), None)
-                .await?;
+        Err(msg) => {
+            bot.send_message(chat_id, msg, None).await?;
             return Ok(());
         }
     };
@@ -568,6 +582,77 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
+}
+
+async fn run_claude_legacy(
+    cwd: &Path,
+    mobile_uuid: &str,
+    body: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let claude_bin = claude_bin_path();
+    claude_headless::spawn_claude_resume(&claude_bin, cwd, mobile_uuid, body, timeout_secs)
+        .await
+        .map_err(|err| format!("❌ claude failed: {err}"))
+}
+
+async fn run_claude_via_runner(
+    runner: &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    repo_id: &str,
+    repo_path: PathBuf,
+    mobile_uuid: String,
+    prompt: String,
+    timeout: Duration,
+    chat_id: i64,
+) -> Result<String, String> {
+    let request_id = format!(
+        "req_{}",
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    let req = AgentRunRequest {
+        agent: "claude".to_string(),
+        repo_id: repo_id.to_string(),
+        repo_path,
+        prompt,
+        mode: AgentRunMode::ClaudeResume { mobile_uuid },
+        preferred_context: None,
+        timeout,
+        request_id,
+        chat_id: Some(chat_id),
+    };
+    match runner.run(req).await {
+        Ok(resp) => match resp.final_kind {
+            agent_bus_core::classifier::ResultKind::Success => Ok(resp.stdout),
+            agent_bus_core::classifier::ResultKind::QuotaExhausted => Err(format!(
+                "⚠️ claude/{} is out of quota. All usable contexts exhausted. Run /quota claude for details.",
+                resp.auth_context
+            )),
+            agent_bus_core::classifier::ResultKind::RateLimited => Err(format!(
+                "⚠️ claude/{} is rate-limited. Retry shortly or rotate with /auth_use claude <id>.",
+                resp.auth_context
+            )),
+            agent_bus_core::classifier::ResultKind::AuthExpired
+            | agent_bus_core::classifier::ResultKind::ManualReauthRequired => Err(format!(
+                "🔒 claude/{} needs re-auth. Run /reauth claude {} on the host machine.",
+                resp.auth_context, resp.auth_context
+            )),
+            _ => Err(format!(
+                "❌ claude failed ({:?}): {}",
+                resp.final_kind, resp.stderr_excerpt
+            )),
+        },
+        Err(RunnerError::NoUsableContexts { agent }) => Err(format!(
+            "All {agent} auth contexts are unavailable. Run /quota {agent} for details."
+        )),
+        Err(RunnerError::ApprovalPending {
+            agent,
+            id,
+            request_id,
+        }) => Err(format!(
+            "⏸ Rotation to {agent}/{id} needs owner approval. Use /auth_approve {request_id} or /auth_deny {request_id}."
+        )),
+        Err(err) => Err(format!("❌ claude failed: {err}")),
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────
@@ -966,13 +1051,22 @@ pub async fn teloxide_message_handler(
     msg: teloxide::types::Message,
     config: Arc<TelegramConfig>,
     state: StateHandle,
+    agent_runner: SharedAgentRunner,
 ) -> ResponseResult<()> {
     let client = TeloxideBotClient::new(bot);
     if let Some(text) = msg.text() {
         let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
-        handle_text_command(&client, &config, state, msg.chat.id.0, username, text)
-            .await
-            .map_err(to_teloxide_error)?;
+        handle_text_command(
+            &client,
+            &config,
+            state,
+            msg.chat.id.0,
+            username,
+            text,
+            agent_runner.as_ref(),
+        )
+        .await
+        .map_err(to_teloxide_error)?;
     }
     Ok(())
 }
@@ -1087,7 +1181,7 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(&bot, &config, state, 100, None, "@list_claude")
+        handle_text_command(&bot, &config, state, 100, None, "@list_claude", None)
             .await
             .unwrap();
 
@@ -1112,6 +1206,7 @@ mod mobile_tests {
             100,
             None,
             "@claude hello world",
+            None,
         )
         .await
         .unwrap();
@@ -1134,7 +1229,7 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(&bot, &config, state, 100, None, "@flush_mobile")
+        handle_text_command(&bot, &config, state, 100, None, "@flush_mobile", None)
             .await
             .unwrap();
 
@@ -1152,7 +1247,7 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(&bot, &config, state, 999, None, "@list_claude")
+        handle_text_command(&bot, &config, state, 999, None, "@list_claude", None)
             .await
             .unwrap();
 
@@ -1171,7 +1266,7 @@ mod mobile_tests {
             .unwrap();
         state.set_default_repo("100", "rallyup").await.unwrap();
 
-        handle_text_command(&bot, &config, state, 100, None, "@claude hi")
+        handle_text_command(&bot, &config, state, 100, None, "@claude hi", None)
             .await
             .unwrap();
 
@@ -1193,6 +1288,77 @@ mod mobile_tests {
         assert_eq!(
             project_hash_for_repo("/home/user/Projects/RallyUp"),
             "-home-user-Projects-RallyUp"
+        );
+    }
+
+    // Phase 4a.8: when agent_runner is Some, handle_claude_mobile_msg
+    // must dispatch through it (not the legacy spawn_claude_resume path).
+    // We verify this by pointing the runner at a fake claude that always
+    // returns quota_exhausted, and asserting the user sees the runner's
+    // "all contexts unavailable" message rather than a raw claude error.
+    #[tokio::test]
+    async fn claude_mobile_msg_uses_runner_when_provided() {
+        use crate::daemon::cli_spawner::CliSpawner;
+        use crate::daemon::runner::{AgentRunner, EventLog};
+        use agent_bus_core::auth_context::AuthContextsConfig;
+        use agent_bus_core::state::MobileSessionState;
+        use std::sync::Arc;
+
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        // test_config uses `/tmp/rallyup-test` as repo.path and Command::current_dir
+        // fails with ENOENT if the directory is missing. Ensure it exists.
+        std::fs::create_dir_all("/tmp/rallyup-test").unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        // Seed a mobile session so the guard passes.
+        state
+            .set_mobile_session(
+                "100".to_string(),
+                MobileSessionState {
+                    repo_id: "rallyup".to_string(),
+                    mobile_uuid: "aaaa-bbbb".to_string(),
+                    mobile_fork_source: String::new(),
+                    mobile_forked_at: String::new(),
+                    project_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Build an auth-contexts config with one enabled context, whose
+        // profile_dir exists on disk.
+        let profile_dir = dir.path().join(".agent-bus/auth/claude/john");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let yaml = format!(
+            "version: 1\ndefaults:\n  auto_rotate: false\n  require_owner_approval: false\nagents:\n  claude:\n    contexts:\n      - id: john\n        profile_dir: {}\n",
+            profile_dir.display()
+        );
+        let cfg = AuthContextsConfig::parse(&yaml, dir.path()).unwrap();
+
+        // Point the CLI spawner at the quota-exhausted fake fixture.
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake-cli/claude_quota.sh");
+        let spawner = CliSpawner::new().with_bin("claude", fixture);
+        let events = EventLog::new(dir.path().join("events.jsonl"));
+        let runner = Arc::new(AgentRunner::new(spawner, cfg, state.clone(), events));
+
+        handle_claude_mobile_msg(&bot, &config, state, 100, "do it".to_string(), Some(&runner))
+            .await
+            .unwrap();
+
+        let sent = bot.sent_messages();
+        // thinking... message, then runner's "unavailable" error mapped by run_claude_via_runner.
+        assert!(sent.iter().any(|m| m.text.contains("thinking")));
+        assert!(
+            sent.iter().any(|m| m.text.contains("out of quota")
+                || m.text.contains("unavailable")
+                || m.text.contains("/quota claude")),
+            "expected runner-path error message, got: {:?}",
+            sent.iter().map(|m| &m.text).collect::<Vec<_>>()
         );
     }
 }
