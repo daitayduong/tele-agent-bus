@@ -278,3 +278,150 @@ exit 1
         "events.jsonl: {log}"
     );
 }
+
+#[tokio::test]
+async fn cli_injects_mobile_context_e2e() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let (state, events) = state_and_events(&tmp).await;
+    
+    let home = tmp.path();
+    let claude_dir = home.join(".agent-bus/auth/claude/john");
+    let codex_dir = home.join(".agent-bus/auth/codex/john");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    
+    let yaml = format!(r#"
+version: 1
+agents:
+  claude:
+    contexts:
+      - id: john
+        profile_dir: {}
+  codex:
+    contexts:
+      - id: john
+        profile_dir: {}
+"#, claude_dir.display(), codex_dir.display());
+    let cfg = AuthContextsConfig::parse(&yaml, home).unwrap();
+    state.set_active_auth_context("claude", "john").await.unwrap();
+    
+    let repo_path = home.join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    let jsonl_dir = claude_dir.join("projects").join(project_hash_for_repo(&repo_path));
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    std::fs::write(jsonl_dir.join("m1.jsonl"), r#"{"type":"user","message":{"content":"mobile hi"}}"#).unwrap();
+
+    let wrapper = home.join("codex_echo.sh");
+    std::fs::write(&wrapper, "#!/usr/bin/env bash\ncat -\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let spawner = CliSpawner::new().with_bin("codex", wrapper);
+    let runner = AgentRunner::new(spawner, cfg, state, events);
+
+    let mut req = request("codex", repo_path, "original prompt");
+    req.mode = AgentRunMode::WithMobileContext { mobile_uuid: "m1".to_string() };
+    
+    let resp = runner.run(req).await.unwrap();
+    assert!(resp.mobile_ctx_injected);
+    assert!(resp.stdout.contains("<mobile_session_context>"));
+    assert!(resp.stdout.contains("mobile hi"));
+}
+
+#[tokio::test]
+async fn cli_mobile_context_persists_across_rotation_ac_l9() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let (state, events) = state_and_events(&tmp).await;
+    let home = tmp.path();
+    
+    let codex_john = home.join(".agent-bus/auth/codex/john");
+    let codex_partner = home.join(".agent-bus/auth/codex/partner");
+    let claude_john = home.join(".agent-bus/auth/claude/john");
+    for d in [&codex_john, &codex_partner, &claude_john] { std::fs::create_dir_all(d).unwrap(); }
+
+    let yaml = format!(r#"
+version: 1
+defaults:
+  auto_rotate: true
+  require_owner_approval: false
+agents:
+  claude:
+    contexts: [{{id: john, profile_dir: {}}}]
+  codex:
+    contexts:
+      - id: john
+        profile_dir: {}
+      - id: partner
+        profile_dir: {}
+"#, claude_john.display(), codex_john.display(), codex_partner.display());
+    let cfg = AuthContextsConfig::parse(&yaml, home).unwrap();
+    state.set_active_auth_context("claude", "john").await.unwrap();
+
+    let repo_path = home.join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    let jsonl_dir = claude_john.join("projects").join(project_hash_for_repo(&repo_path));
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    std::fs::write(jsonl_dir.join("m1.jsonl"), r#"{"type":"user","message":{"content":"mobile content"}}"#).unwrap();
+
+    let wrapper = home.join("codex_rotate.sh");
+    std::fs::write(&wrapper, r#"#!/usr/bin/env bash
+stdin=$(cat -)
+if [[ "$CODEX_HOME" == *"/john" ]]; then
+  echo "quota exceeded" >&2
+  exit 1
+else
+  echo "ok: $stdin"
+  exit 0
+fi
+"#).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let spawner = CliSpawner::new().with_bin("codex", wrapper);
+    let runner = AgentRunner::new(spawner, cfg, state, events);
+
+    let mut req = request("codex", repo_path, "original");
+    req.mode = AgentRunMode::WithMobileContext { mobile_uuid: "m1".to_string() };
+    
+    let resp = runner.run(req).await.unwrap();
+    assert_eq!(resp.auth_context, "partner");
+    assert!(resp.mobile_ctx_injected);
+    assert!(resp.stdout.contains("mobile content"));
+    assert!(resp.stdout.contains("original"));
+}
+
+#[tokio::test]
+async fn cli_mobile_context_skipped_when_disabled() {
+    let tmp = TempDir::new().unwrap();
+    let (state, events) = state_and_events(&tmp).await;
+    let home = tmp.path();
+    let codex_dir = home.join(".agent-bus/auth/codex/john");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    
+    let yaml = format!(r#"
+version: 1
+mobile_context:
+  enabled: false
+agents:
+  codex:
+    contexts:
+      - id: john
+        profile_dir: {}
+"#, codex_dir.display());
+    let cfg = AuthContextsConfig::parse(&yaml, home).unwrap();
+
+    let wrapper = home.join("codex_echo.sh");
+    std::fs::write(&wrapper, "#!/usr/bin/env bash\ncat -\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let spawner = CliSpawner::new().with_bin("codex", wrapper);
+    let runner = AgentRunner::new(spawner, cfg, state, events);
+
+    let mut req = request("codex", home.to_path_buf(), "hi");
+    req.mode = AgentRunMode::WithMobileContext { mobile_uuid: "any".to_string() };
+    
+    let resp = runner.run(req).await.unwrap();
+    assert!(!resp.mobile_ctx_injected);
+    assert_eq!(resp.stdout, "hi");
+}

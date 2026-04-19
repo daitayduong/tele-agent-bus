@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::daemon::mobile_transcript;
+
 pub const DEFAULT_QUOTA_COOLDOWN_SECS: i64 = 6 * 60 * 60; // 6h
 pub const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: i64 = 15 * 60; // 15m
 pub const DEFAULT_MAX_ATTEMPTS: usize = 2;
@@ -278,6 +280,85 @@ impl<S: AgentSpawner> AgentRunner<S> {
 
     pub async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResponse, RunnerError> {
         let snap = self.state.snapshot().await;
+        let mut req = req;
+        let mut mobile_ctx_injected = false;
+
+        // Phase 4b.2: Mobile Context Injection
+        if let AgentRunMode::WithMobileContext { mobile_uuid } = &req.mode {
+            let mobile_cfg = &self.cfg.mobile_context;
+            if !mobile_cfg.enabled {
+                let _ = self.events.append(&serde_json::json!({
+                    "ts": (self.now_fn)().format(&Rfc3339).unwrap_or_default(),
+                    "event": "mobile_context_skipped",
+                    "agent": &req.agent,
+                    "mobile_uuid": mobile_uuid,
+                    "reason": "disabled",
+                }));
+            } else {
+                let claude_ctx_id = snap.active_auth_context.get("claude");
+                let claude_ctx = claude_ctx_id.and_then(|id| self.cfg.context("claude", id));
+                
+                let jsonl_path = claude_ctx.map(|ctx| {
+                    ctx.profile_dir
+                        .join("projects")
+                        .join(project_hash_for_repo(&req.repo_path))
+                        .join(format!("{}.jsonl", mobile_uuid))
+                });
+
+                if let Some(path) = jsonl_path {
+                    if path.exists() {
+                        match mobile_transcript::read_claude_jsonl(&path) {
+                            Ok(msgs) => {
+                                let (rendered, stats) = mobile_transcript::render_context(
+                                    &msgs,
+                                    mobile_cfg.max_bytes,
+                                    mobile_cfg.max_messages,
+                                    mobile_cfg.include_tool_use,
+                                );
+                                req.prompt = format!("{}\n\n<user_prompt>\n{}\n</user_prompt>", rendered, req.prompt);
+                                let _ = self.events.append(&serde_json::json!({
+                                    "ts": (self.now_fn)().format(&Rfc3339).unwrap_or_default(),
+                                    "event": "mobile_context_injected",
+                                    "agent": &req.agent,
+                                    "mobile_uuid": mobile_uuid,
+                                    "bytes": stats.bytes,
+                                    "messages": stats.messages_used,
+                                    "trimmed": stats.trimmed,
+                                }));
+                                mobile_ctx_injected = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to read mobile transcript");
+                                let _ = self.events.append(&serde_json::json!({
+                                    "ts": (self.now_fn)().format(&Rfc3339).unwrap_or_default(),
+                                    "event": "mobile_context_skipped",
+                                    "agent": &req.agent,
+                                    "mobile_uuid": mobile_uuid,
+                                    "reason": "read_error",
+                                }));
+                            }
+                        }
+                    } else {
+                        let _ = self.events.append(&serde_json::json!({
+                            "ts": (self.now_fn)().format(&Rfc3339).unwrap_or_default(),
+                            "event": "mobile_context_skipped",
+                            "agent": &req.agent,
+                            "mobile_uuid": mobile_uuid,
+                            "reason": "jsonl_missing",
+                        }));
+                    }
+                } else {
+                    let _ = self.events.append(&serde_json::json!({
+                        "ts": (self.now_fn)().format(&Rfc3339).unwrap_or_default(),
+                        "event": "mobile_context_skipped",
+                        "agent": &req.agent,
+                        "mobile_uuid": mobile_uuid,
+                        "reason": "claude_context_missing",
+                    }));
+                }
+            }
+        }
+
         let all_candidates = select_candidates(
             &self.cfg,
             &snap,
@@ -377,10 +458,7 @@ impl<S: AgentSpawner> AgentRunner<S> {
                         stderr_excerpt: excerpt(&outcome.stderr),
                         auth_context: ctx.id.clone(),
                         attempts,
-                        mobile_ctx_injected: matches!(
-                            req.mode,
-                            AgentRunMode::WithMobileContext { .. }
-                        ),
+                        mobile_ctx_injected,
                         final_kind: ResultKind::Success,
                     });
                 }
@@ -398,7 +476,7 @@ impl<S: AgentSpawner> AgentRunner<S> {
                     // Try next? Check policy for current ctx (auto_rotate).
                     let can_rotate = ctx.auto_rotate || self.cfg.defaults.auto_rotate;
                     if !can_rotate || idx + 1 >= self.max_attempts {
-                        return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind));
+                        return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind, mobile_ctx_injected));
                     }
 
                     // Check next candidate's approval gate.
@@ -450,13 +528,13 @@ impl<S: AgentSpawner> AgentRunner<S> {
                     // Rotation under normal policy
                     let can_rotate = ctx.auto_rotate || self.cfg.defaults.auto_rotate;
                     if !can_rotate || idx + 1 >= self.max_attempts {
-                        return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind));
+                        return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind, mobile_ctx_injected));
                     }
                     continue;
                 }
                 ResultKind::Timeout | ResultKind::UnknownFailure => {
                     // Do NOT auto-rotate on unknown/timeout in v1.
-                    return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind));
+                    return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind, mobile_ctx_injected));
                 }
             }
         }
@@ -481,13 +559,14 @@ impl<S: AgentSpawner> AgentRunner<S> {
         auth_context: String,
         attempts: Vec<AgentAttempt>,
         kind: ResultKind,
+        mobile_ctx_injected: bool,
     ) -> AgentRunResponse {
         AgentRunResponse {
             stdout: outcome.stdout,
             stderr_excerpt: excerpt(&outcome.stderr),
             auth_context,
             attempts,
-            mobile_ctx_injected: false,
+            mobile_ctx_injected,
             final_kind: kind,
         }
     }
@@ -634,7 +713,7 @@ mod tests {
     #[derive(Default, Clone)]
     struct FakeSpawner {
         script: Arc<Mutex<Vec<SpawnOutcome>>>,
-        calls: Arc<Mutex<Vec<String>>>,
+        calls: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl FakeSpawner {
@@ -644,7 +723,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
-        fn calls(&self) -> Vec<String> {
+        fn calls(&self) -> Vec<(String, String)> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -653,11 +732,11 @@ mod tests {
         fn spawn(
             &self,
             ctx: &AuthContext,
-            _req: &AgentRunRequest,
+            req: &AgentRunRequest,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<SpawnOutcome, String>> + Send + '_>,
         > {
-            self.calls.lock().unwrap().push(ctx.id.clone());
+            self.calls.lock().unwrap().push((ctx.id.clone(), req.prompt.clone()));
             let next = {
                 let mut s = self.script.lock().unwrap();
                 if s.is_empty() {
@@ -794,7 +873,10 @@ agents:
         assert_eq!(resp.attempts.len(), 2);
         assert_eq!(resp.attempts[0].kind, ResultKind::QuotaExhausted);
         assert_eq!(resp.attempts[1].kind, ResultKind::Success);
-        assert_eq!(spawner.calls(), vec!["john", "partner"]);
+        let calls = spawner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "john");
+        assert_eq!(calls[1].0, "partner");
     }
 
     // ── AC-Q8 / 4a.10: rotation emits auth_context_rotated event ──────────
@@ -830,7 +912,9 @@ agents:
 
         let err = runner.run(req("claude")).await.unwrap_err();
         assert!(matches!(err, RunnerError::ApprovalPending { .. }));
-        assert_eq!(spawner.calls(), vec!["john"]);
+        let calls = spawner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "john");
 
         let snap = state.snapshot().await;
         assert_eq!(snap.pending_rotations.len(), 1);
@@ -870,7 +954,9 @@ agents:
 
         let resp = runner.run(req("claude")).await.unwrap();
         assert_eq!(resp.auth_context, "partner");
-        assert_eq!(spawner.calls(), vec!["partner"]);
+        let calls = spawner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "partner");
     }
 
     // ── AC-Q5: all exhausted ─────────────────────────────────────────────
@@ -942,7 +1028,9 @@ agents:
         r.preferred_context = Some("partner".to_string());
         let resp = runner.run(r).await.unwrap();
         assert_eq!(resp.auth_context, "partner");
-        assert_eq!(spawner.calls(), vec!["partner"]);
+        let calls = spawner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "partner");
     }
 
     // ── Pure selection helper tests ──────────────────────────────────────
@@ -995,5 +1083,50 @@ agents:
         );
         assert!(derive_cooldown(ResultKind::Success, now).is_none());
         assert!(derive_cooldown(ResultKind::AuthExpired, now).is_none());
+    }
+
+    #[tokio::test]
+    async fn injects_mobile_context_into_prompt() {
+        let (dir, state) = fresh_state().await;
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        
+        let claude_profile = home.join(".agent-bus/auth/claude/john");
+        let proj_dir = claude_profile.join("projects/-tmp-rp");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let jsonl_path = proj_dir.join("mobile-123.jsonl");
+        std::fs::write(&jsonl_path, r#"{"type":"user","message":{"role":"user","content":"hello from mobile"}}"#).unwrap();
+
+        let cfg_yaml = format!(r#"
+version: 1
+agents:
+  claude:
+    contexts:
+      - id: john
+        profile_dir: {home}/.agent-bus/auth/claude/john
+  codex:
+    contexts:
+      - id: john
+        profile_dir: {home}/.agent-bus/auth/codex/john
+"#, home=home.display());
+        let cfg = AuthContextsConfig::parse(&cfg_yaml, &home).unwrap();
+        
+        state.set_active_auth_context("claude", "john").await.unwrap();
+        state.set_active_auth_context("codex", "john").await.unwrap();
+
+        let spawner = FakeSpawner::new(vec![ok_out("codex reply")]);
+        let runner = AgentRunner::new(spawner.clone(), cfg, state, events_log(dir.path()));
+
+        let mut r = req("codex");
+        r.mode = AgentRunMode::WithMobileContext { mobile_uuid: "mobile-123".into() };
+        
+        let resp = runner.run(r).await.unwrap();
+        assert!(resp.mobile_ctx_injected);
+        
+        let calls = spawner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.contains("<mobile_session_context>"));
+        assert!(calls[0].1.contains("hello from mobile"));
+        assert!(calls[0].1.contains("<user_prompt>\nhi\n</user_prompt>"));
     }
 }
