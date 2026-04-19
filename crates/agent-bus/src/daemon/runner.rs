@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_bus_core::auth_context::{AuthContext, AuthContextsConfig};
@@ -30,6 +31,10 @@ use time::OffsetDateTime;
 pub const DEFAULT_QUOTA_COOLDOWN_SECS: i64 = 6 * 60 * 60; // 6h
 pub const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: i64 = 15 * 60; // 15m
 pub const DEFAULT_MAX_ATTEMPTS: usize = 2;
+
+/// Phase 4a.8 dptree dep: `None` in legacy mode (no `auth-contexts.yaml`),
+/// `Some` when the daemon wraps CLI spawns through `AgentRunner`.
+pub type SharedAgentRunner = Option<Arc<AgentRunner<crate::daemon::cli_spawner::CliSpawner>>>;
 
 // ── Request / response types ────────────────────────────────────────────
 

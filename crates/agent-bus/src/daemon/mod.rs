@@ -25,7 +25,9 @@ use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::Dispatcher;
 use teloxide::types::Update;
 
+use self::cli_spawner::CliSpawner;
 use self::perm::{FsBlacklistLoader, MergedBlacklistLoader, PendingPermRegistry, PermService};
+use self::runner::{AgentRunner, EventLog, SharedAgentRunner};
 use self::telegram::{RepoEntry, TelegramConfig, TeloxideBotClient};
 
 #[derive(Debug, Clone)]
@@ -111,6 +113,15 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Phase 4a.8: build AgentRunner when auth-contexts.yaml is present.
+    // Legacy mode (None) keeps `handle_claude_mobile_msg` on the existing
+    // `spawn_claude_resume` fast path (AC-Q9).
+    let agent_runner: SharedAgentRunner = config.auth_contexts.as_ref().map(|cfg| {
+        let spawner = CliSpawner::new();
+        let events = EventLog::new(config.home.join("events.jsonl"));
+        Arc::new(AgentRunner::new(spawner, cfg.clone(), state.clone(), events))
+    });
+
     let auth_contexts = Arc::new(config.auth_contexts);
     let telegram_config = Arc::new(config.telegram);
     let bot = teloxide::Bot::new(config.bot_token);
@@ -156,7 +167,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             telegram_config,
             state,
             registry,
-            auth_contexts
+            auth_contexts,
+            agent_runner
         ])
         .enable_ctrlc_handler()
         .build()
@@ -498,6 +510,7 @@ mod tests {
         handle_text_command(&bot, &config_with_repo_path(dir.path()), state, &None, 123,
             Some("alice"),
             "@bogus:rallyup foo",
+            None,
         )
         .await
         .unwrap();
@@ -546,6 +559,7 @@ mod tests {
                 handle_text_command(&bot, &config_with_repo_path(dir.path()), state, &None, 123,
                     Some("alice"),
                     "@codex:rallyup     ",
+                    None,
                 )
                 .await
                 .unwrap();
