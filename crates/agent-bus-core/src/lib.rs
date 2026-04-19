@@ -16,6 +16,7 @@ pub mod blacklist;
 pub mod blacklist_integrity;
 pub mod classifier;
 pub mod config;
+pub mod jsonl_scan;
 pub mod path_validate;
 pub mod peer_uid;
 pub mod redact;
