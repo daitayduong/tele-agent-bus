@@ -37,6 +37,7 @@ libc = { workspace = true }
 rand = { workspace = true }
 nix.workspace = true
 shellexpand = "3.1.2"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }

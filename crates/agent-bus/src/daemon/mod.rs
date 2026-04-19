@@ -1,4 +1,6 @@
 pub mod claude_headless;
+pub mod cli_spawner;
+pub mod context_lock;
 pub mod inbox;
 pub mod mobile_session;
 pub mod perm;

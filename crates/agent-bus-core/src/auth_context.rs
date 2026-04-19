@@ -160,7 +160,7 @@ fn default_mobile_max_messages() -> usize {
 
 // ── Validated, ready-to-use shape ────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AuthContextsConfig {
     pub defaults: Defaults,
     pub agents: BTreeMap<String, Vec<AuthContext>>,
@@ -228,18 +228,6 @@ impl Default for MobileContextConfig {
             max_bytes: default_mobile_max_bytes(),
             max_messages: default_mobile_max_messages(),
             include_tool_use: false,
-        }
-    }
-}
-
-impl Default for AuthContextsConfig {
-    fn default() -> Self {
-        Self {
-            defaults: Defaults::default(),
-            agents: BTreeMap::new(),
-            active: BTreeMap::new(),
-            lead: Lead::default(),
-            mobile_context: MobileContextConfig::default(),
         }
     }
 }
@@ -365,7 +353,7 @@ impl AuthContextsConfig {
                 if !SUPPORTED_AGENTS.contains(&l.default.as_str()) {
                     return Err(AuthConfigError::BadLeadAgent { agent: l.default });
                 }
-                for (_chat, agent) in &l.per_chat {
+                for agent in l.per_chat.values() {
                     if !SUPPORTED_AGENTS.contains(&agent.as_str()) {
                         return Err(AuthConfigError::BadLeadAgent {
                             agent: agent.clone(),
