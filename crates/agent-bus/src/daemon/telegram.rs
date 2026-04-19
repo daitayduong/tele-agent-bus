@@ -13,8 +13,11 @@ use crate::daemon::mobile_session::{
 };
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
 use crate::daemon::runner::{AgentRunMode, AgentRunRequest, RunnerError, SharedAgentRunner};
+use crate::daemon::session_bridge::{self, BridgeCommand};
 use agent_bus_core::auth_context::{AgentKind, AuthContextsConfig, LeadSource};
-use agent_bus_core::state::{MobileSessionState, PendingPermStatus, StateHandle};
+use agent_bus_core::state::{
+    BridgedSessionState, MobileSessionState, PendingPermStatus, SessionSyncCursor, StateHandle,
+};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
 use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
@@ -235,6 +238,10 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
 ) -> Result<(), TelegramError> {
     if let Some(cmd) = mobile_session::parse_mobile_command(text) {
         return handle_mobile_command(bot, config, state, chat_id, cmd, agent_runner).await;
+    }
+
+    if let Some(cmd) = session_bridge::parse_bridge_command(text) {
+        return handle_bridge_command(bot, config, state, chat_id, cmd, agent_runner).await;
     }
 
     if text.trim_start().starts_with('@') {
@@ -568,6 +575,56 @@ async fn handle_mobile_command<B: BotClient + ?Sized>(
     }
 }
 
+async fn handle_bridge_command<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    cmd: BridgeCommand,
+    agent_runner: Option<
+        &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    >,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+    match cmd {
+        BridgeCommand::List(AgentKind::Claude) => {
+            handle_list_claude_command(bot, config, state, chat_id).await
+        }
+        BridgeCommand::Chat(AgentKind::Claude, body) => {
+            handle_claude_mobile_msg(bot, config, state, chat_id, body, agent_runner).await
+        }
+        BridgeCommand::Flush(AgentKind::Claude) => {
+            bot.send_message(
+                chat_id,
+                "@flush_claude — not implemented yet (Phase 5b).".to_string(),
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+        BridgeCommand::List(agent) | BridgeCommand::Flush(agent) => {
+            bot.send_message(
+                chat_id,
+                format!("@list_{agent} / @flush_{agent} bridge is not implemented yet."),
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+        BridgeCommand::Chat(agent, _) => {
+            bot.send_message(
+                chat_id,
+                format!("@{agent} session bridge is not implemented yet. Use @list_{agent} first once the provider is available."),
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+    }
+}
+
 pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
@@ -756,12 +813,32 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     let mobile = MobileSessionState {
         mobile_uuid: MOBILE_UUID.to_string(),
         mobile_fork_source: desktop_uuid.clone(),
-        mobile_forked_at: forked_at,
+        mobile_forked_at: forked_at.clone(),
         project_hash,
         repo_id: repo.id.clone(),
     };
+    let desktop_offset = source_path.metadata().map(|m| m.len()).unwrap_or(0);
+    let mobile_offset = target_path.metadata().map(|m| m.len()).unwrap_or(0);
+    let bridge = BridgedSessionState {
+        agent: AgentKind::Claude.to_string(),
+        repo_id: repo.id.clone(),
+        desktop_session_id: desktop_uuid.clone(),
+        desktop_path: source_path.display().to_string(),
+        mobile_session_id: MOBILE_UUID.to_string(),
+        mobile_path: target_path.display().to_string(),
+        selected_at: forked_at.clone(),
+        sync: SessionSyncCursor {
+            desktop_offset,
+            mobile_offset,
+            last_synced_at: None,
+            last_error: None,
+        },
+    };
     state
         .set_mobile_session(chat_id.to_string(), mobile)
+        .await?;
+    state
+        .set_bridged_session(chat_id.to_string(), AgentKind::Claude.to_string(), bridge)
         .await?;
 
     let title = session
@@ -1856,20 +1933,58 @@ mod mobile_tests {
     #[tokio::test]
     async fn selecting_claude_writes_new_generic_state_ac_sb4() {
         let bot = MockBot::default();
-        let config = test_config();
         let dir = tempdir().unwrap();
-        let state = spawn_state_actor(dir.path().join("state.json")).await.unwrap();
+        let repo_path = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let home = dir.path().join("home");
+        let desktop_uuid = "11111111-1111-1111-1111-111111111111";
+        let project_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(project_hash_for_repo(&repo_path.display().to_string()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join(format!("{desktop_uuid}.jsonl")),
+            format!(
+                r#"{{"type":"user","sessionId":"{desktop_uuid}","cwd":"{}","timestamp":"2026-04-19T00:00:00Z","message":{{"role":"user","content":"hello"}}}}"#,
+                repo_path.display()
+            ),
+        )
+        .unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let config = TelegramConfig {
+            allowed_chats: vec!["100".to_string()],
+            repos: vec![RepoEntry {
+                id: "rallyup".to_string(),
+                display: "RallyUp".to_string(),
+                path: repo_path.display().to_string(),
+                agents: vec!["claude".to_string()],
+            }],
+        };
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
         state.set_default_repo("100", "rallyup").await.unwrap();
-        
-        // Current handle_callback_sel_claude will fail here (e.g. source file missing),
-        // but we want to verify that when it works, it writes the new state.
-        // For a RED test, we can just assert the state is written.
-        handle_callback_sel_claude(&bot, &config, state.clone(), 100, 
-            MessageRef { chat_id: 100, message_id: 42 }, 
-            "cb-1".to_string(), 
-            format!("sel_claude:{}", "00000000-0000-0000-0000-000000000002")
-        ).await.ok();
-        
+
+        handle_callback_sel_claude(
+            &bot,
+            &config,
+            state.clone(),
+            100,
+            MessageRef {
+                chat_id: 100,
+                message_id: 42,
+            },
+            "cb-1".to_string(),
+            format!("sel_claude:{desktop_uuid}"),
+        )
+        .await
+        .unwrap();
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        }
+
         let snap = state.snapshot().await;
         assert!(
             snap.bridged_sessions.contains_key("100"),

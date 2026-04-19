@@ -219,6 +219,12 @@ enum StateCmd {
         mobile: MobileSessionState,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
+    SetBridgedSession {
+        chat_id: String,
+        agent: String,
+        bridge: BridgedSessionState,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
     ClearMobileSession {
         chat_id: String,
         reply: oneshot::Sender<Result<(), StateError>>,
@@ -340,6 +346,25 @@ impl StateHandle {
         self.tx
             .send(StateCmd::ClearMobileSession {
                 chat_id: chat_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_bridged_session(
+        &self,
+        chat_id: impl Into<String>,
+        agent: impl Into<String>,
+        bridge: BridgedSessionState,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetBridgedSession {
+                chat_id: chat_id.into(),
+                agent: agent.into(),
+                bridge,
                 reply,
             })
             .await
@@ -514,6 +539,20 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                     reply,
                 } => {
                     state.mobile_sessions.insert(chat_id, mobile);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetBridgedSession {
+                    chat_id,
+                    agent,
+                    bridge,
+                    reply,
+                } => {
+                    state
+                        .bridged_sessions
+                        .entry(chat_id)
+                        .or_default()
+                        .insert(agent, bridge);
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
@@ -783,7 +822,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let mut state = StateSnapshot::default();
-        
+
         let bridge = BridgedSessionState {
             agent: "claude".to_string(),
             repo_id: "rallyup_123".to_string(),
@@ -799,16 +838,18 @@ mod tests {
                 last_error: None,
             },
         };
-        
+
         let mut chat_bridges = BTreeMap::new();
         chat_bridges.insert("claude".to_string(), bridge.clone());
-        state.bridged_sessions.insert("chat1".to_string(), chat_bridges);
-        
+        state
+            .bridged_sessions
+            .insert("chat1".to_string(), chat_bridges);
+
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
-        
+
         let handle = spawn_state_actor(path).await.unwrap();
         let snap = handle.snapshot().await;
-        
+
         assert_eq!(snap.bridged_sessions["chat1"]["claude"], bridge);
     }
 
