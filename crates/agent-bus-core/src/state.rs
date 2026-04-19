@@ -54,6 +54,7 @@ pub enum AuthContextStatusKind {
     Available,
     QuotaExhausted,
     RateLimited,
+    AuthExpiringSoon,
     AuthExpired,
     ManualReauthRequired,
     Disabled,
@@ -284,10 +285,7 @@ impl StateHandle {
         rx.await.map_err(|_| StateError::ActorClosed)?
     }
 
-    pub async fn clear_mobile_session(
-        &self,
-        chat_id: impl Into<String>,
-    ) -> Result<(), StateError> {
+    pub async fn clear_mobile_session(&self, chat_id: impl Into<String>) -> Result<(), StateError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(StateCmd::ClearMobileSession {
@@ -671,9 +669,7 @@ mod tests {
             .unwrap();
 
         let snap = handle.snapshot().await;
-        assert_eq!(
-            snap.auth_context_status["claude"]["john"], status
-        );
+        assert_eq!(snap.auth_context_status["claude"]["john"], status);
 
         drop(handle);
         let reloaded: StateSnapshot =

@@ -85,6 +85,30 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         for (agent, id) in &auth_cfg.active {
             state.set_active_auth_context(agent, id).await.ok();
         }
+
+        // Phase 4a.12: Token expiry detection on startup
+        for (agent_name, contexts) in &auth_cfg.agents {
+            for ctx in contexts {
+                let status = agent_bus_core::token_expiry::read_for_agent(agent_name, &ctx.profile_dir);
+                use agent_bus_core::token_expiry::ExpiryStatus;
+                use agent_bus_core::state::{AuthContextStatus, AuthContextStatusKind};
+                let kind = match status {
+                    ExpiryStatus::Expired { .. } => Some(AuthContextStatusKind::AuthExpired),
+                    ExpiryStatus::ExpiringSoon { .. } => Some(AuthContextStatusKind::AuthExpiringSoon),
+                    _ => None,
+                };
+                if let Some(k) = kind {
+                    let now = time::OffsetDateTime::now_utc();
+                    let st = AuthContextStatus {
+                        status: k,
+                        cooldown_until: None,
+                        last_event_id: None,
+                        updated_at: now.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                    };
+                    state.set_auth_context_status(agent_name, &ctx.id, st).await.ok();
+                }
+            }
+        }
     }
 
     let auth_contexts = Arc::new(config.auth_contexts);
@@ -471,11 +495,7 @@ mod tests {
             .unwrap();
         let bot = MockBot::default();
 
-        handle_text_command(
-            &bot,
-            &config_with_repo_path(dir.path()),
-            state,
-            123,
+        handle_text_command(&bot, &config_with_repo_path(dir.path()), state, &None, 123,
             Some("alice"),
             "@bogus:rallyup foo",
         )
@@ -523,11 +543,7 @@ mod tests {
                     .await
                     .unwrap();
                 let bot = MockBot::default();
-                handle_text_command(
-                    &bot,
-                    &config_with_repo_path(dir.path()),
-                    state,
-                    123,
+                handle_text_command(&bot, &config_with_repo_path(dir.path()), state, &None, 123,
                     Some("alice"),
                     "@codex:rallyup     ",
                 )

@@ -20,8 +20,8 @@ use agent_bus_core::classifier::{
 };
 use agent_bus_core::jsonl_scan;
 use agent_bus_core::state::{
-    AuthContextStatus, AuthContextStatusKind, PendingRotation, PendingRotationStatus,
-    StateHandle, StateSnapshot,
+    AuthContextStatus, AuthContextStatusKind, PendingRotation, PendingRotationStatus, StateHandle,
+    StateSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -102,7 +102,9 @@ pub trait AgentSpawner: Send + Sync {
         &self,
         ctx: &AuthContext,
         req: &AgentRunRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SpawnOutcome, String>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SpawnOutcome, String>> + Send + '_>,
+    >;
 }
 
 #[derive(Debug, Clone)]
@@ -163,9 +165,7 @@ pub fn select_candidates<'a>(
         }
     }
     if let Some(active) = state.active_auth_context.get(agent) {
-        if !ordered_ids.contains(&active.as_str())
-            && all.iter().any(|c| c.id == *active)
-        {
+        if !ordered_ids.contains(&active.as_str()) && all.iter().any(|c| c.id == *active) {
             ordered_ids.push(active.as_str());
         }
     }
@@ -199,7 +199,7 @@ pub fn is_usable(
         return true; // never seen before → available
     };
     match st.status {
-        AuthContextStatusKind::Available => true,
+        AuthContextStatusKind::Available | AuthContextStatusKind::AuthExpiringSoon => true,
         AuthContextStatusKind::Disabled
         | AuthContextStatusKind::AuthExpired
         | AuthContextStatusKind::ManualReauthRequired => false,
@@ -253,12 +253,7 @@ pub struct AgentRunner<S: AgentSpawner> {
 }
 
 impl<S: AgentSpawner> AgentRunner<S> {
-    pub fn new(
-        spawner: S,
-        cfg: AuthContextsConfig,
-        state: StateHandle,
-        events: EventLog,
-    ) -> Self {
+    pub fn new(spawner: S, cfg: AuthContextsConfig, state: StateHandle, events: EventLog) -> Self {
         let mut classifiers = BTreeMap::new();
         for &agent in &["claude", "codex", "gemini"] {
             if let Some(c) = default_classifier(agent) {
@@ -276,10 +271,7 @@ impl<S: AgentSpawner> AgentRunner<S> {
         }
     }
 
-    pub async fn run(
-        &self,
-        req: AgentRunRequest,
-    ) -> Result<AgentRunResponse, RunnerError> {
+    pub async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResponse, RunnerError> {
         let snap = self.state.snapshot().await;
         let all_candidates = select_candidates(
             &self.cfg,
@@ -354,7 +346,8 @@ impl<S: AgentSpawner> AgentRunner<S> {
             match kind {
                 ResultKind::Success => {
                     // Mark available + record active context.
-                    self.mark_available(&req.agent, &ctx.id, finished_at).await?;
+                    self.mark_available(&req.agent, &ctx.id, finished_at)
+                        .await?;
                     self.state
                         .set_active_auth_context(&req.agent, &ctx.id)
                         .await?;
@@ -400,12 +393,7 @@ impl<S: AgentSpawner> AgentRunner<S> {
                     // Try next? Check policy for current ctx (auto_rotate).
                     let can_rotate = ctx.auto_rotate || self.cfg.defaults.auto_rotate;
                     if !can_rotate || idx + 1 >= self.max_attempts {
-                        return Ok(self.failure_response(
-                            outcome,
-                            ctx.id.clone(),
-                            attempts,
-                            kind,
-                        ));
+                        return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind));
                     }
 
                     // Check next candidate's approval gate.
@@ -457,23 +445,13 @@ impl<S: AgentSpawner> AgentRunner<S> {
                     // Rotation under normal policy
                     let can_rotate = ctx.auto_rotate || self.cfg.defaults.auto_rotate;
                     if !can_rotate || idx + 1 >= self.max_attempts {
-                        return Ok(self.failure_response(
-                            outcome,
-                            ctx.id.clone(),
-                            attempts,
-                            kind,
-                        ));
+                        return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind));
                     }
                     continue;
                 }
                 ResultKind::Timeout | ResultKind::UnknownFailure => {
                     // Do NOT auto-rotate on unknown/timeout in v1.
-                    return Ok(self.failure_response(
-                        outcome,
-                        ctx.id.clone(),
-                        attempts,
-                        kind,
-                    ));
+                    return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind));
                 }
             }
         }
@@ -533,7 +511,9 @@ impl<S: AgentSpawner> AgentRunner<S> {
             last_event_id: None,
             updated_at: now.format(&Rfc3339).unwrap_or_default(),
         };
-        self.state.set_auth_context_status(agent, id, status).await?;
+        self.state
+            .set_auth_context_status(agent, id, status)
+            .await?;
         Ok(())
     }
 
@@ -669,8 +649,9 @@ mod tests {
             &self,
             ctx: &AuthContext,
             _req: &AgentRunRequest,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SpawnOutcome, String>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<SpawnOutcome, String>> + Send + '_>,
+        > {
             self.calls.lock().unwrap().push(ctx.id.clone());
             let next = {
                 let mut s = self.script.lock().unwrap();
@@ -680,9 +661,7 @@ mod tests {
                     Some(s.remove(0))
                 }
             };
-            Box::pin(async move {
-                next.ok_or_else(|| "spawner script exhausted".to_string())
-            })
+            Box::pin(async move { next.ok_or_else(|| "spawner script exhausted".to_string()) })
         }
     }
 
@@ -711,7 +690,11 @@ mod tests {
         }
     }
 
-    fn cfg_two_claude_contexts(home: &Path, auto_rotate: bool, approval: bool) -> AuthContextsConfig {
+    fn cfg_two_claude_contexts(
+        home: &Path,
+        auto_rotate: bool,
+        approval: bool,
+    ) -> AuthContextsConfig {
         // Build a config directly via parse to exercise the real path validator.
         let y = format!(
             r#"
@@ -753,7 +736,9 @@ agents:
 
     async fn fresh_state() -> (tempfile::TempDir, StateHandle) {
         let dir = tempfile::tempdir().unwrap();
-        let handle = spawn_state_actor(dir.path().join("state.json")).await.unwrap();
+        let handle = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
         (dir, handle)
     }
 
@@ -868,9 +853,7 @@ agents:
                     status: AuthContextStatusKind::QuotaExhausted,
                     cooldown_until: Some(future.format(&Rfc3339).unwrap()),
                     last_event_id: None,
-                    updated_at: OffsetDateTime::now_utc()
-                        .format(&Rfc3339)
-                        .unwrap(),
+                    updated_at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
                 },
             )
             .await
@@ -903,9 +886,7 @@ agents:
                         status: AuthContextStatusKind::QuotaExhausted,
                         cooldown_until: Some(future.format(&Rfc3339).unwrap()),
                         last_event_id: None,
-                        updated_at: OffsetDateTime::now_utc()
-                            .format(&Rfc3339)
-                            .unwrap(),
+                        updated_at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
                     },
                 )
                 .await
@@ -1001,10 +982,7 @@ agents:
     fn derive_cooldown_uses_defaults() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let c_quota = derive_cooldown(ResultKind::QuotaExhausted, now).unwrap();
-        assert_eq!(
-            (c_quota - now).whole_seconds(),
-            DEFAULT_QUOTA_COOLDOWN_SECS
-        );
+        assert_eq!((c_quota - now).whole_seconds(), DEFAULT_QUOTA_COOLDOWN_SECS);
         let c_rate = derive_cooldown(ResultKind::RateLimited, now).unwrap();
         assert_eq!(
             (c_rate - now).whole_seconds(),

@@ -10,6 +10,8 @@ use crate::daemon::mobile_session::{
     self, MobileCommand, SessionInfo, ARCHIVE_RETENTION, MOBILE_UUID,
 };
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
+use crate::daemon::auth_cmds;
+use agent_bus_core::auth_context::AuthContextsConfig;
 use agent_bus_core::state::{MobileSessionState, PendingPermStatus, StateHandle};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
@@ -221,6 +223,7 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
     state: StateHandle,
+    auth_contexts: &Option<AuthContextsConfig>,
     chat_id: i64,
     username: Option<&str>,
     text: &str,
@@ -246,6 +249,38 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
                 return Ok(());
             };
             handle_switch_rp_command(bot, config, state, chat_id, repo_id.to_string()).await
+        }
+        Some("/auth_list") => {
+            if let Some(cfg) = auth_contexts {
+                auth_cmds::handle_auth_list_command(bot, state, cfg, chat_id).await
+            } else {
+                bot.send_message(chat_id, "Auth contexts not configured (legacy mode)".to_string(), None).await?;
+                Ok(())
+            }
+        }
+        Some("/quota") => {
+            let Some(agent) = parts.next() else {
+                bot.send_message(chat_id, "Usage: /quota <agent>".to_string(), None).await?;
+                return Ok(());
+            };
+            if let Some(cfg) = auth_contexts {
+                auth_cmds::handle_quota_command(bot, state, cfg, chat_id, agent).await
+            } else {
+                bot.send_message(chat_id, "Auth contexts not configured (legacy mode)".to_string(), None).await?;
+                Ok(())
+            }
+        }
+        Some("/auth_rotate") => {
+            let Some(agent) = parts.next() else {
+                bot.send_message(chat_id, "Usage: /auth_rotate <agent>".to_string(), None).await?;
+                return Ok(());
+            };
+            if let Some(cfg) = auth_contexts {
+                auth_cmds::handle_auth_rotate_command(bot, state, cfg, chat_id, agent).await
+            } else {
+                bot.send_message(chat_id, "Auth contexts not configured (legacy mode)".to_string(), None).await?;
+                Ok(())
+            }
         }
         _ => Ok(()),
     }
@@ -278,8 +313,6 @@ async fn handle_mobile_command<B: BotClient + ?Sized>(
     }
 }
 
-/// AC-1: List active desktop Claude sessions for the chat's default repo and
-/// reply with an inline keyboard for session selection.
 pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
@@ -312,12 +345,8 @@ pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
     ) {
         Ok(s) => s,
         Err(err) => {
-            bot.send_message(
-                chat_id,
-                format!("Failed to scan sessions: {err}"),
-                None,
-            )
-            .await?;
+            bot.send_message(chat_id, format!("Failed to scan sessions: {err}"), None)
+                .await?;
             return Ok(());
         }
     };
@@ -343,9 +372,6 @@ pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
     Ok(())
 }
 
-/// AC-2 + AC-5 + AC-9 + AC-10: Fork the chosen desktop session into mobile uuid,
-/// archive the previous mobile file, append a marker line to the source desktop
-/// JSONL, rotate archives, and persist state.
 pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
@@ -377,7 +403,6 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     let source_path = project_dir.join(format!("{}.jsonl", desktop_uuid));
     let target_path = project_dir.join(format!("{}.jsonl", MOBILE_UUID));
 
-    // Locate the session to validate cwd (AC-9)
     let sessions = match mobile_session::detect_active_sessions(
         &project_dir,
         MOBILE_UUID,
@@ -396,7 +421,6 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         return Ok(());
     };
 
-    // AC-9: cwd guard
     if !cwd_matches_repo(&session.cwd, &repo.path) {
         bot.edit_message_text(
             message,
@@ -411,11 +435,13 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         return Ok(());
     }
 
-    // Archive previous mobile if it exists
     let archive_dir = agents_archive_dir(&repo.path);
     if let Err(err) = std::fs::create_dir_all(&archive_dir) {
-        bot.answer_callback(callback_id, short_err("archive dir error", &err.to_string()))
-            .await?;
+        bot.answer_callback(
+            callback_id,
+            short_err("archive dir error", &err.to_string()),
+        )
+        .await?;
         return Ok(());
     }
     if target_path.exists() {
@@ -431,12 +457,14 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         }
     }
 
-    // Clean up any stale .tmp.* files from prior aborted forks
     if let Some(dir) = target_path.parent() {
         if let Ok(entries) = std::fs::read_dir(dir) {
             let prefix = format!(
                 "{}.tmp.",
-                target_path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                target_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
             );
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
@@ -448,7 +476,6 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         }
     }
 
-    // Fork
     let fork_stats = match mobile_session::fork_session(&source_path, &target_path, MOBILE_UUID) {
         Ok(s) => s,
         Err(err) => {
@@ -458,17 +485,14 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         }
     };
 
-    // AC-5: append marker to source desktop JSONL
     if let Err(err) = mobile_session::append_fork_marker(&source_path, MOBILE_UUID) {
         tracing::warn!(target: "agent_bus::mobile", error = %err, "append_fork_marker failed");
     }
 
-    // AC-10: rotate archives
     if let Err(err) = mobile_session::rotate_archives(&archive_dir, ARCHIVE_RETENTION) {
         tracing::warn!(target: "agent_bus::mobile", error = %err, "rotate_archives failed");
     }
 
-    // Persist state
     let now = time::OffsetDateTime::now_utc();
     let forked_at = now
         .format(&time::format_description::well_known::Rfc3339)
@@ -485,12 +509,10 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         .set_mobile_session(chat_id.to_string(), mobile)
         .await?;
 
-    let title = session.ai_title.clone().unwrap_or_else(|| {
-        desktop_uuid
-            .get(..8)
-            .unwrap_or(&desktop_uuid)
-            .to_string()
-    });
+    let title = session
+        .ai_title
+        .clone()
+        .unwrap_or_else(|| desktop_uuid.get(..8).unwrap_or(&desktop_uuid).to_string());
     let confirm = format!(
         "✅ Mobile forked from \"{}\" ({} lines rewritten). Send @claude <msg> to continue.",
         title, fork_stats.lines_rewritten
@@ -501,7 +523,6 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     Ok(())
 }
 
-/// AC-3 + AC-4: Handle `@claude <msg>` — guard, spawn headless, reply.
 pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
@@ -563,16 +584,14 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
         return Ok(());
     }
 
-    const MAX_CHUNK: usize = 4000; // stay under 4096 Telegram limit
+    const MAX_CHUNK: usize = 4000;
     for chunk in claude_headless::chunk_for_telegram(trimmed, MAX_CHUNK) {
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
 }
 
-// ── helpers ───────────────────────────────────────────────────────────
-
-const DEFAULT_MTIME_THRESHOLD_SECS: u64 = 30 * 60; // 30 minutes
+const DEFAULT_MTIME_THRESHOLD_SECS: u64 = 30 * 60;
 
 fn claude_project_dir(repo_path: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -606,8 +625,6 @@ fn claude_bin_path() -> String {
     std::env::var("AGENT_BUS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
-/// Telegram's answer_callback limit is 200 chars; sanitize errors so control
-/// characters and huge payloads never reach the API.
 fn short_err(label: &str, err: &str) -> String {
     const MAX: usize = 180;
     let sanitized: String = err
@@ -618,7 +635,6 @@ fn short_err(label: &str, err: &str) -> String {
     format!("{}: {}", label, head)
 }
 
-// unused in non-test builds — silence when tests disabled
 #[allow(dead_code)]
 fn _session_info_dummy() -> SessionInfo {
     SessionInfo {
@@ -838,10 +854,7 @@ impl MockBot {
     }
 
     pub fn answered_callbacks(&self) -> Vec<String> {
-        self.callbacks
-            .lock()
-            .expect("mock bot lock poisoned")
-            .clone()
+        self.callbacks.lock().expect("mock bot lock poisoned").clone()
     }
 }
 
@@ -966,11 +979,12 @@ pub async fn teloxide_message_handler(
     msg: teloxide::types::Message,
     config: Arc<TelegramConfig>,
     state: StateHandle,
+    auth_contexts: Arc<Option<AuthContextsConfig>>,
 ) -> ResponseResult<()> {
     let client = TeloxideBotClient::new(bot);
     if let Some(text) = msg.text() {
         let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
-        handle_text_command(&client, &config, state, msg.chat.id.0, username, text)
+        handle_text_command(&client, &config, state, &auth_contexts, msg.chat.id.0, username, text)
             .await
             .map_err(to_teloxide_error)?;
     }
@@ -982,6 +996,7 @@ pub async fn teloxide_callback_handler(
     query: teloxide::types::CallbackQuery,
     config: Arc<TelegramConfig>,
     state: StateHandle,
+    auth_contexts: Arc<Option<AuthContextsConfig>>,
     registry: crate::daemon::perm::PendingPermRegistry,
 ) -> ResponseResult<()> {
     let client = TeloxideBotClient::new(bot);
@@ -1044,6 +1059,21 @@ pub async fn teloxide_callback_handler(
         )
         .await
         .map_err(to_teloxide_error)?;
+    } else if data.starts_with("rot:") {
+        if let Some(_cfg) = auth_contexts.as_ref() {
+            auth_cmds::handle_callback_rotation(
+                &client,
+                state,
+                MessageRef {
+                    chat_id: chat.id.0,
+                    message_id: message_id.0,
+                },
+                query.id,
+                data,
+            )
+            .await
+            .map_err(to_teloxide_error)?;
+        }
     }
     Ok(())
 }
@@ -1087,7 +1117,7 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(&bot, &config, state, 100, None, "@list_claude")
+        handle_text_command(&bot, &config, state, &None, 100, None, "@list_claude")
             .await
             .unwrap();
 
@@ -1105,16 +1135,9 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(
-            &bot,
-            &config,
-            state,
-            100,
-            None,
-            "@claude hello world",
-        )
-        .await
-        .unwrap();
+        handle_text_command(&bot, &config, state, &None, 100, None, "@claude hello world")
+            .await
+            .unwrap();
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
@@ -1126,24 +1149,6 @@ mod mobile_tests {
     }
 
     #[tokio::test]
-    async fn flush_mobile_reports_not_implemented() {
-        let bot = MockBot::default();
-        let config = test_config();
-        let dir = tempdir().unwrap();
-        let state = spawn_state_actor(dir.path().join("state.json"))
-            .await
-            .unwrap();
-
-        handle_text_command(&bot, &config, state, 100, None, "@flush_mobile")
-            .await
-            .unwrap();
-
-        let sent = bot.sent_messages();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].text.contains("not implemented"));
-    }
-
-    #[tokio::test]
     async fn unauthorized_chat_is_ignored_for_mobile_commands() {
         let bot = MockBot::default();
         let config = test_config();
@@ -1152,7 +1157,7 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(&bot, &config, state, 999, None, "@list_claude")
+        handle_text_command(&bot, &config, state, &None, 999, None, "@list_claude")
             .await
             .unwrap();
 
@@ -1161,8 +1166,6 @@ mod mobile_tests {
 
     #[tokio::test]
     async fn claude_mobile_msg_uses_stored_repo_and_uuid() {
-        // Verify the state lookup path — no mobile state → guard warning even
-        // when default_repo_by_chat is set (different guard).
         let bot = MockBot::default();
         let config = test_config();
         let dir = tempdir().unwrap();
@@ -1171,11 +1174,10 @@ mod mobile_tests {
             .unwrap();
         state.set_default_repo("100", "rallyup").await.unwrap();
 
-        handle_text_command(&bot, &config, state, 100, None, "@claude hi")
+        handle_text_command(&bot, &config, state, &None, 100, None, "@claude hi")
             .await
             .unwrap();
 
-        // Still hits AC-4 guard because no mobile_sessions entry exists.
         let sent = bot.sent_messages();
         assert!(sent[0].text.contains("No mobile session"));
     }
