@@ -190,6 +190,23 @@ pub fn default_specs(agent: &str) -> &'static [(ResultKind, &'static str, &'stat
     }
 }
 
+/// Classify an arbitrary text buffer using the default rules for `agent`.
+///
+/// Unlike [`ProviderClassifier::classify`], this helper has no process exit
+/// status and therefore scans all default rule kinds directly.
+pub fn classify_text(agent: &str, text: &str) -> Option<(ResultKind, &'static str)> {
+    if text.is_empty() {
+        return None;
+    }
+    for (kind, name, pattern) in default_specs(agent) {
+        let pattern = Regex::new(pattern).ok()?;
+        if pattern.is_match(text) {
+            return Some((*kind, *name));
+        }
+    }
+    None
+}
+
 const CLAUDE_SPECS: &[(ResultKind, &str, &str)] = &[
     (
         ResultKind::QuotaExhausted,
@@ -239,11 +256,7 @@ const CODEX_SPECS: &[(ResultKind, &str, &str)] = &[
         "codex_rate_limit",
         r"(?i)rate\s+limit",
     ),
-    (
-        ResultKind::QuotaExhausted,
-        "codex_quota",
-        r"(?i)quota",
-    ),
+    (ResultKind::QuotaExhausted, "codex_quota", r"(?i)quota"),
     (
         ResultKind::AuthExpired,
         "codex_not_authenticated",
@@ -297,7 +310,12 @@ pub fn default_classifier(agent: &str) -> Option<ProviderClassifier> {
 mod tests {
     use super::*;
 
-    fn out<'a>(exit: Option<i32>, stderr: &'a str, stdout: &'a str, timed_out: bool) -> RunOutput<'a> {
+    fn out<'a>(
+        exit: Option<i32>,
+        stderr: &'a str,
+        stdout: &'a str,
+        timed_out: bool,
+    ) -> RunOutput<'a> {
         RunOutput {
             exit_code: exit,
             stdout,
@@ -332,7 +350,10 @@ mod tests {
             false,
         ));
         assert_eq!(r.kind, ResultKind::QuotaExhausted);
-        assert_eq!(r.classifier.as_deref(), Some("stderr_regex:claude_usage_limit"));
+        assert_eq!(
+            r.classifier.as_deref(),
+            Some("stderr_regex:claude_usage_limit")
+        );
     }
 
     #[test]
@@ -348,7 +369,10 @@ mod tests {
         let c = default_classifier("codex").unwrap();
         let r = c.classify(&out(Some(1), "rate limit exceeded", "", false));
         assert_eq!(r.kind, ResultKind::RateLimited);
-        assert_eq!(r.classifier.as_deref(), Some("stderr_regex:codex_rate_limit"));
+        assert_eq!(
+            r.classifier.as_deref(),
+            Some("stderr_regex:codex_rate_limit")
+        );
     }
 
     #[test]
@@ -417,8 +441,8 @@ mod tests {
         let c = ProviderClassifier::new("test", rules);
         let r = c.classify(&out(
             Some(1),
-            "auth failed",        // stderr matches 'auth' rule
-            "quota exceeded",     // stdout matches 'quota' rule
+            "auth failed",    // stderr matches 'auth' rule
+            "quota exceeded", // stdout matches 'quota' rule
             false,
         ));
         // stderr first → auth wins even though quota is declared earlier,
@@ -437,11 +461,9 @@ mod tests {
 
     #[test]
     fn bad_regex_returns_error() {
-        let err = ProviderClassifier::from_specs(
-            "test",
-            &[(ResultKind::QuotaExhausted, "bad", r"(?P<")],
-        )
-        .unwrap_err();
+        let err =
+            ProviderClassifier::from_specs("test", &[(ResultKind::QuotaExhausted, "bad", r"(?P<")])
+                .unwrap_err();
         assert!(matches!(err, ClassifierError::BadRegex { .. }));
     }
 

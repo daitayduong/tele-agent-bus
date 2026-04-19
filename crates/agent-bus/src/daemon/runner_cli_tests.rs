@@ -49,8 +49,14 @@ fn request(agent: &str, repo_path: PathBuf, prompt: &str) -> AgentRunRequest {
     }
 }
 
+fn project_hash_for_repo(repo_path: &Path) -> String {
+    repo_path.to_string_lossy().replace('/', "-")
+}
+
 async fn state_and_events(tmp: &TempDir) -> (agent_bus_core::state::StateHandle, EventLog) {
-    let state = spawn_state_actor(tmp.path().join("state.json")).await.unwrap();
+    let state = spawn_state_actor(tmp.path().join("state.json"))
+        .await
+        .unwrap();
     let events = EventLog::new(tmp.path().join("events.jsonl"));
     (state, events)
 }
@@ -151,8 +157,7 @@ async fn cli_codex_auth_expired_marks_reauth() {
     let tmp = TempDir::new().unwrap();
     let cfg = cfg_with_real_dirs(tmp.path(), "codex", &["john"], false, false);
     let (state, events) = state_and_events(&tmp).await;
-    let spawner =
-        CliSpawner::new().with_bin("codex", fixture_dir().join("codex_auth_expired.sh"));
+    let spawner = CliSpawner::new().with_bin("codex", fixture_dir().join("codex_auth_expired.sh"));
     let runner = AgentRunner::new(spawner, cfg, state.clone(), events);
 
     let resp = runner
@@ -182,7 +187,11 @@ async fn cli_success_sets_active_context() {
         .unwrap();
 
     assert_eq!(resp.final_kind, ResultKind::Success);
-    assert!(resp.stdout.contains("ok: happy path"), "stdout: {}", resp.stdout);
+    assert!(
+        resp.stdout.contains("ok: happy path"),
+        "stdout: {}",
+        resp.stdout
+    );
     let snap = state.snapshot().await;
     assert_eq!(snap.active_auth_context["claude"], "john");
 }
@@ -208,5 +217,64 @@ async fn cli_env_config_dir_passed_to_child() {
         "stdout should include profile dir {}: {}",
         profile_dir.display(),
         resp.stdout
+    );
+}
+
+#[tokio::test]
+async fn cli_jsonl_tail_upgrades_unknown_to_quota() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = cfg_with_real_dirs(tmp.path(), "claude", &["john"], false, false);
+    let profile_dir = cfg.context("claude", "john").unwrap().profile_dir.clone();
+    let repo_path = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    let mobile_uuid = "00000000-0000-4000-8000-000000000123";
+    let jsonl_dir = profile_dir
+        .join("projects")
+        .join(project_hash_for_repo(&repo_path));
+    std::fs::create_dir_all(&jsonl_dir).unwrap();
+    std::fs::write(
+        jsonl_dir.join(format!("{mobile_uuid}.jsonl")),
+        r#"{"role":"assistant","content":[{"type":"text","text":"Claude usage limit reached"}]}
+"#,
+    )
+    .unwrap();
+
+    let wrapper = tmp.path().join("claude_unknown.sh");
+    std::fs::write(
+        &wrapper,
+        r#"#!/usr/bin/env bash
+cat - >/dev/null
+exit 1
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (state, events) = state_and_events(&tmp).await;
+    let spawner = CliSpawner::new().with_bin("claude", wrapper);
+    let runner = AgentRunner::new(spawner, cfg, state, events);
+
+    let mut req = request("claude", repo_path, "jsonl quota");
+    req.mode = AgentRunMode::WithMobileContext {
+        mobile_uuid: mobile_uuid.to_string(),
+    };
+    let resp = runner.run(req).await.unwrap();
+
+    assert_eq!(resp.final_kind, ResultKind::QuotaExhausted);
+    assert_eq!(resp.attempts[0].kind, ResultKind::QuotaExhausted);
+    assert!(
+        resp.attempts[0]
+            .classifier
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("jsonl_tail:"),
+        "attempt: {:?}",
+        resp.attempts[0]
+    );
+    let log = std::fs::read_to_string(tmp.path().join("events.jsonl")).unwrap();
+    assert!(
+        log.contains(r#""classifier":"jsonl_tail:"#),
+        "events.jsonl: {log}"
     );
 }

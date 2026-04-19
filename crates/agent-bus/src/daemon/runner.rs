@@ -18,6 +18,7 @@ use agent_bus_core::auth_context::{AuthContext, AuthContextsConfig};
 use agent_bus_core::classifier::{
     default_classifier, Classification, ProviderClassifier, ResultKind, RunOutput,
 };
+use agent_bus_core::jsonl_scan;
 use agent_bus_core::state::{
     AuthContextStatus, AuthContextStatusKind, PendingRotation, PendingRotationStatus,
     StateHandle, StateSnapshot,
@@ -332,7 +333,13 @@ impl<S: AgentSpawner> AgentRunner<S> {
                 stderr: &outcome.stderr,
                 timed_out: outcome.timed_out,
             };
-            let class: Classification = classifier.classify(&out);
+            let mut class: Classification = classifier.classify(&out);
+            if class.kind == ResultKind::UnknownFailure {
+                if let Some((kind, matched)) = scan_claude_jsonl_tail(&req, ctx) {
+                    class.kind = kind;
+                    class.classifier = Some(matched);
+                }
+            }
             let kind = class.kind;
 
             attempts.push(AgentAttempt {
@@ -604,6 +611,30 @@ fn excerpt(s: &str) -> String {
 
 fn short_id(now: OffsetDateTime) -> String {
     format!("{}", now.unix_timestamp_nanos() % 1_000_000_000)
+}
+
+fn scan_claude_jsonl_tail(
+    req: &AgentRunRequest,
+    ctx: &AuthContext,
+) -> Option<(ResultKind, String)> {
+    if req.agent != "claude" {
+        return None;
+    }
+    let mobile_uuid = match &req.mode {
+        AgentRunMode::ClaudeResume { mobile_uuid }
+        | AgentRunMode::WithMobileContext { mobile_uuid } => mobile_uuid,
+        AgentRunMode::Fresh => return None,
+    };
+    let path = ctx
+        .profile_dir
+        .join("projects")
+        .join(project_hash_for_repo(&req.repo_path))
+        .join(format!("{mobile_uuid}.jsonl"));
+    jsonl_scan::scan_and_classify(&path)
+}
+
+fn project_hash_for_repo(repo_path: &std::path::Path) -> String {
+    repo_path.to_string_lossy().replace('/', "-")
 }
 
 #[cfg(test)]
