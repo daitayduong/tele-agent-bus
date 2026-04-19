@@ -24,6 +24,10 @@ use serde::Deserialize;
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::Dispatcher;
 use teloxide::types::Update;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use self::perm::{FsBlacklistLoader, MergedBlacklistLoader, PendingPermRegistry, PermService};
 use self::telegram::{RepoEntry, TelegramConfig, TeloxideBotClient};
@@ -83,6 +87,30 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     // `agents.<agent>.active` becomes the initial active context.
     if let Some(ref auth_cfg) = config.auth_contexts {
         for (agent, id) in &auth_cfg.active {
+
+        // Phase 4a.12: Token expiry detection on startup
+        for (agent_name, contexts) in &auth_cfg.agents {
+            for ctx in contexts {
+                let status = agent_bus_core::token_expiry::read_for_agent(agent_name, &ctx.profile_dir);
+                use agent_bus_core::token_expiry::ExpiryStatus;
+                use agent_bus_core::state::{AuthContextStatus, AuthContextStatusKind};
+                let kind = match status {
+                    ExpiryStatus::Expired { .. } => Some(AuthContextStatusKind::AuthExpired),
+                    ExpiryStatus::ExpiringSoon { .. } => Some(AuthContextStatusKind::AuthExpiringSoon),
+                    _ => None,
+                };
+                if let Some(k) = kind {
+                    let now = OffsetDateTime::now_utc();
+                    let st = AuthContextStatus {
+                        status: k,
+                        cooldown_until: None,
+                        last_event_id: None,
+                        updated_at: now.format(&Rfc3339).unwrap_or_default(),
+                    };
+                    state.set_auth_context_status(agent_name, &ctx.id, st).await.ok();
+                }
+            }
+        }
             state.set_active_auth_context(agent, id).await.ok();
         }
     }
