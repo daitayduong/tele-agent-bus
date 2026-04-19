@@ -8,6 +8,7 @@ pub mod mobile_transcript;
 pub mod perm;
 pub mod routing;
 pub mod runner;
+pub mod session_bridge;
 pub mod telegram;
 pub mod uds;
 

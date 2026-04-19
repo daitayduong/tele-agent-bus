@@ -1597,6 +1597,48 @@ mod mobile_tests {
     }
 
     #[tokio::test]
+    async fn list_codex_reports_not_implemented() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(&bot, &config, state, &None, 100, None, "@list_codex", None)
+            .await
+            .unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(
+            sent[0].text.contains("not implemented"),
+            "expected 'not implemented', got: {:?}",
+            sent[0].text
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_chat_reports_not_implemented() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(&bot, &config, state, &None, 100, None, "@codex hello", None)
+            .await
+            .unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(
+            sent[0].text.contains("not implemented"),
+            "expected 'not implemented', got: {:?}",
+            sent[0].text
+        );
+    }
+
+    #[tokio::test]
     async fn unauthorized_chat_is_ignored_for_mobile_commands() {
         let bot = MockBot::default();
         let config = test_config();
@@ -1809,5 +1851,33 @@ mod mobile_tests {
             .sent_messages()
             .iter()
             .any(|m| m.text.contains("resumed-ok")));
+    }
+
+    #[tokio::test]
+    async fn selecting_claude_writes_new_generic_state_ac_sb4() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json")).await.unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+        
+        // Current handle_callback_sel_claude will fail here (e.g. source file missing),
+        // but we want to verify that when it works, it writes the new state.
+        // For a RED test, we can just assert the state is written.
+        handle_callback_sel_claude(&bot, &config, state.clone(), 100, 
+            MessageRef { chat_id: 100, message_id: 42 }, 
+            "cb-1".to_string(), 
+            format!("sel_claude:{}", "00000000-0000-0000-0000-000000000002")
+        ).await.ok();
+        
+        let snap = state.snapshot().await;
+        assert!(
+            snap.bridged_sessions.contains_key("100"),
+            "bridged_sessions should contain chat 100"
+        );
+        assert!(
+            snap.bridged_sessions["100"].contains_key("claude"),
+            "bridged_sessions['100'] should contain 'claude'"
+        );
     }
 }
