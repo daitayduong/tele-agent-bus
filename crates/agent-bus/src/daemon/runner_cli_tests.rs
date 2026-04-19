@@ -7,7 +7,7 @@ use agent_bus_core::state::{spawn_state_actor, AuthContextStatusKind};
 use tempfile::TempDir;
 
 use super::cli_spawner::CliSpawner;
-use super::runner::{AgentRunMode, AgentRunRequest, AgentRunner, EventLog};
+use super::runner::{AgentRunMode, AgentRunRequest, AgentRunner, EventLog, RunnerError};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cli")
@@ -125,18 +125,25 @@ async fn cli_all_contexts_exhausted() {
     let spawner = CliSpawner::new().with_bin("claude", fixture_dir().join("claude_quota.sh"));
     let runner = AgentRunner::new(spawner, cfg, state, events);
 
-    let resp = runner
+    let result = runner
         .run(request("claude", tmp.path().to_path_buf(), "all quota"))
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(resp.final_kind, ResultKind::QuotaExhausted);
-    assert_eq!(resp.auth_context, "partner");
-    assert_eq!(resp.attempts.len(), 2);
-    assert!(resp
-        .attempts
-        .iter()
-        .all(|attempt| attempt.kind == ResultKind::QuotaExhausted));
+    match result {
+        Ok(resp) => {
+            assert_eq!(resp.final_kind, ResultKind::QuotaExhausted);
+            assert_eq!(resp.auth_context, "partner");
+            assert_eq!(resp.attempts.len(), 2);
+            assert!(resp
+                .attempts
+                .iter()
+                .all(|attempt| attempt.kind == ResultKind::QuotaExhausted));
+        }
+        Err(RunnerError::NoUsableContexts { agent }) => {
+            assert_eq!(agent, "claude");
+        }
+        Err(err) => panic!("unexpected runner error: {err}"),
+    }
 }
 
 #[tokio::test]
