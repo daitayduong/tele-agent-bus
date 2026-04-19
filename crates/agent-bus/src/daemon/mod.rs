@@ -1,3 +1,4 @@
+pub mod auth_cmds;
 pub mod claude_headless;
 pub mod cli_spawner;
 pub mod context_lock;
@@ -8,6 +9,9 @@ pub mod routing;
 pub mod runner;
 pub mod telegram;
 pub mod uds;
+
+#[cfg(test)]
+mod runner_cli_tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
