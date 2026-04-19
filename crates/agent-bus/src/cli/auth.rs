@@ -316,6 +316,16 @@ pub fn provider_env(agent: &str) -> Result<(&'static str, &'static str)> {
     }
 }
 
+/// Argv dispatched to the provider binary to start its login flow.
+/// Claude Code CLI uses `claude auth login`; Codex uses `codex login`.
+fn login_args(agent: &str) -> &'static [&'static str] {
+    match agent {
+        "claude" => &["auth", "login"],
+        "codex" => &["login"],
+        _ => &["login"],
+    }
+}
+
 fn resolve_profile_dir(
     home: &Path,
     bus: &Path,
@@ -356,16 +366,18 @@ fn login_inner(home: &Path, bus: &Path, agent: &str, id: &str) -> Result<()> {
 
     let bin_override = std::env::var(format!("AGENT_BUS_{}_BIN", agent.to_uppercase()))
         .unwrap_or_else(|_| bin.to_string());
+    let argv = login_args(agent);
 
     eprintln!(
-        "launching `{} login` with {}={}",
+        "launching `{} {}` with {}={}",
         bin_override,
+        argv.join(" "),
         env,
         dir.display()
     );
 
     let status = Command::new(&bin_override)
-        .arg("login")
+        .args(argv)
         .env(env, &dir)
         .status()
         .with_context(|| format!("spawning {}", bin_override))?;
@@ -641,5 +653,80 @@ mod tests {
             std::env::remove_var("AGENT_BUS_CLAUDE_BIN");
         }
         result.unwrap();
+    }
+
+    // ── login arg dispatch (phase4c bugfix) ──────────────────────────────
+
+    fn write_argv_capture_script(path: &Path, argv_file: &Path) {
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+                argv_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn login_spawns_auth_login_for_claude() {
+        // Claude Code CLI dispatches auth via `claude auth login`, not `claude login`.
+        let (_td, home, bus) = fake_env();
+        register_inner(&home, &bus, args("claude", "john")).unwrap();
+
+        let script = home.join("fake_claude.sh");
+        let argv = home.join("claude-argv.txt");
+        write_argv_capture_script(&script, &argv);
+
+        let prev = std::env::var("AGENT_BUS_CLAUDE_BIN").ok();
+        std::env::set_var("AGENT_BUS_CLAUDE_BIN", &script);
+        let result = login_inner(&home, &bus, "claude", "john");
+        if let Some(p) = prev {
+            std::env::set_var("AGENT_BUS_CLAUDE_BIN", p);
+        } else {
+            std::env::remove_var("AGENT_BUS_CLAUDE_BIN");
+        }
+        result.unwrap();
+
+        let captured = fs::read_to_string(&argv).unwrap();
+        let argv_lines: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            argv_lines,
+            vec!["auth", "login"],
+            "claude must be invoked as `claude auth login`, got: {:?}",
+            argv_lines
+        );
+    }
+
+    #[test]
+    fn login_spawns_login_for_codex() {
+        let (_td, home, bus) = fake_env();
+        register_inner(&home, &bus, args("codex", "john")).unwrap();
+
+        let script = home.join("fake_codex.sh");
+        let argv = home.join("codex-argv.txt");
+        write_argv_capture_script(&script, &argv);
+
+        let prev = std::env::var("AGENT_BUS_CODEX_BIN").ok();
+        std::env::set_var("AGENT_BUS_CODEX_BIN", &script);
+        let result = login_inner(&home, &bus, "codex", "john");
+        if let Some(p) = prev {
+            std::env::set_var("AGENT_BUS_CODEX_BIN", p);
+        } else {
+            std::env::remove_var("AGENT_BUS_CODEX_BIN");
+        }
+        result.unwrap();
+
+        let captured = fs::read_to_string(&argv).unwrap();
+        let argv_lines: Vec<&str> = captured.lines().collect();
+        assert_eq!(
+            argv_lines,
+            vec!["login"],
+            "codex must be invoked as `codex login`, got: {:?}",
+            argv_lines
+        );
     }
 }
