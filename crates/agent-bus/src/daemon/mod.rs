@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_bus_core::auth_context::AuthContextsConfig;
 use agent_bus_core::state::spawn_state_actor;
 use anyhow::Context;
 use serde::Deserialize;
@@ -33,6 +34,9 @@ pub struct DaemonConfig {
     pub home: PathBuf,
     pub bot_token: String,
     pub telegram: TelegramConfig,
+    /// Phase 4a: loaded from `$AGENT_BUS_HOME/auth-contexts.yaml`.
+    /// `None` means legacy mode — existing `@claude` mobile flow unchanged (AC-Q9 / AC-L8).
+    pub auth_contexts: Option<AuthContextsConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,11 +78,21 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let state = spawn_state_actor(config.home.join("state.json"))
         .await
         .context("failed to start state actor")?;
+
+    // Seed active_auth_context from config at startup (spec §4.1):
+    // `agents.<agent>.active` becomes the initial active context.
+    if let Some(ref auth_cfg) = config.auth_contexts {
+        for (agent, id) in &auth_cfg.active {
+            state.set_active_auth_context(agent, id).await.ok();
+        }
+    }
+
+    let auth_contexts = Arc::new(config.auth_contexts);
     let telegram_config = Arc::new(config.telegram);
     let bot = teloxide::Bot::new(config.bot_token);
     let registry = PendingPermRegistry::default();
     let bot_client: Arc<dyn telegram::BotClient> = Arc::new(TeloxideBotClient::new(bot.clone()));
-    
+
     let etc_dir = PathBuf::from("/etc/agent-bus");
     let global_loader = Arc::new(FsBlacklistLoader::new(
         etc_dir.join("blacklist.conf"),
@@ -114,7 +128,12 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         .branch(Update::filter_callback_query().endpoint(telegram::teloxide_callback_handler));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(teloxide::dptree::deps![telegram_config, state, registry])
+        .dependencies(teloxide::dptree::deps![
+            telegram_config,
+            state,
+            registry,
+            auth_contexts
+        ])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -146,15 +165,48 @@ pub fn load_daemon_config() -> anyhow::Result<DaemonConfig> {
         .map(|value| resolve_env_value(value))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let auth_contexts = load_auth_contexts(&home)?;
+
     Ok(DaemonConfig {
         timeout_seconds: config_file.permissions.timeout_seconds,
-        home,
+        home: home.clone(),
         bot_token,
         telegram: TelegramConfig {
             allowed_chats,
             repos: repos_file.repos,
         },
+        auth_contexts,
     })
+}
+
+/// Load `$AGENT_BUS_HOME/auth-contexts.yaml` if it exists. Missing file is
+/// NOT an error — the daemon falls back to legacy mode (AC-Q9 / AC-L8).
+/// Malformed file IS an error — fail-fast so the operator sees it.
+fn load_auth_contexts(home: &std::path::Path) -> anyhow::Result<Option<AuthContextsConfig>> {
+    let path = home.join("auth-contexts.yaml");
+    if !path.exists() {
+        tracing::info!(
+            path = %path.display(),
+            "auth-contexts.yaml not found; falling back to legacy mode"
+        );
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let home_for_paths = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.to_path_buf());
+    let cfg = AuthContextsConfig::parse(&text, &home_for_paths)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let claude_ctx = cfg.contexts_for("claude").len();
+    let codex_ctx = cfg.contexts_for("codex").len();
+    tracing::info!(
+        path = %path.display(),
+        claude_contexts = claude_ctx,
+        codex_contexts = codex_ctx,
+        "loaded auth-contexts.yaml"
+    );
+    Ok(Some(cfg))
 }
 
 fn agent_bus_home() -> anyhow::Result<PathBuf> {
@@ -558,5 +610,39 @@ repos:
 
     fn assert_daemon_config_home(config: &DaemonConfig, home: &Path) {
         assert_eq!(config.home, home);
+    }
+
+    #[test]
+    fn load_auth_contexts_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = super::load_auth_contexts(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_auth_contexts_present_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create profile dir so AuthContextsConfig path validation passes.
+        let home = dir.path();
+        std::fs::create_dir_all(home.join(".agent-bus/auth/claude/john")).unwrap();
+        std::fs::write(
+            home.join("auth-contexts.yaml"),
+            format!(
+                r#"
+version: 1
+agents:
+  claude:
+    contexts:
+      - id: john
+        profile_dir: {}/.agent-bus/auth/claude/john
+"#,
+                home.display()
+            ),
+        )
+        .unwrap();
+        std::env::set_var("HOME", home);
+        let cfg = super::load_auth_contexts(home).unwrap().unwrap();
+        assert_eq!(cfg.contexts_for("claude").len(), 1);
+        assert_eq!(cfg.contexts_for("claude")[0].id, "john");
     }
 }

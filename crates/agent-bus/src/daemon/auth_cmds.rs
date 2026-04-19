@@ -256,6 +256,8 @@ mod tests {
     fn test_cfg() -> AuthContextsConfig {
         let yaml = r#"
 version: 1
+defaults:
+  require_owner_approval: false
 agents:
   claude:
     contexts:

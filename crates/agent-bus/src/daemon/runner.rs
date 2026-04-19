@@ -351,6 +351,22 @@ impl<S: AgentSpawner> AgentRunner<S> {
                     self.state
                         .set_active_auth_context(&req.agent, &ctx.id)
                         .await?;
+                    // AC-Q8 / 4a.10: on successful rotation (idx > 0),
+                    // emit an auth_context_rotated event with from->to path.
+                    if idx > 0 {
+                        if let Some(prev) = attempts.get(idx - 1) {
+                            let _ = self.events.append(&serde_json::json!({
+                                "type": "auth_context_rotated",
+                                "agent": &req.agent,
+                                "from": &prev.auth_context,
+                                "to": &ctx.id,
+                                "repo_id": &req.repo_id,
+                                "request_id": &req.request_id,
+                                "trigger": format!("{:?}", prev.kind),
+                                "ts": finished_at.format(&Rfc3339).unwrap_or_default(),
+                            }));
+                        }
+                    }
                     return Ok(AgentRunResponse {
                         stdout: outcome.stdout,
                         stderr_excerpt: excerpt(&outcome.stderr),
@@ -758,6 +774,26 @@ agents:
         assert_eq!(resp.attempts[0].kind, ResultKind::QuotaExhausted);
         assert_eq!(resp.attempts[1].kind, ResultKind::Success);
         assert_eq!(spawner.calls(), vec!["john", "partner"]);
+    }
+
+    // ── AC-Q8 / 4a.10: rotation emits auth_context_rotated event ──────────
+
+    #[tokio::test]
+    async fn auto_rotate_emits_auth_context_rotated_event() {
+        let (dir, state) = fresh_state().await;
+        let home = PathBuf::from("/home/alice");
+        let cfg = cfg_two_claude_contexts(&home, true, false);
+        let spawner = FakeSpawner::new(vec![quota_out(), ok_out("ok")]);
+        let events = events_log(dir.path());
+        let runner = AgentRunner::new(spawner, cfg, state, events);
+
+        let resp = runner.run(req("claude")).await.unwrap();
+        assert_eq!(resp.final_kind, ResultKind::Success);
+
+        let log = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+        assert!(log.contains("auth_context_rotated"), "log: {log}");
+        assert!(log.contains(r#""from":"john""#), "log: {log}");
+        assert!(log.contains(r#""to":"partner""#), "log: {log}");
     }
 
     // ── AC-Q4: approval required ─────────────────────────────────────────
