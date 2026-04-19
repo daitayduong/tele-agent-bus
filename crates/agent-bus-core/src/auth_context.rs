@@ -5,7 +5,9 @@
 //! existence) are deferred to the CLI register/login path and `AgentRunner`.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -167,7 +169,7 @@ pub struct AuthContextsConfig {
     /// Persistent "active" context id per agent (from `agents.<agent>.active`).
     /// Consumed by AgentRunner at startup to seed `active_auth_context`.
     pub active: BTreeMap<String, String>,
-    pub lead: Lead,
+    pub lead: Option<LeadConfig>,
     pub mobile_context: MobileContextConfig,
 }
 
@@ -190,9 +192,17 @@ pub struct AuthContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Lead {
-    pub default_agent: String,
-    pub per_chat: BTreeMap<String, String>,
+pub struct LeadConfig {
+    pub default: AgentKind,
+    pub per_chat: BTreeMap<String, AgentKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    Claude,
+    Codex,
+    Gemini,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,11 +222,33 @@ impl Default for Defaults {
     }
 }
 
-impl Default for Lead {
-    fn default() -> Self {
-        Self {
-            default_agent: "claude".to_string(),
-            per_chat: BTreeMap::new(),
+impl AgentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
+impl fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AgentKind {
+    type Err = AuthConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "gemini" => Ok(Self::Gemini),
+            other => Err(AuthConfigError::BadLeadAgent {
+                agent: other.to_string(),
+            }),
         }
     }
 }
@@ -348,25 +380,7 @@ impl AuthContextsConfig {
             agents.insert(agent, contexts);
         }
 
-        let lead = match raw.lead {
-            Some(l) => {
-                if !SUPPORTED_AGENTS.contains(&l.default.as_str()) {
-                    return Err(AuthConfigError::BadLeadAgent { agent: l.default });
-                }
-                for agent in l.per_chat.values() {
-                    if !SUPPORTED_AGENTS.contains(&agent.as_str()) {
-                        return Err(AuthConfigError::BadLeadAgent {
-                            agent: agent.clone(),
-                        });
-                    }
-                }
-                Lead {
-                    default_agent: l.default,
-                    per_chat: l.per_chat,
-                }
-            }
-            None => Lead::default(),
-        };
+        let lead = raw.lead.map(parse_lead).transpose()?;
 
         let mobile_context = raw
             .mobile_context
@@ -388,30 +402,68 @@ impl AuthContextsConfig {
     }
 
     pub fn contexts_for(&self, agent: &str) -> &[AuthContext] {
-        self.agents
-            .get(agent)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.agents.get(agent).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     pub fn context(&self, agent: &str, id: &str) -> Option<&AuthContext> {
         self.contexts_for(agent).iter().find(|c| c.id == id)
     }
 
-    pub fn resolve_lead(&self, chat_id: Option<&str>) -> (String, LeadSource) {
+    pub fn resolve_lead(&self, chat_id: Option<&str>) -> (AgentKind, LeadSource) {
+        let Some(lead) = &self.lead else {
+            return (AgentKind::Claude, LeadSource::Legacy);
+        };
         if let Some(cid) = chat_id {
-            if let Some(agent) = self.lead.per_chat.get(cid) {
-                return (agent.clone(), LeadSource::PerChat);
+            if let Some(agent) = lead.per_chat.get(cid) {
+                return (*agent, LeadSource::PerChat);
             }
         }
-        (self.lead.default_agent.clone(), LeadSource::Default)
+        (lead.default, LeadSource::Default)
+    }
+
+    pub fn resolve_agent_for_text(
+        &self,
+        text: &str,
+        chat_id: Option<&str>,
+    ) -> (AgentKind, LeadSource) {
+        if let Some(agent) = explicit_agent_prefix(text) {
+            return (agent, LeadSource::Explicit);
+        }
+        self.resolve_lead(chat_id)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeadSource {
+    Explicit,
     PerChat,
     Default,
+    OverridePerChat,
+    OverrideDefault,
+    Legacy,
+}
+
+fn parse_lead(raw: RawLead) -> Result<LeadConfig, AuthConfigError> {
+    let default = AgentKind::from_str(&raw.default)?;
+    let mut per_chat = BTreeMap::new();
+    for (chat_id, agent) in raw.per_chat {
+        per_chat.insert(chat_id, AgentKind::from_str(&agent)?);
+    }
+    Ok(LeadConfig { default, per_chat })
+}
+
+pub fn explicit_agent_prefix(text: &str) -> Option<AgentKind> {
+    let trimmed = text.trim_start();
+    let after_at = trimmed.strip_prefix('@')?;
+    let target = after_at
+        .split_once(char::is_whitespace)
+        .map(|(target, _)| target)
+        .unwrap_or(after_at);
+    let agent = target
+        .split_once(':')
+        .map(|(agent, _)| agent)
+        .unwrap_or(target);
+    AgentKind::from_str(agent).ok()
 }
 
 fn expand_tilde(path_str: &str, home_dir: &Path) -> PathBuf {
@@ -589,30 +641,87 @@ agents:
     }
 
     #[test]
-    fn lead_defaults_to_claude_when_missing() {
+    fn lead_block_missing_is_none() {
         let cfg = AuthContextsConfig::parse(MINIMAL, &home()).unwrap();
-        assert_eq!(cfg.lead.default_agent, "claude");
-        assert!(cfg.lead.per_chat.is_empty());
+        assert_eq!(cfg.lead, None);
     }
 
     #[test]
-    fn lead_per_chat_resolves() {
+    fn parses_valid_lead_block_with_default_and_per_chat() {
         let y = r#"
 version: 1
 agents: {}
 lead:
-  default: claude
+  default: codex
   per_chat:
-    "123": codex
+    "123": gemini
     "456": gemini
 "#;
         let cfg = AuthContextsConfig::parse(y, &home()).unwrap();
-        assert_eq!(cfg.resolve_lead(Some("123")).0, "codex");
-        assert_eq!(cfg.resolve_lead(Some("456")).0, "gemini");
-        assert_eq!(cfg.resolve_lead(Some("999")).0, "claude");
-        assert_eq!(cfg.resolve_lead(None).0, "claude");
-        assert_eq!(cfg.resolve_lead(Some("123")).1, LeadSource::PerChat);
-        assert_eq!(cfg.resolve_lead(None).1, LeadSource::Default);
+        let lead = cfg.lead.as_ref().expect("lead block parsed");
+        assert_eq!(lead.default, AgentKind::Codex);
+        assert_eq!(lead.per_chat.get("123"), Some(&AgentKind::Gemini));
+        assert_eq!(lead.per_chat.get("456"), Some(&AgentKind::Gemini));
+    }
+
+    #[test]
+    fn resolve_explicit_prefix_wins_over_lead_config() {
+        let y = r#"
+version: 1
+agents: {}
+lead:
+  default: codex
+  per_chat:
+    "123": claude
+"#;
+        let cfg = AuthContextsConfig::parse(y, &home()).unwrap();
+        assert_eq!(
+            cfg.resolve_agent_for_text("@gemini hello", Some("123")),
+            (AgentKind::Gemini, LeadSource::Explicit)
+        );
+    }
+
+    #[test]
+    fn resolve_per_chat_match_returns_per_chat_agent() {
+        let y = r#"
+version: 1
+agents: {}
+lead:
+  default: codex
+  per_chat:
+    "123": gemini
+"#;
+        let cfg = AuthContextsConfig::parse(y, &home()).unwrap();
+        assert_eq!(
+            cfg.resolve_agent_for_text("hello", Some("123")),
+            (AgentKind::Gemini, LeadSource::PerChat)
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default_without_per_chat_match() {
+        let y = r#"
+version: 1
+agents: {}
+lead:
+  default: codex
+  per_chat:
+    "123": gemini
+"#;
+        let cfg = AuthContextsConfig::parse(y, &home()).unwrap();
+        assert_eq!(
+            cfg.resolve_agent_for_text("hello", Some("456")),
+            (AgentKind::Codex, LeadSource::Default)
+        );
+    }
+
+    #[test]
+    fn resolve_missing_lead_config_returns_legacy_claude() {
+        let cfg = AuthContextsConfig::parse(MINIMAL, &home()).unwrap();
+        assert_eq!(
+            cfg.resolve_agent_for_text("hello", Some("123")),
+            (AgentKind::Claude, LeadSource::Legacy)
+        );
     }
 
     #[test]
@@ -694,11 +803,9 @@ mobile_context:
 
     #[test]
     fn load_missing_file_is_io_error() {
-        let err = AuthContextsConfig::load(
-            Path::new("/nonexistent/path/auth-contexts.yaml"),
-            &home(),
-        )
-        .unwrap_err();
+        let err =
+            AuthContextsConfig::load(Path::new("/nonexistent/path/auth-contexts.yaml"), &home())
+                .unwrap_err();
         assert!(matches!(err, AuthConfigError::Io { .. }));
     }
 

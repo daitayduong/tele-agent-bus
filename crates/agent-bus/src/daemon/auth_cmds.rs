@@ -1,10 +1,122 @@
-use agent_bus_core::auth_context::AuthContextsConfig;
+use crate::daemon::telegram::{BotClient, InlineKeyboard, MessageRef, TelegramError};
+use agent_bus_core::auth_context::{AgentKind, AuthContextsConfig, LeadSource};
 use agent_bus_core::state::{
     AuthContextStatusKind, PendingRotation, PendingRotationStatus, StateHandle,
 };
 use agent_bus_core::token_expiry::{self, ExpiryStatus};
-use crate::daemon::telegram::{BotClient, InlineKeyboard, MessageRef, TelegramError};
+use std::str::FromStr;
 use time::OffsetDateTime;
+
+pub async fn handle_lead_command<B: BotClient + ?Sized>(
+    bot: &B,
+    state: StateHandle,
+    cfg: &AuthContextsConfig,
+    chat_id: i64,
+    agent: Option<&str>,
+) -> Result<(), TelegramError> {
+    if let Some(agent) = agent {
+        let Some(agent) = parse_agent_for_command(agent, bot, chat_id).await? else {
+            return Ok(());
+        };
+        state
+            .set_lead_for_chat(chat_id.to_string(), agent.to_string())
+            .await?;
+        bot.send_message(chat_id, format!("Lead for this chat set to {agent}"), None)
+            .await?;
+        return Ok(());
+    }
+
+    let (agent, source) = resolve_effective_lead(state, cfg, chat_id).await;
+    bot.send_message(
+        chat_id,
+        format!("Lead: {agent}\nsource: {}", format_lead_source(source)),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn handle_lead_default_command<B: BotClient + ?Sized>(
+    bot: &B,
+    state: StateHandle,
+    chat_id: i64,
+    agent: &str,
+) -> Result<(), TelegramError> {
+    let Some(agent) = parse_agent_for_command(agent, bot, chat_id).await? else {
+        return Ok(());
+    };
+    state.set_lead_default(agent.to_string()).await?;
+    bot.send_message(chat_id, format!("Default lead set to {agent}"), None)
+        .await?;
+    Ok(())
+}
+
+pub async fn handle_lead_clear_command<B: BotClient + ?Sized>(
+    bot: &B,
+    state: StateHandle,
+    chat_id: i64,
+) -> Result<(), TelegramError> {
+    state.clear_lead_for_chat(chat_id.to_string()).await?;
+    bot.send_message(
+        chat_id,
+        "Lead override cleared for this chat".to_string(),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn resolve_effective_lead(
+    state: StateHandle,
+    cfg: &AuthContextsConfig,
+    chat_id: i64,
+) -> (AgentKind, LeadSource) {
+    let snapshot = state.snapshot().await;
+    if let Some(agent) = snapshot
+        .lead_overrides
+        .per_chat
+        .get(&chat_id.to_string())
+        .and_then(|agent| AgentKind::from_str(agent).ok())
+    {
+        return (agent, LeadSource::OverridePerChat);
+    }
+    if let Some(agent) = snapshot
+        .lead_overrides
+        .default
+        .as_deref()
+        .and_then(|agent| AgentKind::from_str(agent).ok())
+    {
+        return (agent, LeadSource::OverrideDefault);
+    }
+    cfg.resolve_lead(Some(&chat_id.to_string()))
+}
+
+async fn parse_agent_for_command<B: BotClient + ?Sized>(
+    agent: &str,
+    bot: &B,
+    chat_id: i64,
+) -> Result<Option<AgentKind>, TelegramError> {
+    match AgentKind::from_str(agent) {
+        Ok(agent) => Ok(Some(agent)),
+        Err(_) => {
+            bot.send_message(
+                chat_id,
+                "Usage: agent must be one of claude, codex, gemini".to_string(),
+                None,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+fn format_lead_source(source: LeadSource) -> &'static str {
+    match source {
+        LeadSource::Explicit => "explicit",
+        LeadSource::PerChat | LeadSource::OverridePerChat => "per_chat",
+        LeadSource::Default | LeadSource::OverrideDefault | LeadSource::Legacy => "default",
+    }
+}
 
 /// 4a.5: handle /quota <agent>
 pub async fn handle_quota_command<B: BotClient + ?Sized>(
@@ -80,14 +192,17 @@ pub async fn handle_auth_list_command<B: BotClient + ?Sized>(
     let snapshot = state.snapshot().await;
     let now = OffsetDateTime::now_utc();
 
-    let mut text = "AGENT   ID       STATUS               AUTO   APPROVAL   EXPIRES      LABEL".to_string();
+    let mut text =
+        "AGENT   ID       STATUS               AUTO   APPROVAL   EXPIRES      LABEL".to_string();
     for (agent, contexts) in &cfg.agents {
         for ctx in contexts {
-            let status_kind = snapshot.auth_context_status.get(agent)
+            let status_kind = snapshot
+                .auth_context_status
+                .get(agent)
                 .and_then(|m| m.get(&ctx.id))
                 .map(|st| st.status)
                 .unwrap_or(AuthContextStatusKind::Available);
-            
+
             let status_str = match status_kind {
                 AuthContextStatusKind::Available => "available",
                 AuthContextStatusKind::QuotaExhausted => "quota_exhausted",
@@ -99,14 +214,22 @@ pub async fn handle_auth_list_command<B: BotClient + ?Sized>(
                 AuthContextStatusKind::UnknownFailure => "failed",
             };
 
-            let auto = if ctx.auto_rotate || cfg.defaults.auto_rotate { "yes" } else { "no " };
-            let approval = if ctx.require_owner_approval { "yes" } else { "no " };
-            
+            let auto = if ctx.auto_rotate || cfg.defaults.auto_rotate {
+                "yes"
+            } else {
+                "no "
+            };
+            let approval = if ctx.require_owner_approval {
+                "yes"
+            } else {
+                "no "
+            };
+
             let expiry_status = token_expiry::read_for_agent(agent, &ctx.profile_dir);
             let expires_str = format_expiry(expiry_status, now);
-            
+
             let label = ctx.label.as_deref().unwrap_or("");
-            
+
             text.push('\n');
             text.push_str(&format!(
                 "{:<7} {:<8} {:<20} {:<6} {:<10} {:<12} {}",
@@ -125,7 +248,7 @@ pub async fn handle_auth_list_command<B: BotClient + ?Sized>(
     } else {
         bot.send_message(chat_id, text, None).await?;
     }
-    
+
     Ok(())
 }
 
@@ -138,7 +261,11 @@ fn format_expiry(status: ExpiryStatus, now: OffsetDateTime) -> String {
             } else if diff.whole_hours() >= 72 {
                 format!("in {} days", diff.whole_days())
             } else if diff.whole_hours() >= 1 {
-                format!("in {}h {}m", diff.whole_hours(), (diff.whole_minutes() % 60).abs())
+                format!(
+                    "in {}h {}m",
+                    diff.whole_hours(),
+                    (diff.whole_minutes() % 60).abs()
+                )
             } else {
                 format!("in {}m", diff.whole_minutes().abs())
             }
@@ -210,7 +337,10 @@ pub async fn handle_auth_rotate_command<B: BotClient + ?Sized>(
         );
         let keyboard = InlineKeyboard {
             rows: vec![vec![
-                ("Approve".to_string(), format!("rot:approve:{}", rotation_id)),
+                (
+                    "Approve".to_string(),
+                    format!("rot:approve:{}", rotation_id),
+                ),
                 ("Deny".to_string(), format!("rot:deny:{}", rotation_id)),
             ]],
         };
@@ -241,9 +371,10 @@ pub async fn handle_callback_rotation<B: BotClient + ?Sized>(
         .ok_or_else(|| TelegramError::InvalidCallback(callback_data.clone()))?;
 
     let snapshot = state.snapshot().await;
-    let rotation = snapshot.pending_rotations.get(rot_id).ok_or_else(|| {
-        TelegramError::InvalidCallback(format!("unknown rotation {}", rot_id))
-    })?;
+    let rotation = snapshot
+        .pending_rotations
+        .get(rot_id)
+        .ok_or_else(|| TelegramError::InvalidCallback(format!("unknown rotation {}", rot_id)))?;
 
     if rotation.status != PendingRotationStatus::Pending {
         bot.answer_callback(callback_id, "Rotation already resolved".to_string())
@@ -391,7 +522,9 @@ agents:
         let json = format!(r#"{{"claudeAiOauth": {{"expiresAt": {}}}}}"#, expires_at_ms);
         std::fs::write(john_dir.join(".credentials.json"), json).unwrap();
 
-        handle_auth_list_command(&bot, state, &cfg, 100).await.unwrap();
+        handle_auth_list_command(&bot, state, &cfg, 100)
+            .await
+            .unwrap();
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
@@ -400,7 +533,7 @@ agents:
         assert!(text.contains("claude"));
         assert!(text.contains("john"));
         // Using "in 4" to match either "in 42 days" or "in 41 days" if there's rounding
-        assert!(text.contains("in 4")); 
+        assert!(text.contains("in 4"));
         assert!(text.contains("Claude Pro - John"));
     }
 
@@ -413,7 +546,9 @@ agents:
             .unwrap();
         let cfg = test_cfg(dir.path());
 
-        handle_auth_list_command(&bot, state, &cfg, 100).await.unwrap();
+        handle_auth_list_command(&bot, state, &cfg, 100)
+            .await
+            .unwrap();
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
@@ -435,21 +570,30 @@ agents:
             .await
             .unwrap();
         let snap = state.snapshot().await;
-        assert_eq!(snap.active_auth_context.get("codex").map(|s| s.as_str()), Some("main"));
+        assert_eq!(
+            snap.active_auth_context.get("codex").map(|s| s.as_str()),
+            Some("main")
+        );
 
         // Rotate claude: none -> john (no approval req for john)
         handle_auth_rotate_command(&bot, state.clone(), &cfg, 100, "claude")
             .await
             .unwrap();
         let snap = state.snapshot().await;
-        assert_eq!(snap.active_auth_context.get("claude").map(|s| s.as_str()), Some("john"));
+        assert_eq!(
+            snap.active_auth_context.get("claude").map(|s| s.as_str()),
+            Some("john")
+        );
 
         // Rotate claude: john -> partner (approval required)
         handle_auth_rotate_command(&bot, state.clone(), &cfg, 100, "claude")
             .await
             .unwrap();
         let snap = state.snapshot().await;
-        assert_eq!(snap.active_auth_context.get("claude").map(|s| s.as_str()), Some("john")); // Still john
+        assert_eq!(
+            snap.active_auth_context.get("claude").map(|s| s.as_str()),
+            Some("john")
+        ); // Still john
         assert_eq!(snap.pending_rotations.len(), 1);
         let rot = snap.pending_rotations.values().next().unwrap();
         assert_eq!(rot.to, "partner");
@@ -494,8 +638,45 @@ agents:
             snap.pending_rotations["rot123"].status,
             PendingRotationStatus::Approved
         );
-        assert_eq!(snap.active_auth_context.get("claude").map(|s| s.as_str()), Some("partner"));
+        assert_eq!(
+            snap.active_auth_context.get("claude").map(|s| s.as_str()),
+            Some("partner")
+        );
         assert_eq!(bot.edited_messages().len(), 1);
         assert!(bot.edited_messages()[0].text.contains("Approved"));
+    }
+
+    #[tokio::test]
+    async fn lead_commands_mutate_state_and_report_source() {
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        let cfg = test_cfg(dir.path());
+
+        handle_lead_default_command(&bot, state.clone(), 100, "codex")
+            .await
+            .unwrap();
+        assert_eq!(state.resolve_lead("456").await, Some(AgentKind::Codex));
+
+        handle_lead_command(&bot, state.clone(), &cfg, 123, Some("gemini"))
+            .await
+            .unwrap();
+        assert_eq!(state.resolve_lead("123").await, Some(AgentKind::Gemini));
+        assert_eq!(state.resolve_lead("456").await, Some(AgentKind::Codex));
+
+        handle_lead_clear_command(&bot, state.clone(), 123)
+            .await
+            .unwrap();
+        assert_eq!(state.resolve_lead("123").await, Some(AgentKind::Codex));
+
+        handle_lead_command(&bot, state, &cfg, 123, None)
+            .await
+            .unwrap();
+        let sent = bot.sent_messages();
+        assert!(sent
+            .iter()
+            .any(|m| { m.text.contains("Lead: codex") && m.text.contains("source: default") }));
     }
 }

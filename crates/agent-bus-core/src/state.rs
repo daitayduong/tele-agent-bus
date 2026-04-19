@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::auth_context::AgentKind;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -46,6 +48,16 @@ pub struct StateSnapshot {
     pub active_auth_context: BTreeMap<String, String>,
     #[serde(default)]
     pub pending_rotations: BTreeMap<String, PendingRotation>,
+    #[serde(default)]
+    pub lead_overrides: LeadOverrides,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LeadOverrides {
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub per_chat: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +156,7 @@ impl Default for StateSnapshot {
             auth_context_status: BTreeMap::new(),
             active_auth_context: BTreeMap::new(),
             pending_rotations: BTreeMap::new(),
+            lead_overrides: LeadOverrides::default(),
         }
     }
 }
@@ -204,6 +217,19 @@ enum StateCmd {
     ResolvePendingRotation {
         id: String,
         status: PendingRotationStatus,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetLeadDefault {
+        agent: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetLeadForChat {
+        chat_id: String,
+        agent: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ClearLeadForChat {
+        chat_id: String,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
 }
@@ -361,6 +387,63 @@ impl StateHandle {
             .map_err(|_| StateError::ActorClosed)?;
         rx.await.map_err(|_| StateError::ActorClosed)?
     }
+
+    pub async fn set_lead_default(&self, agent: impl Into<String>) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetLeadDefault {
+                agent: agent.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_lead_for_chat(
+        &self,
+        chat_id: impl Into<String>,
+        agent: impl Into<String>,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetLeadForChat {
+                chat_id: chat_id.into(),
+                agent: agent.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn clear_lead_for_chat(&self, chat_id: impl Into<String>) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ClearLeadForChat {
+                chat_id: chat_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn resolve_lead(&self, chat_id: impl AsRef<str>) -> Option<AgentKind> {
+        let snapshot = self.snapshot.read().await;
+        snapshot
+            .lead_overrides
+            .per_chat
+            .get(chat_id.as_ref())
+            .and_then(|agent| AgentKind::from_str(agent).ok())
+            .or_else(|| {
+                snapshot
+                    .lead_overrides
+                    .default
+                    .as_deref()
+                    .and_then(|agent| AgentKind::from_str(agent).ok())
+            })
+    }
 }
 
 pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError> {
@@ -445,6 +528,25 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                     if let Some(rot) = state.pending_rotations.get_mut(&id) {
                         rot.status = status;
                     }
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetLeadDefault { agent, reply } => {
+                    state.lead_overrides.default = Some(agent);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetLeadForChat {
+                    chat_id,
+                    agent,
+                    reply,
+                } => {
+                    state.lead_overrides.per_chat.insert(chat_id, agent);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::ClearLeadForChat { chat_id, reply } => {
+                    state.lead_overrides.per_chat.remove(&chat_id);
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
@@ -693,6 +795,29 @@ mod tests {
 
         let snap = handle.snapshot().await;
         assert_eq!(snap.active_auth_context.get("claude").unwrap(), "partner");
+    }
+
+    #[tokio::test]
+    async fn lead_overrides_persist_and_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        handle.set_lead_default("codex").await.unwrap();
+        assert_eq!(handle.resolve_lead("456").await, Some(AgentKind::Codex));
+
+        handle.set_lead_for_chat("123", "gemini").await.unwrap();
+        assert_eq!(handle.resolve_lead("123").await, Some(AgentKind::Gemini));
+        assert_eq!(handle.resolve_lead("456").await, Some(AgentKind::Codex));
+
+        handle.clear_lead_for_chat("123").await.unwrap();
+        assert_eq!(handle.resolve_lead("123").await, Some(AgentKind::Codex));
+
+        drop(handle);
+        let reloaded: StateSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(reloaded.lead_overrides.default.as_deref(), Some("codex"));
+        assert!(!reloaded.lead_overrides.per_chat.contains_key("123"));
     }
 
     #[tokio::test]

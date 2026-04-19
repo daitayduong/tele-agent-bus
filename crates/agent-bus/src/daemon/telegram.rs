@@ -2,20 +2,18 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 #[cfg(test)]
 use std::sync::Mutex;
+use std::time::Duration;
 
+use crate::daemon::auth_cmds;
 use crate::daemon::claude_headless;
 use crate::daemon::mobile_session::{
     self, MobileCommand, SessionInfo, ARCHIVE_RETENTION, MOBILE_UUID,
 };
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
-use crate::daemon::auth_cmds;
-use crate::daemon::runner::{
-    AgentRunMode, AgentRunRequest, RunnerError, SharedAgentRunner,
-};
-use agent_bus_core::auth_context::AuthContextsConfig;
+use crate::daemon::runner::{AgentRunMode, AgentRunRequest, RunnerError, SharedAgentRunner};
+use agent_bus_core::auth_context::{AgentKind, AuthContextsConfig, LeadSource};
 use agent_bus_core::state::{MobileSessionState, PendingPermStatus, StateHandle};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
@@ -231,7 +229,9 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
     chat_id: i64,
     username: Option<&str>,
     text: &str,
-    agent_runner: Option<&Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>>,
+    agent_runner: Option<
+        &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    >,
 ) -> Result<(), TelegramError> {
     if let Some(cmd) = mobile_session::parse_mobile_command(text) {
         return handle_mobile_command(bot, config, state, chat_id, cmd, agent_runner).await;
@@ -259,36 +259,283 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
             if let Some(cfg) = auth_contexts {
                 auth_cmds::handle_auth_list_command(bot, state, cfg, chat_id).await
             } else {
-                bot.send_message(chat_id, "Auth contexts not configured (legacy mode)".to_string(), None).await?;
+                bot.send_message(
+                    chat_id,
+                    "Auth contexts not configured (legacy mode)".to_string(),
+                    None,
+                )
+                .await?;
                 Ok(())
             }
         }
         Some("/quota") => {
             let Some(agent) = parts.next() else {
-                bot.send_message(chat_id, "Usage: /quota <agent>".to_string(), None).await?;
+                bot.send_message(chat_id, "Usage: /quota <agent>".to_string(), None)
+                    .await?;
                 return Ok(());
             };
             if let Some(cfg) = auth_contexts {
                 auth_cmds::handle_quota_command(bot, state, cfg, chat_id, agent).await
             } else {
-                bot.send_message(chat_id, "Auth contexts not configured (legacy mode)".to_string(), None).await?;
+                bot.send_message(
+                    chat_id,
+                    "Auth contexts not configured (legacy mode)".to_string(),
+                    None,
+                )
+                .await?;
                 Ok(())
             }
         }
         Some("/auth_rotate") => {
             let Some(agent) = parts.next() else {
-                bot.send_message(chat_id, "Usage: /auth_rotate <agent>".to_string(), None).await?;
+                bot.send_message(chat_id, "Usage: /auth_rotate <agent>".to_string(), None)
+                    .await?;
                 return Ok(());
             };
             if let Some(cfg) = auth_contexts {
                 auth_cmds::handle_auth_rotate_command(bot, state, cfg, chat_id, agent).await
             } else {
-                bot.send_message(chat_id, "Auth contexts not configured (legacy mode)".to_string(), None).await?;
+                bot.send_message(
+                    chat_id,
+                    "Auth contexts not configured (legacy mode)".to_string(),
+                    None,
+                )
+                .await?;
                 Ok(())
             }
         }
-        _ => Ok(()),
+        Some("/lead") => {
+            if !is_allowed(config, chat_id) {
+                return Ok(());
+            }
+            if let Some(cfg) = auth_contexts {
+                auth_cmds::handle_lead_command(bot, state, cfg, chat_id, parts.next()).await
+            } else {
+                handle_legacy_lead_command(bot, state, chat_id, parts.next()).await
+            }
+        }
+        Some("/lead_default") => {
+            if !is_allowed(config, chat_id) {
+                return Ok(());
+            }
+            let Some(agent) = parts.next() else {
+                bot.send_message(chat_id, "Usage: /lead_default <agent>".to_string(), None)
+                    .await?;
+                return Ok(());
+            };
+            auth_cmds::handle_lead_default_command(bot, state, chat_id, agent).await
+        }
+        Some("/lead_clear") => {
+            if !is_allowed(config, chat_id) {
+                return Ok(());
+            }
+            auth_cmds::handle_lead_clear_command(bot, state, chat_id).await
+        }
+        Some(cmd) if cmd.starts_with('/') => Ok(()),
+        _ => {
+            handle_unaddressed_lead_message(
+                bot,
+                config,
+                state,
+                auth_contexts,
+                chat_id,
+                text,
+                agent_runner,
+            )
+            .await
+        }
     }
+}
+
+async fn handle_legacy_lead_command<B: BotClient + ?Sized>(
+    bot: &B,
+    state: StateHandle,
+    chat_id: i64,
+    agent: Option<&str>,
+) -> Result<(), TelegramError> {
+    if let Some(agent) = agent {
+        if !matches!(agent, "claude" | "codex" | "gemini") {
+            bot.send_message(
+                chat_id,
+                "Usage: agent must be one of claude, codex, gemini".to_string(),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+        state.set_lead_for_chat(chat_id.to_string(), agent).await?;
+        bot.send_message(chat_id, format!("Lead for this chat set to {agent}"), None)
+            .await?;
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let (agent, source) = snapshot
+        .lead_overrides
+        .per_chat
+        .get(&chat_id.to_string())
+        .map(|agent| (agent.as_str(), "per_chat"))
+        .or_else(|| {
+            snapshot
+                .lead_overrides
+                .default
+                .as_deref()
+                .map(|agent| (agent, "default"))
+        })
+        .unwrap_or(("claude", "default"));
+    bot.send_message(chat_id, format!("Lead: {agent}\nsource: {source}"), None)
+        .await?;
+    Ok(())
+}
+
+async fn handle_unaddressed_lead_message<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    auth_contexts: &Option<AuthContextsConfig>,
+    chat_id: i64,
+    text: &str,
+    agent_runner: Option<
+        &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    >,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let (agent, source) = resolve_lead_for_chat(state.clone(), auth_contexts, chat_id).await;
+    tracing::info!(
+        target: "agent_bus::lead",
+        chat_id = %chat_id,
+        source = ?source,
+        agent = %agent,
+        "lead_resolved"
+    );
+
+    let snapshot = state.snapshot().await;
+    let mobile = snapshot.mobile_sessions.get(&chat_id.to_string()).cloned();
+    if agent == AgentKind::Claude && mobile.is_some() {
+        return handle_claude_mobile_msg(
+            bot,
+            config,
+            state,
+            chat_id,
+            text.trim().to_string(),
+            agent_runner,
+        )
+        .await;
+    }
+
+    let Some(runner) = agent_runner else {
+        bot.send_message(
+            chat_id,
+            "Auth contexts not configured (legacy mode)".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let repo_id = mobile.as_ref().map(|m| m.repo_id.as_str()).or_else(|| {
+        snapshot
+            .default_repo_by_chat
+            .get(&chat_id.to_string())
+            .map(String::as_str)
+    });
+    let Some(repo_id) = repo_id else {
+        bot.send_message(
+            chat_id,
+            "No default repo for this chat. Use /switch_rp <id> first.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.to_string()));
+    };
+
+    if !repo.agents.iter().any(|allowed| allowed == agent.as_str()) {
+        bot.send_message(
+            chat_id,
+            format!("Agent {} is not enabled for repo {}", agent, repo.id),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let timeout_secs = claude_headless::resolved_timeout_secs();
+    bot.send_message(
+        chat_id,
+        format!("⏳ thinking... (timeout {}s)", timeout_secs),
+        None,
+    )
+    .await
+    .ok();
+
+    let mode = match mobile {
+        Some(mobile) => AgentRunMode::WithMobileContext {
+            mobile_uuid: mobile.mobile_uuid,
+        },
+        None => AgentRunMode::Fresh,
+    };
+    let reply = run_agent_via_runner(
+        runner,
+        agent,
+        &repo.id,
+        PathBuf::from(&repo.path),
+        text.trim().to_string(),
+        mode,
+        Duration::from_secs(timeout_secs),
+        chat_id,
+    )
+    .await;
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(msg) => {
+            bot.send_message(chat_id, msg, None).await?;
+            return Ok(());
+        }
+    };
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        bot.send_message(chat_id, format!("(empty reply from {agent})"), None)
+            .await?;
+        return Ok(());
+    }
+    for chunk in claude_headless::chunk_for_telegram(trimmed, 4000) {
+        bot.send_message(chat_id, chunk, None).await?;
+    }
+    Ok(())
+}
+
+async fn resolve_lead_for_chat(
+    state: StateHandle,
+    auth_contexts: &Option<AuthContextsConfig>,
+    chat_id: i64,
+) -> (AgentKind, LeadSource) {
+    let snapshot = state.snapshot().await;
+    if let Some(agent) = snapshot
+        .lead_overrides
+        .per_chat
+        .get(&chat_id.to_string())
+        .and_then(|agent| agent.parse::<AgentKind>().ok())
+    {
+        return (agent, LeadSource::OverridePerChat);
+    }
+    if let Some(agent) = snapshot
+        .lead_overrides
+        .default
+        .as_deref()
+        .and_then(|agent| agent.parse::<AgentKind>().ok())
+    {
+        return (agent, LeadSource::OverrideDefault);
+    }
+    auth_contexts
+        .as_ref()
+        .map(|cfg| cfg.resolve_lead(Some(&chat_id.to_string())))
+        .unwrap_or((AgentKind::Claude, LeadSource::Legacy))
 }
 
 async fn handle_mobile_command<B: BotClient + ?Sized>(
@@ -297,7 +544,9 @@ async fn handle_mobile_command<B: BotClient + ?Sized>(
     state: StateHandle,
     chat_id: i64,
     cmd: MobileCommand,
-    agent_runner: Option<&Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>>,
+    agent_runner: Option<
+        &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    >,
 ) -> Result<(), TelegramError> {
     if !is_allowed(config, chat_id) {
         return Ok(());
@@ -538,7 +787,9 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
     state: StateHandle,
     chat_id: i64,
     body: String,
-    agent_runner: Option<&Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>>,
+    agent_runner: Option<
+        &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    >,
 ) -> Result<(), TelegramError> {
     if !is_allowed(config, chat_id) {
         return Ok(());
@@ -674,6 +925,66 @@ async fn run_claude_via_runner(
             "⏸ Rotation to {agent}/{id} needs owner approval. Use /auth_approve {request_id} or /auth_deny {request_id}."
         )),
         Err(err) => Err(format!("❌ claude failed: {err}")),
+    }
+}
+
+async fn run_agent_via_runner(
+    runner: &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    agent: AgentKind,
+    repo_id: &str,
+    repo_path: PathBuf,
+    prompt: String,
+    mode: AgentRunMode,
+    timeout: Duration,
+    chat_id: i64,
+) -> Result<String, String> {
+    let request_id = format!(
+        "req_{}",
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    let req = AgentRunRequest {
+        agent: agent.to_string(),
+        repo_id: repo_id.to_string(),
+        repo_path,
+        prompt,
+        mode,
+        preferred_context: None,
+        timeout,
+        request_id,
+        chat_id: Some(chat_id),
+    };
+    match runner.run(req).await {
+        Ok(resp) => match resp.final_kind {
+            agent_bus_core::classifier::ResultKind::Success => Ok(resp.stdout),
+            agent_bus_core::classifier::ResultKind::QuotaExhausted => Err(format!(
+                "⚠️ {agent}/{} is out of quota. All usable contexts exhausted. Run /quota {agent} for details.",
+                resp.auth_context
+            )),
+            agent_bus_core::classifier::ResultKind::RateLimited => Err(format!(
+                "⚠️ {agent}/{} is rate-limited. Retry shortly or rotate with /auth_use {agent} <id>.",
+                resp.auth_context
+            )),
+            agent_bus_core::classifier::ResultKind::AuthExpired
+            | agent_bus_core::classifier::ResultKind::ManualReauthRequired => Err(format!(
+                "🔒 {agent}/{} needs re-auth. Run /reauth {agent} {} on the host machine.",
+                resp.auth_context, resp.auth_context
+            )),
+            _ => Err(format!(
+                "❌ {agent} failed ({:?}): {}",
+                resp.final_kind, resp.stderr_excerpt
+            )),
+        },
+        Err(RunnerError::NoUsableContexts { agent }) => Err(format!(
+            "All {agent} auth contexts are unavailable. Run /quota {agent} for details."
+        )),
+        Err(RunnerError::ApprovalPending {
+            agent,
+            id,
+            request_id,
+        }) => Err(format!(
+            "⏸ Rotation to {agent}/{id} needs owner approval. Use /auth_approve {request_id} or /auth_deny {request_id}."
+        )),
+        Err(err) => Err(format!("❌ {agent} failed: {err}")),
     }
 }
 
@@ -942,7 +1253,10 @@ impl MockBot {
     }
 
     pub fn answered_callbacks(&self) -> Vec<String> {
-        self.callbacks.lock().expect("mock bot lock poisoned").clone()
+        self.callbacks
+            .lock()
+            .expect("mock bot lock poisoned")
+            .clone()
     }
 }
 
@@ -1264,9 +1578,18 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(&bot, &config, state, &None, 100, None, "@flush_mobile", None)
-            .await
-            .unwrap();
+        handle_text_command(
+            &bot,
+            &config,
+            state,
+            &None,
+            100,
+            None,
+            "@flush_mobile",
+            None,
+        )
+        .await
+        .unwrap();
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
@@ -1378,9 +1701,16 @@ mod mobile_tests {
         let events = EventLog::new(dir.path().join("events.jsonl"));
         let runner = Arc::new(AgentRunner::new(spawner, cfg, state.clone(), events));
 
-        handle_claude_mobile_msg(&bot, &config, state, 100, "do it".to_string(), Some(&runner))
-            .await
-            .unwrap();
+        handle_claude_mobile_msg(
+            &bot,
+            &config,
+            state,
+            100,
+            "do it".to_string(),
+            Some(&runner),
+        )
+        .await
+        .unwrap();
 
         let sent = bot.sent_messages();
         // thinking... message, then runner's "unavailable" error mapped by run_claude_via_runner.
@@ -1392,5 +1722,92 @@ mod mobile_tests {
             "expected runner-path error message, got: {:?}",
             sent.iter().map(|m| &m.text).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn unaddressed_message_with_claude_lead_and_mobile_session_uses_resume() {
+        use crate::daemon::cli_spawner::CliSpawner;
+        use crate::daemon::runner::{AgentRunner, EventLog};
+        use agent_bus_core::auth_context::AuthContextsConfig;
+        use agent_bus_core::state::MobileSessionState;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let args_file = dir.path().join("claude-args.txt");
+        let fake_claude = dir.path().join("fake-claude.sh");
+        std::fs::write(
+            &fake_claude,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > {}\necho resumed-ok\n",
+                args_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = TelegramConfig {
+            allowed_chats: vec!["100".to_string()],
+            repos: vec![RepoEntry {
+                id: "rallyup".to_string(),
+                display: "RallyUp".to_string(),
+                path: repo_path.display().to_string(),
+                agents: vec!["claude".to_string()],
+            }],
+        };
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+        state
+            .set_mobile_session(
+                "100",
+                MobileSessionState {
+                    repo_id: "rallyup".to_string(),
+                    mobile_uuid: "mobile-uuid-123".to_string(),
+                    mobile_fork_source: String::new(),
+                    mobile_forked_at: String::new(),
+                    project_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let profile_dir = dir.path().join(".agent-bus/auth/claude/john");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let yaml = format!(
+            "version: 1\nlead:\n  default: claude\nagents:\n  claude:\n    contexts:\n      - id: john\n        profile_dir: {}\n",
+            profile_dir.display()
+        );
+        let cfg = AuthContextsConfig::parse(&yaml, dir.path()).unwrap();
+        let runner = Arc::new(AgentRunner::new(
+            CliSpawner::new().with_bin("claude", fake_claude),
+            cfg.clone(),
+            state.clone(),
+            EventLog::new(dir.path().join("events.jsonl")),
+        ));
+
+        handle_text_command(
+            &bot,
+            &config,
+            state,
+            &Some(cfg),
+            100,
+            None,
+            "hello lead",
+            Some(&runner),
+        )
+        .await
+        .unwrap();
+
+        let args = std::fs::read_to_string(args_file).unwrap();
+        assert!(args.contains("--resume mobile-uuid-123"), "args: {args}");
+        assert!(bot
+            .sent_messages()
+            .iter()
+            .any(|m| m.text.contains("resumed-ok")));
     }
 }
