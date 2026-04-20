@@ -101,15 +101,13 @@ pub fn detect_codex_sessions(
         if normalize_path_text(&session.cwd) != repo_path {
             continue;
         }
-        if session.updated_secs == 0 {
-            session.updated_secs = path
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-        }
+        session.updated_secs = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(session.updated_secs);
         sessions.push(session);
     }
     sessions.sort_by(|a, b| {
@@ -187,7 +185,6 @@ fn read_codex_session_meta(path: &Path) -> anyhow::Result<Option<CodexSessionInf
 }
 
 fn infer_codex_title(text: &str) -> Option<String> {
-    let mut title = None;
     for line in text.lines().take(80) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -215,11 +212,11 @@ fn infer_codex_title(text: &str) -> Option<String> {
                 .and_then(Value::as_str)
                 .and_then(extract_codex_title_candidate)
             {
-                title = Some(candidate);
+                return Some(candidate);
             }
         }
     }
-    title
+    None
 }
 
 fn extract_codex_title_candidate(text: &str) -> Option<String> {
