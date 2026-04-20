@@ -3,6 +3,7 @@ use agent_bus_core::state::{BridgedSessionState, StateHandle};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +11,14 @@ pub enum BridgeCommand {
     List(AgentKind),
     Chat(AgentKind, String),
     Flush(AgentKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSessionInfo {
+    pub id: String,
+    pub path: PathBuf,
+    pub cwd: String,
+    pub updated_secs: u64,
 }
 
 pub fn parse_bridge_command(text: &str) -> Option<BridgeCommand> {
@@ -67,6 +76,112 @@ pub fn parse_callback_data(data: &str) -> Option<(AgentKind, String)> {
         return Some((AgentKind::Codex, id.to_string()));
     }
     None
+}
+
+pub fn detect_codex_sessions(
+    codex_home: &Path,
+    repo_path: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<CodexSessionInfo>> {
+    let root = codex_home.join("sessions");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let repo_path = normalize_path_text(repo_path);
+    let mut files = Vec::new();
+    collect_codex_rollouts(&root, &mut files)?;
+
+    let mut sessions = Vec::new();
+    for path in files {
+        let Some(mut session) = read_codex_session_meta(&path)? else {
+            continue;
+        };
+        if normalize_path_text(&session.cwd) != repo_path {
+            continue;
+        }
+        if session.updated_secs == 0 {
+            session.updated_secs = path
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+        }
+        sessions.push(session);
+    }
+    sessions.sort_by(|a, b| {
+        b.updated_secs
+            .cmp(&a.updated_secs)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    sessions.truncate(limit);
+    Ok(sessions)
+}
+
+fn collect_codex_rollouts(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_codex_rollouts(&path, out)?;
+        } else if file_type.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_codex_session_meta(path: &Path) -> anyhow::Result<Option<CodexSessionInfo>> {
+    let text = std::fs::read_to_string(path)?;
+    for line in text.lines().take(20) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(id) = payload.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(cwd) = payload.get("cwd").and_then(Value::as_str) else {
+            continue;
+        };
+        let updated_secs = payload
+            .get("timestamp")
+            .or_else(|| value.get("timestamp"))
+            .and_then(Value::as_str)
+            .and_then(|ts| {
+                time::OffsetDateTime::parse(
+                    ts,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .ok()
+            })
+            .map(|ts| ts.unix_timestamp().max(0) as u64)
+            .unwrap_or(0);
+        return Ok(Some(CodexSessionInfo {
+            id: id.to_string(),
+            path: path.to_path_buf(),
+            cwd: cwd.to_string(),
+            updated_secs,
+        }));
+    }
+    Ok(None)
+}
+
+fn normalize_path_text(path: &str) -> String {
+    path.trim_end_matches('/').to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +300,14 @@ pub fn sync_bridged_session(bridge: &mut BridgedSessionState) -> anyhow::Result<
     let agent = AgentKind::from_str(&bridge.agent)?;
     let desktop_path = std::path::Path::new(&bridge.desktop_path);
     let mobile_path = std::path::Path::new(&bridge.mobile_path);
+    if desktop_path == mobile_path {
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc().unix_timestamp().to_string());
+        bridge.sync.last_synced_at = Some(now);
+        bridge.sync.last_error = None;
+        return Ok(BridgeSyncStats::default());
+    }
     let desktop_to_mobile = sync_cycle(
         agent,
         SyncDirection::DesktopToMobile,
@@ -513,6 +636,39 @@ mod tests {
         assert!(good.sync.last_synced_at.is_some());
         assert_eq!(good.sync.last_error, None);
         assert!(bad.sync.last_error.is_some());
+    }
+
+    #[test]
+    fn test_detect_codex_sessions_filters_by_repo_and_sorts_recent_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("codex");
+        let sessions_dir = codex_home.join("sessions/2026/04/19");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let older = sessions_dir.join("rollout-old.jsonl");
+        let newer = sessions_dir.join("rollout-new.jsonl");
+        let other_repo = sessions_dir.join("rollout-other.jsonl");
+        std::fs::write(
+            &older,
+            r#"{"type":"session_meta","payload":{"id":"old","cwd":"/repo","timestamp":"2026-04-19T10:00:00Z"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &newer,
+            r#"{"type":"session_meta","payload":{"id":"new","cwd":"/repo/","timestamp":"2026-04-19T11:00:00Z"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &other_repo,
+            r#"{"type":"session_meta","payload":{"id":"other","cwd":"/elsewhere"}}"#,
+        )
+        .unwrap();
+
+        let sessions = detect_codex_sessions(&codex_home, "/repo", 10).unwrap();
+
+        assert_eq!(
+            sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["new", "old"]
+        );
     }
 
     #[test]
