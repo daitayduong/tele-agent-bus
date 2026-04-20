@@ -1224,9 +1224,10 @@ pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
         .await?;
 
     let short = session.id.get(..8).unwrap_or(&session.id);
+    let label = session.title.as_deref().unwrap_or(short);
     bot.edit_message_text(
         message,
-        format!("Codex session {short} selected. Mobile context replaced; send @codex <msg> to continue."),
+        format!("{label} selected. Mobile context replaced; send @codex <msg> to continue."),
     )
     .await?;
     bot.answer_callback(callback_id, "Selected".to_string())
