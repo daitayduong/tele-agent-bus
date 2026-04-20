@@ -28,6 +28,8 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(test)]
 static CODEX_HOME_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+const CODEX_MOBILE_SESSION_ID: &str = "agent-bus-mobile-codex";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramConfig {
     pub allowed_chats: Vec<String>,
@@ -908,6 +910,46 @@ fn codex_home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".codex"))
 }
 
+fn codex_mobile_session_path(codex_home: &Path, repo_path: &str) -> PathBuf {
+    codex_home
+        .join("agent-bus")
+        .join("mobile")
+        .join(project_hash_for_repo(repo_path))
+        .join(format!("{CODEX_MOBILE_SESSION_ID}.jsonl"))
+}
+
+fn fork_codex_session_to_mobile(source_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = target_path.with_extension(format!("jsonl.tmp.{}", std::process::id()));
+    let text = std::fs::read_to_string(source_path)?;
+    let mut rendered = String::new();
+    for line in text.lines() {
+        let rewritten = rewrite_codex_mobile_line(line);
+        rendered.push_str(&rewritten);
+        rendered.push('\n');
+    }
+    std::fs::write(&tmp_path, rendered)?;
+    std::fs::rename(tmp_path, target_path)?;
+    Ok(())
+}
+
+fn rewrite_codex_mobile_line(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        if obj.contains_key("sessionId") {
+            obj.insert(
+                "sessionId".to_string(),
+                serde_json::json!(CODEX_MOBILE_SESSION_ID),
+            );
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
+}
+
 pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
@@ -1125,18 +1167,47 @@ pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
     let selected_at = now
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| now.unix_timestamp().to_string());
-    let offset = session.path.metadata().map(|m| m.len()).unwrap_or(0);
+    let codex_home = codex_home_dir();
+    let target_path = codex_mobile_session_path(&codex_home, &repo.path);
+    let archive_dir = agents_archive_dir(&repo.path);
+    if let Err(err) = std::fs::create_dir_all(&archive_dir) {
+        bot.answer_callback(
+            callback_id,
+            short_err("archive dir error", &err.to_string()),
+        )
+        .await?;
+        return Ok(());
+    }
+    if target_path.exists() {
+        let archive_target = archive_dir.join(format!("codex-mobile-{}.jsonl", timestamp_tag()));
+        if let Err(err) = std::fs::rename(&target_path, &archive_target) {
+            bot.answer_callback(
+                callback_id,
+                short_err("archive rename failed", &err.to_string()),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+    if let Err(err) = fork_codex_session_to_mobile(&session.path, &target_path) {
+        bot.answer_callback(callback_id, short_err("fork failed", &err.to_string()))
+            .await?;
+        return Ok(());
+    }
+
+    let desktop_offset = session.path.metadata().map(|m| m.len()).unwrap_or(0);
+    let mobile_offset = target_path.metadata().map(|m| m.len()).unwrap_or(0);
     let bridge = BridgedSessionState {
         agent: AgentKind::Codex.to_string(),
         repo_id: repo.id.clone(),
         desktop_session_id: session.id.clone(),
         desktop_path: session.path.display().to_string(),
-        mobile_session_id: session.id.clone(),
-        mobile_path: session.path.display().to_string(),
+        mobile_session_id: CODEX_MOBILE_SESSION_ID.to_string(),
+        mobile_path: target_path.display().to_string(),
         selected_at,
         sync: SessionSyncCursor {
-            desktop_offset: offset,
-            mobile_offset: offset,
+            desktop_offset,
+            mobile_offset,
             last_synced_at: None,
             last_error: None,
         },
@@ -1148,7 +1219,7 @@ pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
     let short = session.id.get(..8).unwrap_or(&session.id);
     bot.edit_message_text(
         message,
-        format!("Codex session {short} selected. @codex resume execution is not wired yet."),
+        format!("Codex session {short} selected. Mobile context replaced; send @codex <msg> to continue."),
     )
     .await?;
     bot.answer_callback(callback_id, "Selected".to_string())
@@ -2119,9 +2190,91 @@ mod mobile_tests {
         assert_eq!(bridge.agent, "codex");
         assert_eq!(bridge.desktop_session_id, "codex-session-2");
         assert_eq!(bridge.desktop_path, session_path.display().to_string());
-        assert_eq!(bridge.mobile_path, session_path.display().to_string());
+        assert_ne!(bridge.mobile_path, session_path.display().to_string());
+        assert_eq!(bridge.mobile_session_id, CODEX_MOBILE_SESSION_ID);
+        assert!(bridge.mobile_path.ends_with(&format!(
+            "agent-bus/mobile/{}/{}.jsonl",
+            project_hash_for_repo(&repo.display().to_string()),
+            CODEX_MOBILE_SESSION_ID
+        )));
         assert_eq!(bot.answered_callbacks(), vec!["cb1".to_string()]);
         assert!(bot.edited_messages()[0].text.contains("Codex session"));
+    }
+
+    #[tokio::test]
+    async fn selecting_codex_replaces_fixed_mobile_transcript_and_archives_old_one() {
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let codex_home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&repo).unwrap();
+        write_codex_session(&codex_home, "codex-session-old", &repo);
+        let new_session_path = write_codex_session(&codex_home, "codex-session-new", &repo);
+        *CODEX_HOME_OVERRIDE.lock().unwrap() = Some(codex_home.clone());
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+
+        let mobile_path = codex_mobile_session_path(&codex_home, &repo.display().to_string());
+        std::fs::create_dir_all(mobile_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mobile_path,
+            r#"{"sessionId":"agent-bus-mobile-codex","text":"old mobile data"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &new_session_path,
+            format!(
+                "{}\n{}",
+                std::fs::read_to_string(&new_session_path).unwrap(),
+                r#"{"sessionId":"codex-session-new","text":"new desktop data"}"#
+            ),
+        )
+        .unwrap();
+
+        handle_callback_sel_codex(
+            &bot,
+            &config,
+            state.clone(),
+            100,
+            MessageRef {
+                chat_id: 100,
+                message_id: 1,
+            },
+            "cb1".to_string(),
+            "sel_codex:codex-session-new".to_string(),
+        )
+        .await
+        .unwrap();
+        *CODEX_HOME_OVERRIDE.lock().unwrap() = None;
+
+        let snapshot = state.snapshot().await;
+        let bridge = &snapshot.bridged_sessions["100"]["codex"];
+        assert_eq!(bridge.desktop_session_id, "codex-session-new");
+        assert_eq!(bridge.desktop_path, new_session_path.display().to_string());
+        assert_eq!(bridge.mobile_session_id, CODEX_MOBILE_SESSION_ID);
+        assert_eq!(bridge.mobile_path, mobile_path.display().to_string());
+
+        let mobile_content = std::fs::read_to_string(&mobile_path).unwrap();
+        assert!(mobile_content.contains("new desktop data"));
+        assert!(mobile_content.contains(CODEX_MOBILE_SESSION_ID));
+        assert!(!mobile_content.contains("old mobile data"));
+
+        let archive_dir = agents_archive_dir(&repo.display().to_string());
+        let archived = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("codex-mobile-"))
+            })
+            .expect("old mobile transcript archived");
+        let archived_content = std::fs::read_to_string(archived).unwrap();
+        assert!(archived_content.contains("old mobile data"));
     }
 
     #[tokio::test]
