@@ -1,7 +1,9 @@
 use agent_bus_core::auth_context::AgentKind;
+use agent_bus_core::state::{BridgedSessionState, StateHandle};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeCommand {
@@ -73,7 +75,36 @@ pub enum SyncDirection {
     MobileToDesktop,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncStats {
+    pub copied: usize,
+    pub skipped: usize,
+    pub errors: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BridgeSyncStats {
+    pub desktop_to_mobile: SyncStats,
+    pub mobile_to_desktop: SyncStats,
+}
+
+impl BridgeSyncStats {
+    pub fn copied(self) -> usize {
+        self.desktop_to_mobile.copied + self.mobile_to_desktop.copied
+    }
+
+    pub fn skipped(self) -> usize {
+        self.desktop_to_mobile.skipped + self.mobile_to_desktop.skipped
+    }
+
+    pub fn errors(self) -> usize {
+        self.desktop_to_mobile.errors + self.mobile_to_desktop.errors
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BridgePollStats {
+    pub sessions: usize,
     pub copied: usize,
     pub skipped: usize,
     pub errors: usize,
@@ -148,6 +179,97 @@ pub fn sync_cycle(
 
     *source_offset += complete_len as u64;
     Ok(stats)
+}
+
+pub fn sync_bridged_session(bridge: &mut BridgedSessionState) -> anyhow::Result<BridgeSyncStats> {
+    let agent = AgentKind::from_str(&bridge.agent)?;
+    let desktop_path = std::path::Path::new(&bridge.desktop_path);
+    let mobile_path = std::path::Path::new(&bridge.mobile_path);
+    let desktop_to_mobile = sync_cycle(
+        agent,
+        SyncDirection::DesktopToMobile,
+        desktop_path,
+        mobile_path,
+        &mut bridge.sync.desktop_offset,
+        &bridge.mobile_session_id,
+    )?;
+    let mobile_to_desktop = sync_cycle(
+        agent,
+        SyncDirection::MobileToDesktop,
+        mobile_path,
+        desktop_path,
+        &mut bridge.sync.mobile_offset,
+        &bridge.desktop_session_id,
+    )?;
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc().unix_timestamp().to_string());
+    bridge.sync.last_synced_at = Some(now);
+    bridge.sync.last_error = None;
+    Ok(BridgeSyncStats {
+        desktop_to_mobile,
+        mobile_to_desktop,
+    })
+}
+
+pub async fn sync_all_bridged_sessions_once(state: StateHandle) -> BridgePollStats {
+    let snapshot = state.snapshot().await;
+    let mut poll = BridgePollStats::default();
+
+    for (chat_id, by_agent) in snapshot.bridged_sessions {
+        for (agent, mut bridge) in by_agent {
+            poll.sessions += 1;
+            match sync_bridged_session(&mut bridge) {
+                Ok(stats) => {
+                    poll.copied += stats.copied();
+                    poll.skipped += stats.skipped();
+                    poll.errors += stats.errors();
+                }
+                Err(err) => {
+                    poll.errors += 1;
+                    bridge.sync.last_error = Some(err.to_string());
+                }
+            }
+            if let Err(err) = state
+                .set_bridged_session(chat_id.clone(), agent.clone(), bridge)
+                .await
+            {
+                tracing::warn!(
+                    target: "agent_bus::session_bridge",
+                    chat_id = %chat_id,
+                    agent = %agent,
+                    error = %err,
+                    "failed to persist bridge sync state"
+                );
+                poll.errors += 1;
+            }
+        }
+    }
+
+    poll
+}
+
+pub fn spawn_session_bridge_sync(
+    state: StateHandle,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let stats = sync_all_bridged_sessions_once(state.clone()).await;
+            if stats.sessions > 0 {
+                tracing::debug!(
+                    target: "agent_bus::session_bridge",
+                    sessions = stats.sessions,
+                    copied = stats.copied,
+                    skipped = stats.skipped,
+                    errors = stats.errors,
+                    "session bridge sync tick complete"
+                );
+            }
+        }
+    })
 }
 
 fn should_skip_synced_line(value: &Value, direction: SyncDirection) -> bool {
@@ -280,6 +402,117 @@ mod tests {
 
         assert_eq!(stats.copied, 0);
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_sync_mobile_to_desktop_advances_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let desktop = dir.path().join("desktop.jsonl");
+        let mobile = dir.path().join("mobile.jsonl");
+
+        let mut f = std::fs::File::create(&mobile).unwrap();
+        writeln!(f, r#"{{"sessionId":"mobile-id","text":"hello desktop"}}"#).unwrap();
+
+        let mut offset = 0;
+        let stats = sync_cycle(
+            AgentKind::Claude,
+            SyncDirection::MobileToDesktop,
+            &mobile,
+            &desktop,
+            &mut offset,
+            "desktop-id",
+        )
+        .unwrap();
+
+        assert_eq!(stats.copied, 1);
+        assert!(offset > 0);
+
+        let desktop_content = std::fs::read_to_string(&desktop).unwrap();
+        assert!(desktop_content.contains(r#""sessionId":"desktop-id""#));
+        assert!(desktop_content.contains(r#""from":"mobile""#));
+        assert!(desktop_content.contains(r#""sourceSessionId":"mobile-id""#));
+    }
+
+    #[tokio::test]
+    async fn test_sync_all_bridged_sessions_once_persists_offsets_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = agent_bus_core::state::spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        let good_desktop = dir.path().join("good-desktop.jsonl");
+        let good_mobile = dir.path().join("good-mobile.jsonl");
+        {
+            let mut f = std::fs::File::create(&good_desktop).unwrap();
+            writeln!(f, r#"{{"sessionId":"desk","text":"from desktop"}}"#).unwrap();
+        }
+        std::fs::File::create(&good_mobile).unwrap();
+
+        state
+            .set_bridged_session(
+                "chat-good",
+                AgentKind::Claude.to_string(),
+                BridgedSessionState {
+                    agent: AgentKind::Claude.to_string(),
+                    repo_id: "repo".to_string(),
+                    desktop_session_id: "desk".to_string(),
+                    desktop_path: good_desktop.display().to_string(),
+                    mobile_session_id: "mob".to_string(),
+                    mobile_path: good_mobile.display().to_string(),
+                    selected_at: "2026-04-19T00:00:00Z".to_string(),
+                    sync: agent_bus_core::state::SessionSyncCursor {
+                        desktop_offset: 0,
+                        mobile_offset: 0,
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .set_bridged_session(
+                "chat-bad",
+                AgentKind::Claude.to_string(),
+                BridgedSessionState {
+                    agent: AgentKind::Claude.to_string(),
+                    repo_id: "repo".to_string(),
+                    desktop_session_id: "missing-desk".to_string(),
+                    desktop_path: dir
+                        .path()
+                        .join("missing-desktop.jsonl")
+                        .display()
+                        .to_string(),
+                    mobile_session_id: "missing-mob".to_string(),
+                    mobile_path: dir
+                        .path()
+                        .join("missing-mobile.jsonl")
+                        .display()
+                        .to_string(),
+                    selected_at: "2026-04-19T00:00:00Z".to_string(),
+                    sync: agent_bus_core::state::SessionSyncCursor {
+                        desktop_offset: 0,
+                        mobile_offset: 0,
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        let stats = sync_all_bridged_sessions_once(state.clone()).await;
+
+        assert_eq!(stats.sessions, 2);
+        assert_eq!(stats.copied, 1);
+        assert_eq!(stats.errors, 1);
+        let snapshot = state.snapshot().await;
+        let good = &snapshot.bridged_sessions["chat-good"]["claude"];
+        let bad = &snapshot.bridged_sessions["chat-bad"]["claude"];
+        assert!(good.sync.desktop_offset > 0);
+        assert!(good.sync.last_synced_at.is_some());
+        assert_eq!(good.sync.last_error, None);
+        assert!(bad.sync.last_error.is_some());
     }
 
     #[test]

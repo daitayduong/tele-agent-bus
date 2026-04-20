@@ -159,6 +159,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     );
     let uds_server = uds::UdsServer::new(config.home.join("daemon.sock"), state.clone(), perm);
     let uds_task = tokio::spawn(uds::run_uds_server(uds_server));
+    let bridge_sync_task =
+        session_bridge::spawn_session_bridge_sync(state.clone(), Duration::from_secs(30));
 
     let handler = teloxide::dptree::entry()
         .branch(Update::filter_message().endpoint(telegram::teloxide_message_handler))
@@ -178,6 +180,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         .await;
 
     uds_task.abort();
+    bridge_sync_task.abort();
     Ok(())
 }
 

@@ -13,7 +13,7 @@ use crate::daemon::mobile_session::{
 };
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
 use crate::daemon::runner::{AgentRunMode, AgentRunRequest, RunnerError, SharedAgentRunner};
-use crate::daemon::session_bridge::{self, BridgeCommand};
+use crate::daemon::session_bridge::{self, BridgeCommand, BridgeSyncStats};
 use agent_bus_core::auth_context::{AgentKind, AuthContextsConfig, LeadSource};
 use agent_bus_core::state::{
     BridgedSessionState, MobileSessionState, PendingPermStatus, SessionSyncCursor, StateHandle,
@@ -564,13 +564,7 @@ async fn handle_mobile_command<B: BotClient + ?Sized>(
             handle_claude_mobile_msg(bot, config, state, chat_id, body, agent_runner).await
         }
         MobileCommand::FlushMobile => {
-            bot.send_message(
-                chat_id,
-                "@flush_mobile — not implemented yet (Phase 3.5).".to_string(),
-                None,
-            )
-            .await?;
-            Ok(())
+            flush_bridge_session(bot, state, chat_id, AgentKind::Claude).await
         }
     }
 }
@@ -596,13 +590,7 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
             handle_claude_mobile_msg(bot, config, state, chat_id, body, agent_runner).await
         }
         BridgeCommand::Flush(AgentKind::Claude) => {
-            bot.send_message(
-                chat_id,
-                "@flush_claude — not implemented yet (Phase 5b).".to_string(),
-                None,
-            )
-            .await?;
-            Ok(())
+            flush_bridge_session(bot, state, chat_id, AgentKind::Claude).await
         }
         BridgeCommand::List(agent) | BridgeCommand::Flush(agent) => {
             bot.send_message(
@@ -623,6 +611,70 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
             Ok(())
         }
     }
+}
+
+async fn flush_bridge_session<B: BotClient + ?Sized>(
+    bot: &B,
+    state: StateHandle,
+    chat_id: i64,
+    agent: AgentKind,
+) -> Result<(), TelegramError> {
+    let chat_key = chat_id.to_string();
+    let agent_key = agent.to_string();
+    let snapshot = state.snapshot().await;
+    let Some(mut bridge) = snapshot
+        .bridged_sessions
+        .get(&chat_key)
+        .and_then(|by_agent| by_agent.get(&agent_key))
+        .cloned()
+    else {
+        bot.send_message(
+            chat_id,
+            format!("No {agent} session selected. Send @list_{agent} first."),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let result = session_bridge::sync_bridged_session(&mut bridge);
+    match result {
+        Ok(stats) => {
+            state
+                .set_bridged_session(chat_key, agent_key, bridge)
+                .await?;
+            bot.send_message(chat_id, format_bridge_sync_stats(agent, stats), None)
+                .await?;
+            Ok(())
+        }
+        Err(err) => {
+            bridge.sync.last_error = Some(err.to_string());
+            state
+                .set_bridged_session(chat_key, agent_key, bridge)
+                .await?;
+            bot.send_message(chat_id, format!("@flush_{agent} failed: {err}"), None)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+fn format_bridge_sync_stats(agent: AgentKind, stats: BridgeSyncStats) -> String {
+    format!(
+        "@flush_{agent} synced\n\
+desktop -> mobile: copied {}, skipped {}, errors {}\n\
+mobile -> desktop: copied {}, skipped {}, errors {}\n\
+total: copied {}, skipped {}, errors {}",
+        stats.desktop_to_mobile.copied,
+        stats.desktop_to_mobile.skipped,
+        stats.desktop_to_mobile.errors,
+        stats.mobile_to_desktop.copied,
+        stats.mobile_to_desktop.skipped,
+        stats.mobile_to_desktop.errors,
+        stats.copied(),
+        stats.skipped(),
+        stats.errors()
+    )
 }
 
 pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
@@ -1583,6 +1635,7 @@ fn to_teloxide_error(err: TelegramError) -> teloxide::RequestError {
 mod mobile_tests {
     use super::*;
     use agent_bus_core::state::spawn_state_actor;
+    use std::io::Write;
     use tempfile::tempdir;
 
     fn test_config() -> TelegramConfig {
@@ -1627,7 +1680,7 @@ mod mobile_tests {
         handle_text_command(
             &bot,
             &config,
-            state,
+            state.clone(),
             &None,
             100,
             None,
@@ -1647,22 +1700,54 @@ mod mobile_tests {
     }
 
     #[tokio::test]
-    async fn flush_mobile_reports_not_implemented() {
+    async fn flush_claude_syncs_both_directions_and_updates_state() {
         let bot = MockBot::default();
         let config = test_config();
         let dir = tempdir().unwrap();
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
+        let desktop = dir.path().join("desktop.jsonl");
+        let mobile = dir.path().join("mobile.jsonl");
+        {
+            let mut f = std::fs::File::create(&desktop).unwrap();
+            writeln!(f, r#"{{"sessionId":"desktop-id","text":"from desktop"}}"#).unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&mobile).unwrap();
+            writeln!(f, r#"{{"sessionId":"mobile-id","text":"from mobile"}}"#).unwrap();
+        }
+        state
+            .set_bridged_session(
+                "100",
+                AgentKind::Claude.to_string(),
+                BridgedSessionState {
+                    agent: AgentKind::Claude.to_string(),
+                    repo_id: "rallyup".to_string(),
+                    desktop_session_id: "desktop-id".to_string(),
+                    desktop_path: desktop.display().to_string(),
+                    mobile_session_id: "mobile-id".to_string(),
+                    mobile_path: mobile.display().to_string(),
+                    selected_at: "2026-04-19T00:00:00Z".to_string(),
+                    sync: SessionSyncCursor {
+                        desktop_offset: 0,
+                        mobile_offset: 0,
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
 
         handle_text_command(
             &bot,
             &config,
-            state,
+            state.clone(),
             &None,
             100,
             None,
-            "@flush_mobile",
+            "@flush_claude",
             None,
         )
         .await
@@ -1670,7 +1755,21 @@ mod mobile_tests {
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].text.contains("not implemented"));
+        assert!(sent[0].text.contains("desktop -> mobile: copied 1"));
+        assert!(sent[0].text.contains("mobile -> desktop: copied 1"));
+        assert!(sent[0].text.contains("total: copied 2"));
+
+        let desktop_content = std::fs::read_to_string(&desktop).unwrap();
+        let mobile_content = std::fs::read_to_string(&mobile).unwrap();
+        assert!(desktop_content.contains("from mobile"));
+        assert!(mobile_content.contains("from desktop"));
+
+        let snapshot = state.snapshot().await;
+        let bridge = &snapshot.bridged_sessions["100"]["claude"];
+        assert!(bridge.sync.desktop_offset > 0);
+        assert!(bridge.sync.mobile_offset > 0);
+        assert!(bridge.sync.last_synced_at.is_some());
+        assert_eq!(bridge.sync.last_error, None);
     }
 
     #[tokio::test]
