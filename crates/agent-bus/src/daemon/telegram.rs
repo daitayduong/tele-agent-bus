@@ -426,16 +426,14 @@ async fn handle_unaddressed_lead_message<B: BotClient + ?Sized>(
 
     let snapshot = state.snapshot().await;
     let mobile = snapshot.mobile_sessions.get(&chat_id.to_string()).cloned();
-    if agent == AgentKind::Claude && mobile.is_some() {
-        return handle_claude_mobile_msg(
-            bot,
-            config,
-            state,
-            chat_id,
-            text.trim().to_string(),
-            agent_runner,
-        )
-        .await;
+    if lead_has_selected_session(&snapshot, chat_id, agent) {
+        let addressed = format!("@{} {}", agent, text.trim());
+        if let Some(cmd) = mobile_session::parse_mobile_command(&addressed) {
+            return handle_mobile_command(bot, config, state, chat_id, cmd, agent_runner).await;
+        }
+        if let Some(cmd) = session_bridge::parse_bridge_command(&addressed) {
+            return handle_bridge_command(bot, config, state, chat_id, cmd, agent_runner).await;
+        }
     }
 
     let Some(runner) = agent_runner else {
@@ -520,6 +518,23 @@ async fn handle_unaddressed_lead_message<B: BotClient + ?Sized>(
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
+}
+
+fn lead_has_selected_session(
+    snapshot: &agent_bus_core::state::StateSnapshot,
+    chat_id: i64,
+    agent: AgentKind,
+) -> bool {
+    let chat_key = chat_id.to_string();
+    match agent {
+        AgentKind::Claude => snapshot.mobile_sessions.contains_key(&chat_key),
+        AgentKind::Codex => snapshot
+            .bridged_sessions
+            .get(&chat_key)
+            .and_then(|by_agent| by_agent.get("codex"))
+            .is_some(),
+        AgentKind::Gemini => false,
+    }
 }
 
 async fn resolve_lead_for_chat(
@@ -2449,7 +2464,11 @@ mod mobile_tests {
         .unwrap();
 
         let sent = bot.sent_messages();
-        assert!(sent.iter().any(|m| m.text.contains("codex thinking")));
+        assert!(
+            sent.iter().any(|m| m.text.contains("codex thinking")),
+            "messages: {:?}",
+            sent.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
         assert!(
             sent.iter().any(|m| m
                 .text
@@ -2683,6 +2702,111 @@ mod mobile_tests {
             .sent_messages()
             .iter()
             .any(|m| m.text.contains("resumed-ok")));
+    }
+
+    #[tokio::test]
+    async fn unaddressed_message_with_codex_lead_and_selected_session_uses_bridge() {
+        use crate::daemon::cli_spawner::CliSpawner;
+        use crate::daemon::runner::{AgentRunner, EventLog};
+        use agent_bus_core::auth_context::AuthContextsConfig;
+        use agent_bus_core::state::{BridgedSessionState, SessionSyncCursor};
+        use std::sync::Arc;
+
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let config = TelegramConfig {
+            allowed_chats: vec!["100".to_string()],
+            repos: vec![RepoEntry {
+                id: "rallyup".to_string(),
+                display: "RallyUp".to_string(),
+                path: repo_path.display().to_string(),
+                agents: vec!["codex".to_string()],
+            }],
+        };
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_lead_for_chat("100", "codex").await.unwrap();
+        let session_path = dir.path().join("rollout-codex-session-xyz.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"type":"session_meta","payload":{"id":"codex-session-xyz","cwd":"/repo"}}"#,
+        )
+        .unwrap();
+        let mobile_path = dir.path().join("mobile.jsonl");
+        std::fs::File::create(&mobile_path).unwrap();
+        state
+            .set_bridged_session(
+                "100",
+                "codex",
+                BridgedSessionState {
+                    agent: "codex".to_string(),
+                    repo_id: "rallyup".to_string(),
+                    desktop_session_id: "codex-session-xyz".to_string(),
+                    desktop_path: session_path.display().to_string(),
+                    mobile_session_id: "agent-bus-mobile-codex".to_string(),
+                    mobile_path: mobile_path.display().to_string(),
+                    selected_at: "2026-04-19T00:00:00Z".to_string(),
+                    sync: SessionSyncCursor {
+                        desktop_offset: 0,
+                        mobile_offset: 0,
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        let profile_dir = dir.path().join(".agent-bus/auth/codex/john");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let yaml = format!(
+            "version: 1\nlead:\n  default: codex\nagents:\n  codex:\n    contexts:\n      - id: john\n        profile_dir: {}\n",
+            profile_dir.display()
+        );
+        let cfg = AuthContextsConfig::parse(&yaml, dir.path()).unwrap();
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cli/codex_ok.sh");
+        let runner = Arc::new(AgentRunner::new(
+            CliSpawner::new().with_bin("codex", fixture),
+            cfg.clone(),
+            state.clone(),
+            EventLog::new(dir.path().join("events.jsonl")),
+        ));
+
+        handle_text_command(
+            &bot,
+            &config,
+            state,
+            &Some(cfg),
+            100,
+            None,
+            "OK, vậy là đúng rồi. Good job",
+            Some(&runner),
+        )
+        .await
+        .unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(
+            sent.iter().any(|m| m.text.contains("codex thinking")),
+            "messages: {:?}",
+            sent.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        assert!(sent
+            .iter()
+            .any(|m| m.text.contains("[agent-bus session bridge]")));
+        assert!(sent
+            .iter()
+            .any(|m| m.text.contains("OK, vậy là đúng rồi. Good job")));
+        assert!(
+            profile_dir
+                .join("sessions/agent-bus/rollout-codex-session-xyz.jsonl")
+                .exists()
+        );
     }
 
     #[tokio::test]
