@@ -2206,7 +2206,7 @@ mod mobile_tests {
             CODEX_MOBILE_SESSION_ID
         )));
         assert_eq!(bot.answered_callbacks(), vec!["cb1".to_string()]);
-        assert!(bot.edited_messages()[0].text.contains("Codex session"));
+        assert!(bot.edited_messages()[0].text.contains("selected"));
     }
 
     #[tokio::test]

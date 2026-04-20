@@ -727,6 +727,16 @@ mod tests {
             r#"{"type":"session_meta","payload":{"id":"new","cwd":"/repo/","timestamp":"2026-04-19T11:00:00Z"}}"#,
         )
         .unwrap();
+        filetime::set_file_mtime(
+            &older,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &newer,
+            filetime::FileTime::from_unix_time(1_700_000_100, 0),
+        )
+        .unwrap();
         std::fs::write(
             &other_repo,
             r#"{"type":"session_meta","payload":{"id":"other","cwd":"/elsewhere"}}"#,
