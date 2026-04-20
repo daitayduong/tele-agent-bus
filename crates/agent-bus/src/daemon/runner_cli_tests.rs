@@ -197,6 +197,28 @@ async fn cli_success_sets_active_context() {
 }
 
 #[tokio::test]
+async fn cli_codex_resume_uses_selected_session_id() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = cfg_with_real_dirs(tmp.path(), "codex", &["john"], false, false);
+    let (state, events) = state_and_events(&tmp).await;
+    let spawner = CliSpawner::new().with_bin("codex", fixture_dir().join("codex_ok.sh"));
+    let runner = AgentRunner::new(spawner, cfg, state, events);
+
+    let mut req = request("codex", tmp.path().to_path_buf(), "continue");
+    req.mode = AgentRunMode::CodexResume {
+        session_id: "codex-session-abc".to_string(),
+    };
+
+    let resp = runner.run(req).await.unwrap();
+
+    assert_eq!(resp.final_kind, ResultKind::Success);
+    assert!(resp.stdout.contains(
+        "[args=exec resume --skip-git-repo-check codex-session-abc -]"
+    ));
+    assert!(resp.stdout.contains("codex-ok: continue"));
+}
+
+#[tokio::test]
 async fn cli_env_config_dir_passed_to_child() {
     let tmp = TempDir::new().unwrap();
     let cfg = cfg_with_real_dirs(tmp.path(), "claude", &["john"], false, false);

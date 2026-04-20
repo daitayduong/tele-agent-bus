@@ -50,6 +50,29 @@ pub struct StateSnapshot {
     pub pending_rotations: BTreeMap<String, PendingRotation>,
     #[serde(default)]
     pub lead_overrides: LeadOverrides,
+    // Phase 5 additions:
+    #[serde(default)]
+    pub bridged_sessions: BTreeMap<String, BTreeMap<String, BridgedSessionState>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgedSessionState {
+    pub agent: String,
+    pub repo_id: String,
+    pub desktop_session_id: String,
+    pub desktop_path: String,
+    pub mobile_session_id: String,
+    pub mobile_path: String,
+    pub selected_at: String,
+    pub sync: SessionSyncCursor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSyncCursor {
+    pub desktop_offset: u64,
+    pub mobile_offset: u64,
+    pub last_synced_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -157,6 +180,7 @@ impl Default for StateSnapshot {
             active_auth_context: BTreeMap::new(),
             pending_rotations: BTreeMap::new(),
             lead_overrides: LeadOverrides::default(),
+            bridged_sessions: BTreeMap::new(),
         }
     }
 }
@@ -193,6 +217,12 @@ enum StateCmd {
     SetMobileSession {
         chat_id: String,
         mobile: MobileSessionState,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetBridgedSession {
+        chat_id: String,
+        agent: String,
+        bridge: BridgedSessionState,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
     ClearMobileSession {
@@ -316,6 +346,25 @@ impl StateHandle {
         self.tx
             .send(StateCmd::ClearMobileSession {
                 chat_id: chat_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_bridged_session(
+        &self,
+        chat_id: impl Into<String>,
+        agent: impl Into<String>,
+        bridge: BridgedSessionState,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetBridgedSession {
+                chat_id: chat_id.into(),
+                agent: agent.into(),
+                bridge,
                 reply,
             })
             .await
@@ -490,6 +539,20 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                     reply,
                 } => {
                     state.mobile_sessions.insert(chat_id, mobile);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetBridgedSession {
+                    chat_id,
+                    agent,
+                    bridge,
+                    reply,
+                } => {
+                    state
+                        .bridged_sessions
+                        .entry(chat_id)
+                        .or_default()
+                        .insert(agent, bridge);
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
@@ -751,6 +814,43 @@ mod tests {
         assert!(snap.auth_context_status.is_empty());
         assert!(snap.active_auth_context.is_empty());
         assert!(snap.pending_rotations.is_empty());
+        assert!(snap.bridged_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_with_bridged_sessions_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = StateSnapshot::default();
+
+        let bridge = BridgedSessionState {
+            agent: "claude".to_string(),
+            repo_id: "rallyup_123".to_string(),
+            desktop_session_id: "desk-uuid".to_string(),
+            desktop_path: "/path/to/desk.jsonl".to_string(),
+            mobile_session_id: "mob-uuid".to_string(),
+            mobile_path: "/path/to/mob.jsonl".to_string(),
+            selected_at: "2026-04-19T00:00:00Z".to_string(),
+            sync: SessionSyncCursor {
+                desktop_offset: 100,
+                mobile_offset: 200,
+                last_synced_at: Some("2026-04-19T00:00:30Z".to_string()),
+                last_error: None,
+            },
+        };
+
+        let mut chat_bridges = BTreeMap::new();
+        chat_bridges.insert("claude".to_string(), bridge.clone());
+        state
+            .bridged_sessions
+            .insert("chat1".to_string(), chat_bridges);
+
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let handle = spawn_state_actor(path).await.unwrap();
+        let snap = handle.snapshot().await;
+
+        assert_eq!(snap.bridged_sessions["chat1"]["claude"], bridge);
     }
 
     #[tokio::test]

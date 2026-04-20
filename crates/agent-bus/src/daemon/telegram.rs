@@ -13,14 +13,20 @@ use crate::daemon::mobile_session::{
 };
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
 use crate::daemon::runner::{AgentRunMode, AgentRunRequest, RunnerError, SharedAgentRunner};
+use crate::daemon::session_bridge::{self, BridgeCommand, BridgeSyncStats};
 use agent_bus_core::auth_context::{AgentKind, AuthContextsConfig, LeadSource};
-use agent_bus_core::state::{MobileSessionState, PendingPermStatus, StateHandle};
+use agent_bus_core::state::{
+    BridgedSessionState, MobileSessionState, PendingPermStatus, SessionSyncCursor, StateHandle,
+};
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
 use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
 use thiserror::Error;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[cfg(test)]
+static CODEX_HOME_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramConfig {
@@ -235,6 +241,10 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
 ) -> Result<(), TelegramError> {
     if let Some(cmd) = mobile_session::parse_mobile_command(text) {
         return handle_mobile_command(bot, config, state, chat_id, cmd, agent_runner).await;
+    }
+
+    if let Some(cmd) = session_bridge::parse_bridge_command(text) {
+        return handle_bridge_command(bot, config, state, chat_id, cmd, agent_runner).await;
     }
 
     if text.trim_start().starts_with('@') {
@@ -557,15 +567,202 @@ async fn handle_mobile_command<B: BotClient + ?Sized>(
             handle_claude_mobile_msg(bot, config, state, chat_id, body, agent_runner).await
         }
         MobileCommand::FlushMobile => {
+            flush_bridge_session(bot, state, chat_id, AgentKind::Claude).await
+        }
+    }
+}
+
+async fn handle_bridge_command<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    cmd: BridgeCommand,
+    agent_runner: Option<
+        &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    >,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+    match cmd {
+        BridgeCommand::List(AgentKind::Claude) => {
+            handle_list_claude_command(bot, config, state, chat_id).await
+        }
+        BridgeCommand::List(AgentKind::Codex) => {
+            handle_list_codex_command(bot, config, state, chat_id).await
+        }
+        BridgeCommand::Chat(AgentKind::Claude, body) => {
+            handle_claude_mobile_msg(bot, config, state, chat_id, body, agent_runner).await
+        }
+        BridgeCommand::Chat(AgentKind::Codex, body) => {
+            handle_codex_bridge_msg(bot, config, state, chat_id, body, agent_runner).await
+        }
+        BridgeCommand::Flush(AgentKind::Claude) => {
+            flush_bridge_session(bot, state, chat_id, AgentKind::Claude).await
+        }
+        BridgeCommand::List(agent) | BridgeCommand::Flush(agent) => {
             bot.send_message(
                 chat_id,
-                "@flush_mobile — not implemented yet (Phase 3.5).".to_string(),
+                format!("@list_{agent} / @flush_{agent} bridge is not implemented yet."),
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+        BridgeCommand::Chat(agent, _) => {
+            bot.send_message(
+                chat_id,
+                format!("@{agent} session bridge is not implemented yet. Use @list_{agent} first once the provider is available."),
                 None,
             )
             .await?;
             Ok(())
         }
     }
+}
+
+async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    body: String,
+    agent_runner: Option<
+        &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    >,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let Some(bridge) = snapshot
+        .bridged_sessions
+        .get(&chat_id.to_string())
+        .and_then(|by_agent| by_agent.get("codex"))
+    else {
+        bot.send_message(
+            chat_id,
+            "No codex session selected. Send @list_codex first.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, &bridge.repo_id) else {
+        return Err(TelegramError::UnknownRepo(bridge.repo_id.clone()));
+    };
+    let Some(runner) = agent_runner else {
+        bot.send_message(
+            chat_id,
+            "Codex session bridge requires auth-contexts.yaml / AgentRunner.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    bot.send_message(chat_id, "⏳ codex thinking...".to_string(), None)
+        .await
+        .ok();
+
+    let reply = run_agent_via_runner(
+        runner,
+        AgentKind::Codex,
+        &bridge.repo_id,
+        PathBuf::from(&repo.path),
+        body,
+        AgentRunMode::CodexResume {
+            session_id: bridge.desktop_session_id.clone(),
+        },
+        Duration::from_secs(claude_headless::resolved_timeout_secs()),
+        chat_id,
+    )
+    .await;
+
+    let reply = match reply {
+        Ok(out) => out,
+        Err(msg) => {
+            bot.send_message(chat_id, msg, None).await?;
+            return Ok(());
+        }
+    };
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        bot.send_message(chat_id, "(empty reply from codex)".to_string(), None)
+            .await?;
+        return Ok(());
+    }
+    const MAX_CHUNK: usize = 4000;
+    for chunk in claude_headless::chunk_for_telegram(trimmed, MAX_CHUNK) {
+        bot.send_message(chat_id, chunk, None).await?;
+    }
+    Ok(())
+}
+
+async fn flush_bridge_session<B: BotClient + ?Sized>(
+    bot: &B,
+    state: StateHandle,
+    chat_id: i64,
+    agent: AgentKind,
+) -> Result<(), TelegramError> {
+    let chat_key = chat_id.to_string();
+    let agent_key = agent.to_string();
+    let snapshot = state.snapshot().await;
+    let Some(mut bridge) = snapshot
+        .bridged_sessions
+        .get(&chat_key)
+        .and_then(|by_agent| by_agent.get(&agent_key))
+        .cloned()
+    else {
+        bot.send_message(
+            chat_id,
+            format!("No {agent} session selected. Send @list_{agent} first."),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let result = session_bridge::sync_bridged_session(&mut bridge);
+    match result {
+        Ok(stats) => {
+            state
+                .set_bridged_session(chat_key, agent_key, bridge)
+                .await?;
+            bot.send_message(chat_id, format_bridge_sync_stats(agent, stats), None)
+                .await?;
+            Ok(())
+        }
+        Err(err) => {
+            bridge.sync.last_error = Some(err.to_string());
+            state
+                .set_bridged_session(chat_key, agent_key, bridge)
+                .await?;
+            bot.send_message(chat_id, format!("@flush_{agent} failed: {err}"), None)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+fn format_bridge_sync_stats(agent: AgentKind, stats: BridgeSyncStats) -> String {
+    format!(
+        "@flush_{agent} synced\n\
+desktop -> mobile: copied {}, skipped {}, errors {}\n\
+mobile -> desktop: copied {}, skipped {}, errors {}\n\
+total: copied {}, skipped {}, errors {}",
+        stats.desktop_to_mobile.copied,
+        stats.desktop_to_mobile.skipped,
+        stats.desktop_to_mobile.errors,
+        stats.mobile_to_desktop.copied,
+        stats.mobile_to_desktop.skipped,
+        stats.mobile_to_desktop.errors,
+        stats.copied(),
+        stats.skipped(),
+        stats.errors()
+    )
 }
 
 pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
@@ -625,6 +822,90 @@ pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
     bot.send_message(chat_id, text, Some(InlineKeyboard { rows }))
         .await?;
     Ok(())
+}
+
+pub async fn handle_list_codex_command<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
+        bot.send_message(
+            chat_id,
+            "No default repo for this chat. Use /switch_rp first.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.clone()));
+    };
+
+    let codex_home = codex_home_dir();
+    let sessions = match session_bridge::detect_codex_sessions(&codex_home, &repo.path, 10) {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            bot.send_message(chat_id, format!("Failed to scan Codex sessions: {err}"), None)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    if sessions.is_empty() {
+        bot.send_message(
+            chat_id,
+            format!(
+                "No Codex sessions for {} (scanned {}).",
+                repo.display,
+                codex_home.join("sessions").display()
+            ),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let rows = sessions
+        .iter()
+        .map(|session| {
+            let short = session.id.get(..8).unwrap_or(&session.id);
+            vec![(
+                format!("Codex {short}"),
+                format!("sel_codex:{}", session.id),
+            )]
+        })
+        .collect();
+    bot.send_message(
+        chat_id,
+        format!("Active Codex sessions ({}):", repo.display),
+        Some(InlineKeyboard { rows }),
+    )
+    .await?;
+    Ok(())
+}
+
+fn codex_home_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(home) = CODEX_HOME_OVERRIDE
+        .lock()
+        .expect("codex home override lock poisoned")
+        .clone()
+    {
+        return home;
+    }
+    if let Ok(home) = std::env::var("CODEX_HOME") {
+        return PathBuf::from(home);
+    }
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".codex"))
+        .unwrap_or_else(|_| PathBuf::from(".codex"))
 }
 
 pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
@@ -756,12 +1037,32 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     let mobile = MobileSessionState {
         mobile_uuid: MOBILE_UUID.to_string(),
         mobile_fork_source: desktop_uuid.clone(),
-        mobile_forked_at: forked_at,
+        mobile_forked_at: forked_at.clone(),
         project_hash,
         repo_id: repo.id.clone(),
     };
+    let desktop_offset = source_path.metadata().map(|m| m.len()).unwrap_or(0);
+    let mobile_offset = target_path.metadata().map(|m| m.len()).unwrap_or(0);
+    let bridge = BridgedSessionState {
+        agent: AgentKind::Claude.to_string(),
+        repo_id: repo.id.clone(),
+        desktop_session_id: desktop_uuid.clone(),
+        desktop_path: source_path.display().to_string(),
+        mobile_session_id: MOBILE_UUID.to_string(),
+        mobile_path: target_path.display().to_string(),
+        selected_at: forked_at.clone(),
+        sync: SessionSyncCursor {
+            desktop_offset,
+            mobile_offset,
+            last_synced_at: None,
+            last_error: None,
+        },
+    };
     state
         .set_mobile_session(chat_id.to_string(), mobile)
+        .await?;
+    state
+        .set_bridged_session(chat_id.to_string(), AgentKind::Claude.to_string(), bridge)
         .await?;
 
     let title = session
@@ -774,6 +1075,83 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     );
     bot.edit_message_text(message, confirm).await?;
     bot.answer_callback(callback_id, "Forked".to_string())
+        .await?;
+    Ok(())
+}
+
+pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    message: MessageRef,
+    callback_id: String,
+    callback_data: String,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let Some((AgentKind::Codex, codex_id)) = session_bridge::parse_callback_data(&callback_data)
+    else {
+        return Err(TelegramError::InvalidCallback(callback_data));
+    };
+
+    let snapshot = state.snapshot().await;
+    let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
+        bot.answer_callback(callback_id, "No default repo".to_string())
+            .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.clone()));
+    };
+
+    let sessions = match session_bridge::detect_codex_sessions(&codex_home_dir(), &repo.path, 50) {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            bot.answer_callback(callback_id, short_err("scan failed", &err.to_string()))
+                .await?;
+            return Ok(());
+        }
+    };
+    let Some(session) = sessions.into_iter().find(|session| session.id == codex_id) else {
+        bot.answer_callback(callback_id, "Session not found".to_string())
+            .await?;
+        return Ok(());
+    };
+
+    let now = time::OffsetDateTime::now_utc();
+    let selected_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string());
+    let offset = session.path.metadata().map(|m| m.len()).unwrap_or(0);
+    let bridge = BridgedSessionState {
+        agent: AgentKind::Codex.to_string(),
+        repo_id: repo.id.clone(),
+        desktop_session_id: session.id.clone(),
+        desktop_path: session.path.display().to_string(),
+        mobile_session_id: session.id.clone(),
+        mobile_path: session.path.display().to_string(),
+        selected_at,
+        sync: SessionSyncCursor {
+            desktop_offset: offset,
+            mobile_offset: offset,
+            last_synced_at: None,
+            last_error: None,
+        },
+    };
+    state
+        .set_bridged_session(chat_id.to_string(), AgentKind::Codex.to_string(), bridge)
+        .await?;
+
+    let short = session.id.get(..8).unwrap_or(&session.id);
+    bot.edit_message_text(
+        message,
+        format!("Codex session {short} selected. @codex resume execution is not wired yet."),
+    )
+    .await?;
+    bot.answer_callback(callback_id, "Selected".to_string())
         .await?;
     Ok(())
 }
@@ -1451,6 +1829,21 @@ pub async fn teloxide_callback_handler(
         )
         .await
         .map_err(to_teloxide_error)?;
+    } else if data.starts_with("sel_codex:") {
+        handle_callback_sel_codex(
+            &client,
+            &config,
+            state,
+            chat.id.0,
+            MessageRef {
+                chat_id: chat.id.0,
+                message_id: message_id.0,
+            },
+            query.id,
+            data,
+        )
+        .await
+        .map_err(to_teloxide_error)?;
     } else if data.starts_with("perm:") {
         let user_name = query
             .from
@@ -1506,18 +1899,39 @@ fn to_teloxide_error(err: TelegramError) -> teloxide::RequestError {
 mod mobile_tests {
     use super::*;
     use agent_bus_core::state::spawn_state_actor;
+    use std::io::Write;
     use tempfile::tempdir;
 
     fn test_config() -> TelegramConfig {
+        config_with_repo_path("/tmp/rallyup-test")
+    }
+
+    fn config_with_repo_path(path: impl Into<String>) -> TelegramConfig {
         TelegramConfig {
             allowed_chats: vec!["100".to_string()],
             repos: vec![RepoEntry {
                 id: "rallyup".to_string(),
                 display: "RallyUp".to_string(),
-                path: "/tmp/rallyup-test".to_string(),
-                agents: vec!["claude".to_string()],
+                path: path.into(),
+                agents: vec!["claude".to_string(), "codex".to_string()],
             }],
         }
+    }
+
+    fn write_codex_session(codex_home: &Path, id: &str, repo_path: &Path) -> PathBuf {
+        let path = codex_home
+            .join("sessions/2026/04/19")
+            .join(format!("rollout-test-{id}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+                repo_path.display()
+            ),
+        )
+        .unwrap();
+        path
     }
 
     #[tokio::test]
@@ -1550,7 +1964,7 @@ mod mobile_tests {
         handle_text_command(
             &bot,
             &config,
-            state,
+            state.clone(),
             &None,
             100,
             None,
@@ -1570,13 +1984,225 @@ mod mobile_tests {
     }
 
     #[tokio::test]
-    async fn flush_mobile_reports_not_implemented() {
+    async fn flush_claude_syncs_both_directions_and_updates_state() {
         let bot = MockBot::default();
         let config = test_config();
         let dir = tempdir().unwrap();
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
+        let desktop = dir.path().join("desktop.jsonl");
+        let mobile = dir.path().join("mobile.jsonl");
+        {
+            let mut f = std::fs::File::create(&desktop).unwrap();
+            writeln!(f, r#"{{"sessionId":"desktop-id","text":"from desktop"}}"#).unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(&mobile).unwrap();
+            writeln!(f, r#"{{"sessionId":"mobile-id","text":"from mobile"}}"#).unwrap();
+        }
+        state
+            .set_bridged_session(
+                "100",
+                AgentKind::Claude.to_string(),
+                BridgedSessionState {
+                    agent: AgentKind::Claude.to_string(),
+                    repo_id: "rallyup".to_string(),
+                    desktop_session_id: "desktop-id".to_string(),
+                    desktop_path: desktop.display().to_string(),
+                    mobile_session_id: "mobile-id".to_string(),
+                    mobile_path: mobile.display().to_string(),
+                    selected_at: "2026-04-19T00:00:00Z".to_string(),
+                    sync: SessionSyncCursor {
+                        desktop_offset: 0,
+                        mobile_offset: 0,
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        handle_text_command(
+            &bot,
+            &config,
+            state.clone(),
+            &None,
+            100,
+            None,
+            "@flush_claude",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let sent = bot.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("desktop -> mobile: copied 1"));
+        assert!(sent[0].text.contains("mobile -> desktop: copied 1"));
+        assert!(sent[0].text.contains("total: copied 2"));
+
+        let desktop_content = std::fs::read_to_string(&desktop).unwrap();
+        let mobile_content = std::fs::read_to_string(&mobile).unwrap();
+        assert!(desktop_content.contains("from mobile"));
+        assert!(mobile_content.contains("from desktop"));
+
+        let snapshot = state.snapshot().await;
+        let bridge = &snapshot.bridged_sessions["100"]["claude"];
+        assert!(bridge.sync.desktop_offset > 0);
+        assert!(bridge.sync.mobile_offset > 0);
+        assert!(bridge.sync.last_synced_at.is_some());
+        assert_eq!(bridge.sync.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn list_codex_lists_matching_sessions() {
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let codex_home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&repo).unwrap();
+        write_codex_session(&codex_home, "codex-session-1", &repo);
+        *CODEX_HOME_OVERRIDE.lock().unwrap() = Some(codex_home);
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+
+        handle_text_command(&bot, &config, state, &None, 100, None, "@list_codex", None)
+            .await
+            .unwrap();
+        *CODEX_HOME_OVERRIDE.lock().unwrap() = None;
+
+        let sent = bot.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("Active Codex sessions"));
+        let keyboard = sent[0].keyboard.as_ref().expect("codex session keyboard");
+        assert_eq!(keyboard.rows[0][0].1, "sel_codex:codex-session-1");
+    }
+
+    #[tokio::test]
+    async fn selecting_codex_writes_generic_bridge_state() {
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let codex_home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&repo).unwrap();
+        let session_path = write_codex_session(&codex_home, "codex-session-2", &repo);
+        *CODEX_HOME_OVERRIDE.lock().unwrap() = Some(codex_home);
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+
+        handle_callback_sel_codex(
+            &bot,
+            &config,
+            state.clone(),
+            100,
+            MessageRef {
+                chat_id: 100,
+                message_id: 1,
+            },
+            "cb1".to_string(),
+            "sel_codex:codex-session-2".to_string(),
+        )
+        .await
+        .unwrap();
+        *CODEX_HOME_OVERRIDE.lock().unwrap() = None;
+
+        let snapshot = state.snapshot().await;
+        let bridge = &snapshot.bridged_sessions["100"]["codex"];
+        assert_eq!(bridge.agent, "codex");
+        assert_eq!(bridge.desktop_session_id, "codex-session-2");
+        assert_eq!(bridge.desktop_path, session_path.display().to_string());
+        assert_eq!(bridge.mobile_path, session_path.display().to_string());
+        assert_eq!(bot.answered_callbacks(), vec!["cb1".to_string()]);
+        assert!(bot.edited_messages()[0].text.contains("Codex session"));
+    }
+
+    #[tokio::test]
+    async fn codex_chat_reports_not_implemented() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(&bot, &config, state, &None, 100, None, "@codex hello", None)
+            .await
+            .unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(
+            sent[0].text.contains("No codex session selected"),
+            "expected setup guidance, got: {:?}",
+            sent[0].text
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_chat_uses_selected_session_via_runner() {
+        use crate::daemon::cli_spawner::CliSpawner;
+        use crate::daemon::runner::{AgentRunner, EventLog};
+        use agent_bus_core::auth_context::AuthContextsConfig;
+        use agent_bus_core::state::{BridgedSessionState, SessionSyncCursor};
+        use std::sync::Arc;
+
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let config = config_with_repo_path(repo_path.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+        let session_path = dir.path().join("rollout-codex-session-xyz.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"type":"session_meta","payload":{"id":"codex-session-xyz","cwd":"/unused"}}"#,
+        )
+        .unwrap();
+        state
+            .set_bridged_session(
+                "100",
+                "codex",
+                BridgedSessionState {
+                    agent: "codex".to_string(),
+                    repo_id: "rallyup".to_string(),
+                    desktop_session_id: "codex-session-xyz".to_string(),
+                    desktop_path: session_path.display().to_string(),
+                    mobile_session_id: "codex-session-xyz".to_string(),
+                    mobile_path: session_path.display().to_string(),
+                    selected_at: "2026-04-19T00:00:00Z".to_string(),
+                    sync: SessionSyncCursor {
+                        desktop_offset: 0,
+                        mobile_offset: 0,
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        let profile_dir = dir.path().join(".agent-bus/auth/codex/john");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let yaml = format!(
+            "version: 1\ndefaults:\n  auto_rotate: false\n  require_owner_approval: false\nagents:\n  codex:\n    contexts:\n      - id: john\n        profile_dir: {}\n",
+            profile_dir.display()
+        );
+        let cfg = AuthContextsConfig::parse(&yaml, dir.path()).unwrap();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake-cli/codex_ok.sh");
+        let spawner = CliSpawner::new().with_bin("codex", fixture);
+        let events = EventLog::new(dir.path().join("events.jsonl"));
+        let runner = Arc::new(AgentRunner::new(spawner, cfg, state.clone(), events));
 
         handle_text_command(
             &bot,
@@ -1585,15 +2211,22 @@ mod mobile_tests {
             &None,
             100,
             None,
-            "@flush_mobile",
-            None,
+            "@codex continue this",
+            Some(&runner),
         )
         .await
         .unwrap();
 
         let sent = bot.sent_messages();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].text.contains("not implemented"));
+        assert!(sent.iter().any(|m| m.text.contains("codex thinking")));
+        assert!(
+            sent.iter().any(|m| m.text.contains(
+                "[args=exec resume --skip-git-repo-check codex-session-xyz -]"
+            )),
+            "messages: {:?}",
+            sent.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        assert!(sent.iter().any(|m| m.text.contains("codex-ok: continue this")));
     }
 
     #[tokio::test]
@@ -1809,5 +2442,71 @@ mod mobile_tests {
             .sent_messages()
             .iter()
             .any(|m| m.text.contains("resumed-ok")));
+    }
+
+    #[tokio::test]
+    async fn selecting_claude_writes_new_generic_state_ac_sb4() {
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let home = dir.path().join("home");
+        let desktop_uuid = "11111111-1111-1111-1111-111111111111";
+        let project_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(project_hash_for_repo(&repo_path.display().to_string()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join(format!("{desktop_uuid}.jsonl")),
+            format!(
+                r#"{{"type":"user","sessionId":"{desktop_uuid}","cwd":"{}","timestamp":"2026-04-19T00:00:00Z","message":{{"role":"user","content":"hello"}}}}"#,
+                repo_path.display()
+            ),
+        )
+        .unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let config = TelegramConfig {
+            allowed_chats: vec!["100".to_string()],
+            repos: vec![RepoEntry {
+                id: "rallyup".to_string(),
+                display: "RallyUp".to_string(),
+                path: repo_path.display().to_string(),
+                agents: vec!["claude".to_string()],
+            }],
+        };
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "rallyup").await.unwrap();
+
+        handle_callback_sel_claude(
+            &bot,
+            &config,
+            state.clone(),
+            100,
+            MessageRef {
+                chat_id: 100,
+                message_id: 42,
+            },
+            "cb-1".to_string(),
+            format!("sel_claude:{desktop_uuid}"),
+        )
+        .await
+        .unwrap();
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        }
+
+        let snap = state.snapshot().await;
+        assert!(
+            snap.bridged_sessions.contains_key("100"),
+            "bridged_sessions should contain chat 100"
+        );
+        assert!(
+            snap.bridged_sessions["100"].contains_key("claude"),
+            "bridged_sessions['100'] should contain 'claude'"
+        );
     }
 }
