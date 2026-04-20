@@ -879,7 +879,7 @@ pub async fn handle_list_codex_command<B: BotClient + ?Sized>(
         .map(|session| {
             let short = session.id.get(..8).unwrap_or(&session.id);
             vec![(
-                format!("Codex {short}"),
+                codex_session_button_label(session.title.as_deref(), short),
                 format!("sel_codex:{}", session.id),
             )]
         })
@@ -891,6 +891,13 @@ pub async fn handle_list_codex_command<B: BotClient + ?Sized>(
     )
     .await?;
     Ok(())
+}
+
+fn codex_session_button_label(title: Option<&str>, short_id: &str) -> String {
+    match title {
+        Some(title) => format!("{title} ({short_id})"),
+        None => format!("Codex {short_id}"),
+    }
 }
 
 fn codex_home_dir() -> PathBuf {

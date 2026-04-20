@@ -18,6 +18,7 @@ pub struct CodexSessionInfo {
     pub id: String,
     pub path: PathBuf,
     pub cwd: String,
+    pub title: Option<String>,
     pub updated_secs: u64,
 }
 
@@ -174,10 +175,82 @@ fn read_codex_session_meta(path: &Path) -> anyhow::Result<Option<CodexSessionInf
             id: id.to_string(),
             path: path.to_path_buf(),
             cwd: cwd.to_string(),
+            title: payload
+                .get("title")
+                .and_then(Value::as_str)
+                .and_then(clean_codex_title)
+                .or_else(|| infer_codex_title(&text)),
             updated_secs,
         }));
     }
     Ok(None)
+}
+
+fn infer_codex_title(text: &str) -> Option<String> {
+    let mut title = None;
+    for line in text.lines().take(80) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("message")
+            || payload.get("role").and_then(Value::as_str) != Some("user")
+        {
+            continue;
+        }
+        let Some(content) = payload.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in content {
+            if item.get("type").and_then(Value::as_str) != Some("input_text") {
+                continue;
+            }
+            if let Some(candidate) = item
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(extract_codex_title_candidate)
+            {
+                title = Some(candidate);
+            }
+        }
+    }
+    title
+}
+
+fn extract_codex_title_candidate(text: &str) -> Option<String> {
+    if text.starts_with("# AGENTS.md instructions") || text.starts_with("<environment_context>") {
+        return None;
+    }
+    if let Some((_, after)) = text.rsplit_once("My request for Codex:") {
+        return clean_codex_title(after);
+    }
+    if let Some((_, after)) = text.rsplit_once("from @") {
+        if let Some((_, body)) = after.split_once('\n') {
+            return clean_codex_title(body);
+        }
+    }
+    if text.starts_with("## Context from shared memory") {
+        return None;
+    }
+    clean_codex_title(text)
+}
+
+fn clean_codex_title(text: &str) -> Option<String> {
+    let mut title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    const MAX_CHARS: usize = 48;
+    if title.chars().count() > MAX_CHARS {
+        title = title.chars().take(MAX_CHARS - 1).collect::<String>();
+        title.push('…');
+    }
+    Some(title)
 }
 
 fn normalize_path_text(path: &str) -> String {
