@@ -207,6 +207,7 @@ async fn cli_codex_resume_uses_selected_session_id() {
     let mut req = request("codex", tmp.path().to_path_buf(), "continue");
     req.mode = AgentRunMode::CodexResume {
         session_id: "codex-session-abc".to_string(),
+        transcript_path: None,
     };
 
     let resp = runner.run(req).await.unwrap();

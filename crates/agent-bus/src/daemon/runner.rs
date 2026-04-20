@@ -44,7 +44,10 @@ pub type SharedAgentRunner = Option<Arc<AgentRunner<crate::daemon::cli_spawner::
 pub enum AgentRunMode {
     Fresh,
     ClaudeResume { mobile_uuid: String },
-    CodexResume { session_id: String },
+    CodexResume {
+        session_id: String,
+        transcript_path: Option<PathBuf>,
+    },
     WithMobileContext { mobile_uuid: String },
 }
 

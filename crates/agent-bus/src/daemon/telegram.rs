@@ -639,10 +639,11 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
     }
 
     let snapshot = state.snapshot().await;
-    let Some(bridge) = snapshot
+    let Some(mut bridge) = snapshot
         .bridged_sessions
         .get(&chat_id.to_string())
         .and_then(|by_agent| by_agent.get("codex"))
+        .cloned()
     else {
         bot.send_message(
             chat_id,
@@ -664,19 +665,36 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
         .await?;
         return Ok(());
     };
+    if let Err(err) =
+        session_bridge::sync_bridged_session_locked(&chat_id.to_string(), "codex", &mut bridge)
+            .await
+    {
+        bridge.sync.last_error = Some(err.to_string());
+        state
+            .set_bridged_session(chat_id.to_string(), "codex".to_string(), bridge.clone())
+            .await?;
+        bot.send_message(chat_id, format!("@codex sync failed: {err}"), None)
+            .await?;
+        return Ok(());
+    }
+    state
+        .set_bridged_session(chat_id.to_string(), "codex".to_string(), bridge.clone())
+        .await?;
 
     bot.send_message(chat_id, "⏳ codex thinking...".to_string(), None)
         .await
         .ok();
 
+    let prompt = codex_bridge_prompt(&bridge, repo, &body);
     let reply = run_agent_via_runner(
         runner,
         AgentKind::Codex,
         &bridge.repo_id,
         PathBuf::from(&repo.path),
-        body,
+        prompt,
         AgentRunMode::CodexResume {
             session_id: bridge.desktop_session_id.clone(),
+            transcript_path: Some(PathBuf::from(&bridge.desktop_path)),
         },
         Duration::from_secs(claude_headless::resolved_timeout_secs()),
         chat_id,
@@ -690,6 +708,21 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
             return Ok(());
         }
     };
+    if let Ok(stats) =
+        session_bridge::sync_bridged_session_locked(&chat_id.to_string(), "codex", &mut bridge)
+            .await
+    {
+        let _ = state
+            .set_bridged_session(chat_id.to_string(), "codex".to_string(), bridge)
+            .await;
+        tracing::debug!(
+            target: "agent_bus::session_bridge",
+            copied = stats.copied(),
+            skipped = stats.skipped(),
+            errors = stats.errors(),
+            "synced codex bridge after mobile reply"
+        );
+    }
     let trimmed = reply.trim();
     if trimmed.is_empty() {
         bot.send_message(chat_id, "(empty reply from codex)".to_string(), None)
@@ -701,6 +734,28 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
+}
+
+fn codex_bridge_prompt(
+    bridge: &BridgedSessionState,
+    repo: &RepoEntry,
+    user_message: &str,
+) -> String {
+    format!(
+        "[agent-bus session bridge]\n\
+You are continuing the selected desktop Codex session.\n\
+Use the selected session transcript as the primary context for this Telegram message.\n\
+Repo id: {repo_id}\n\
+Repo path: {repo_path}\n\
+Desktop session id: {desktop_session_id}\n\
+Mobile session id: {mobile_session_id}\n\
+\n\
+User message from Telegram:\n{user_message}",
+        repo_id = bridge.repo_id,
+        repo_path = repo.path,
+        desktop_session_id = bridge.desktop_session_id,
+        mobile_session_id = bridge.mobile_session_id,
+    )
 }
 
 async fn flush_bridge_session<B: BotClient + ?Sized>(
@@ -2404,7 +2459,15 @@ mod mobile_tests {
         );
         assert!(sent
             .iter()
-            .any(|m| m.text.contains("codex-ok: continue this")));
+            .any(|m| m.text.contains("[agent-bus session bridge]")));
+        assert!(sent
+            .iter()
+            .any(|m| m.text.contains("User message from Telegram:\ncontinue this")));
+        assert!(
+            profile_dir
+                .join("sessions/agent-bus/rollout-codex-session-xyz.jsonl")
+                .exists()
+        );
     }
 
     #[tokio::test]

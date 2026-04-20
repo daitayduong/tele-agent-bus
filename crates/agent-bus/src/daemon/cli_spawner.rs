@@ -68,7 +68,7 @@ impl CliSpawner {
                 Ok(args)
             }
             "codex" => match mode {
-                AgentRunMode::CodexResume { session_id } => Ok(vec![
+                AgentRunMode::CodexResume { session_id, .. } => Ok(vec![
                     "exec".to_string(),
                     "resume".to_string(),
                     "--skip-git-repo-check".to_string(),
@@ -106,14 +106,90 @@ impl AgentSpawner for CliSpawner {
         let prompt = req.prompt.clone();
         let timeout = req.timeout;
         let args_result = Self::build_args(&agent, &req.mode);
+        let mode = req.mode.clone();
 
         Box::pin(async move {
             let bin = bin_opt
                 .ok_or_else(|| format!("spawn: no binary configured for '{agent}'"))?;
             let args = args_result?;
-            run_child(&agent, &bin, &args, &profile_dir, &cwd, &prompt, timeout).await
+            let mirror = materialize_codex_resume_session(&agent, &profile_dir, &mode)?;
+            let outcome = run_child(&agent, &bin, &args, &profile_dir, &cwd, &prompt, timeout).await;
+            if let Some(mirror) = mirror {
+                mirror.copy_back()?;
+            }
+            outcome
         })
     }
+}
+
+struct CodexSessionMirror {
+    source_path: PathBuf,
+    profile_path: PathBuf,
+}
+
+impl CodexSessionMirror {
+    fn copy_back(&self) -> Result<(), String> {
+        if !self.profile_path.exists() {
+            return Ok(());
+        }
+        copy_file_atomic(&self.profile_path, &self.source_path)
+            .map_err(|e| format!("codex session copy-back failed: {e}"))
+    }
+}
+
+fn materialize_codex_resume_session(
+    agent: &str,
+    profile_dir: &Path,
+    mode: &AgentRunMode,
+) -> Result<Option<CodexSessionMirror>, String> {
+    if agent != "codex" {
+        return Ok(None);
+    }
+    let AgentRunMode::CodexResume {
+        session_id,
+        transcript_path: Some(source_path),
+    } = mode
+    else {
+        return Ok(None);
+    };
+    let source_path = source_path
+        .canonicalize()
+        .map_err(|e| format!("codex transcript path invalid: {e}"))?;
+    let profile_path = codex_profile_session_path(profile_dir, session_id, &source_path);
+    copy_file_atomic(&source_path, &profile_path)
+        .map_err(|e| format!("codex session materialize failed: {e}"))?;
+    Ok(Some(CodexSessionMirror {
+        source_path,
+        profile_path,
+    }))
+}
+
+fn codex_profile_session_path(profile_dir: &Path, session_id: &str, source_path: &Path) -> PathBuf {
+    let components = source_path
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect::<Vec<_>>();
+    if let Some(pos) = components.iter().position(|c| c == "sessions") {
+        let mut target = profile_dir.to_path_buf();
+        for component in &components[pos..] {
+            target.push(component);
+        }
+        return target;
+    }
+    profile_dir
+        .join("sessions")
+        .join("agent-bus")
+        .join(format!("rollout-{session_id}.jsonl"))
+}
+
+fn copy_file_atomic(source: &Path, target: &Path) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = target.with_extension(format!("jsonl.tmp.{}", std::process::id()));
+    std::fs::copy(source, &tmp)?;
+    std::fs::rename(tmp, target)?;
+    Ok(())
 }
 
 async fn run_child(
@@ -321,6 +397,7 @@ mod tests {
         let mut r = req("codex", "hi again", tmp.path().to_path_buf());
         r.mode = AgentRunMode::CodexResume {
             session_id: "codex-session-123".to_string(),
+            transcript_path: None,
         };
         let outcome = spawner
             .spawn(&ctx("codex", profile), &r)
@@ -336,6 +413,56 @@ mod tests {
             outcome.stdout
         );
         assert!(outcome.stdout.contains("codex-ok: hi again"));
+    }
+
+    #[tokio::test]
+    async fn spawn_codex_resume_materializes_transcript_into_context_home_and_copies_back() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp
+            .path()
+            .join(".codex/sessions/2026/04/20/rollout-codex-session-123.jsonl");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            r#"{"type":"session_meta","payload":{"id":"codex-session-123","cwd":"/repo"}}"#,
+        )
+        .unwrap();
+
+        let bin = tmp.path().join("codex_append.sh");
+        std::fs::write(
+            &bin,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+target="$CODEX_HOME/sessions/2026/04/20/rollout-codex-session-123.jsonl"
+test -f "$target"
+printf '\n{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from profile"}]}}\n' >> "$target"
+echo codex-ok
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let profile = tmp.path().join("profile");
+        let spawner = CliSpawner::new().with_bin("codex", bin);
+        let mut r = req("codex", "hi again", tmp.path().to_path_buf());
+        r.mode = AgentRunMode::CodexResume {
+            session_id: "codex-session-123".to_string(),
+            transcript_path: Some(source.clone()),
+        };
+
+        let outcome = spawner
+            .spawn(&ctx("codex", profile.clone()), &r)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        let profile_copy =
+            profile.join("sessions/2026/04/20/rollout-codex-session-123.jsonl");
+        assert!(profile_copy.exists());
+        let copied_back = std::fs::read_to_string(&source).unwrap();
+        assert!(copied_back.contains("from profile"));
     }
 
     #[tokio::test]
