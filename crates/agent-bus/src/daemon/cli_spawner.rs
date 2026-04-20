@@ -67,11 +67,20 @@ impl CliSpawner {
                 }
                 Ok(args)
             }
-            "codex" => Ok(vec![
-                "exec".to_string(),
-                "--skip-git-repo-check".to_string(),
-                "-".to_string(),
-            ]),
+            "codex" => match mode {
+                AgentRunMode::CodexResume { session_id } => Ok(vec![
+                    "exec".to_string(),
+                    "resume".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    session_id.clone(),
+                    "-".to_string(),
+                ]),
+                _ => Ok(vec![
+                    "exec".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    "-".to_string(),
+                ]),
+            },
             "gemini" => Err("spawn: gemini not supported in 4a".to_string()),
             other => Err(format!("spawn: unknown agent '{other}'")),
         }
@@ -300,6 +309,33 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.stdout.contains("codex-ok: hi"));
         assert!(outcome.stdout.contains(&format!("[config={}]", profile.display())));
+    }
+
+    #[tokio::test]
+    async fn spawn_codex_resume_uses_exec_resume_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = tmp.path().to_path_buf();
+        let bin = fixture_dir().join("codex_ok.sh");
+        let spawner = CliSpawner::new().with_bin("codex", bin);
+
+        let mut r = req("codex", "hi again", tmp.path().to_path_buf());
+        r.mode = AgentRunMode::CodexResume {
+            session_id: "codex-session-123".to_string(),
+        };
+        let outcome = spawner
+            .spawn(&ctx("codex", profile), &r)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(
+            outcome
+                .stdout
+                .contains("[args=exec resume --skip-git-repo-check codex-session-123 -]"),
+            "stdout: {}",
+            outcome.stdout
+        );
+        assert!(outcome.stdout.contains("codex-ok: hi again"));
     }
 
     #[tokio::test]

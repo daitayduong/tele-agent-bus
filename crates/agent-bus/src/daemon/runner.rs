@@ -44,6 +44,7 @@ pub type SharedAgentRunner = Option<Arc<AgentRunner<crate::daemon::cli_spawner::
 pub enum AgentRunMode {
     Fresh,
     ClaudeResume { mobile_uuid: String },
+    CodexResume { session_id: String },
     WithMobileContext { mobile_uuid: String },
 }
 
@@ -687,6 +688,7 @@ fn scan_claude_jsonl_tail(
     let mobile_uuid = match &req.mode {
         AgentRunMode::ClaudeResume { mobile_uuid }
         | AgentRunMode::WithMobileContext { mobile_uuid } => mobile_uuid,
+        AgentRunMode::CodexResume { .. } => return None,
         AgentRunMode::Fresh => return None,
     };
     let path = ctx
