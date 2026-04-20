@@ -727,7 +727,8 @@ async fn flush_bridge_session<B: BotClient + ?Sized>(
         return Ok(());
     };
 
-    let result = session_bridge::sync_bridged_session(&mut bridge);
+    let result =
+        session_bridge::sync_bridged_session_locked(&chat_key, &agent_key, &mut bridge).await;
     match result {
         Ok(stats) => {
             state
@@ -854,8 +855,12 @@ pub async fn handle_list_codex_command<B: BotClient + ?Sized>(
     let sessions = match session_bridge::detect_codex_sessions(&codex_home, &repo.path, 10) {
         Ok(sessions) => sessions,
         Err(err) => {
-            bot.send_message(chat_id, format!("Failed to scan Codex sessions: {err}"), None)
-                .await?;
+            bot.send_message(
+                chat_id,
+                format!("Failed to scan Codex sessions: {err}"),
+                None,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -952,6 +957,16 @@ fn rewrite_codex_mobile_line(line: &str) -> String {
                 "sessionId".to_string(),
                 serde_json::json!(CODEX_MOBILE_SESSION_ID),
             );
+        }
+        if obj.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
+            if let Some(payload) = obj
+                .get_mut("payload")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if payload.contains_key("id") {
+                    payload.insert("id".to_string(), serde_json::json!(CODEX_MOBILE_SESSION_ID));
+                }
+            }
         }
     }
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
@@ -2359,8 +2374,8 @@ mod mobile_tests {
             profile_dir.display()
         );
         let cfg = AuthContextsConfig::parse(&yaml, dir.path()).unwrap();
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/fake-cli/codex_ok.sh");
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cli/codex_ok.sh");
         let spawner = CliSpawner::new().with_bin("codex", fixture);
         let events = EventLog::new(dir.path().join("events.jsonl"));
         let runner = Arc::new(AgentRunner::new(spawner, cfg, state.clone(), events));
@@ -2381,13 +2396,15 @@ mod mobile_tests {
         let sent = bot.sent_messages();
         assert!(sent.iter().any(|m| m.text.contains("codex thinking")));
         assert!(
-            sent.iter().any(|m| m.text.contains(
-                "[args=exec resume --skip-git-repo-check codex-session-xyz -]"
-            )),
+            sent.iter().any(|m| m
+                .text
+                .contains("[args=exec resume --skip-git-repo-check codex-session-xyz -]")),
             "messages: {:?}",
             sent.iter().map(|m| &m.text).collect::<Vec<_>>()
         );
-        assert!(sent.iter().any(|m| m.text.contains("codex-ok: continue this")));
+        assert!(sent
+            .iter()
+            .any(|m| m.text.contains("codex-ok: continue this")));
     }
 
     #[tokio::test]

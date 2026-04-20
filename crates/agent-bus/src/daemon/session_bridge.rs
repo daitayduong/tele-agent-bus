@@ -1,5 +1,7 @@
 use agent_bus_core::auth_context::AgentKind;
 use agent_bus_core::state::{BridgedSessionState, StateHandle};
+use anyhow::{anyhow, Context};
+use fs2::FileExt;
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -161,11 +163,7 @@ fn read_codex_session_meta(path: &Path) -> anyhow::Result<Option<CodexSessionInf
             .or_else(|| value.get("timestamp"))
             .and_then(Value::as_str)
             .and_then(|ts| {
-                time::OffsetDateTime::parse(
-                    ts,
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .ok()
+                time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok()
             })
             .map(|ts| ts.unix_timestamp().max(0) as u64)
             .unwrap_or(0);
@@ -295,6 +293,66 @@ pub struct BridgePollStats {
     pub errors: usize,
 }
 
+#[derive(Debug)]
+struct BridgeLock {
+    _file: std::fs::File,
+}
+
+pub async fn sync_bridged_session_locked(
+    chat_id: &str,
+    agent: &str,
+    bridge: &mut BridgedSessionState,
+) -> anyhow::Result<BridgeSyncStats> {
+    let lock_path = bridge_lock_path(chat_id, agent)?;
+    let _lock = tokio::task::spawn_blocking(move || acquire_bridge_lock(&lock_path))
+        .await
+        .context("session bridge lock task failed")??;
+    sync_bridged_session(bridge)
+}
+
+fn bridge_lock_path(chat_id: &str, agent: &str) -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("AGENT_BUS_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent-bus")))
+        .ok_or_else(|| anyhow!("HOME is not set"))?;
+    let lock_name = format!(
+        "session-bridge-{}-{}.lock",
+        sanitize_lock_component(chat_id),
+        sanitize_lock_component(agent)
+    );
+    Ok(home.join("locks").join(lock_name))
+}
+
+fn sanitize_lock_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn acquire_bridge_lock(path: &Path) -> anyhow::Result<BridgeLock> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create lock dir {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("failed to open session bridge lock {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("failed to lock session bridge {}", path.display()))?;
+    Ok(BridgeLock { _file: file })
+}
+
 /// Generic JSONL sync cycle with loop prevention and offset advancement.
 /// To be implemented in Code phase.
 pub fn sync_cycle(
@@ -336,11 +394,7 @@ pub fn sync_cycle(
             stats.skipped += 1;
             continue;
         }
-        let source_session_id = value
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let source_session_id = jsonl_session_id(&value).unwrap_or_default().to_string();
         rewrite_jsonl_session(&mut value, target_session_id);
         add_sync_metadata(&mut value, agent, direction, &source_session_id);
         rendered.push(serde_json::to_vec(&value)?);
@@ -368,8 +422,8 @@ pub fn sync_cycle(
 
 pub fn sync_bridged_session(bridge: &mut BridgedSessionState) -> anyhow::Result<BridgeSyncStats> {
     let agent = AgentKind::from_str(&bridge.agent)?;
-    let desktop_path = std::path::Path::new(&bridge.desktop_path);
-    let mobile_path = std::path::Path::new(&bridge.mobile_path);
+    let desktop_path = validate_bridge_path(Path::new(&bridge.desktop_path), true)?;
+    let mobile_path = validate_bridge_path(Path::new(&bridge.mobile_path), false)?;
     if desktop_path == mobile_path {
         let now = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -381,16 +435,16 @@ pub fn sync_bridged_session(bridge: &mut BridgedSessionState) -> anyhow::Result<
     let desktop_to_mobile = sync_cycle(
         agent,
         SyncDirection::DesktopToMobile,
-        desktop_path,
-        mobile_path,
+        &desktop_path,
+        &mobile_path,
         &mut bridge.sync.desktop_offset,
         &bridge.mobile_session_id,
     )?;
     let mobile_to_desktop = sync_cycle(
         agent,
         SyncDirection::MobileToDesktop,
-        mobile_path,
-        desktop_path,
+        &mobile_path,
+        &desktop_path,
         &mut bridge.sync.mobile_offset,
         &bridge.desktop_session_id,
     )?;
@@ -405,6 +459,52 @@ pub fn sync_bridged_session(bridge: &mut BridgedSessionState) -> anyhow::Result<
     })
 }
 
+fn validate_bridge_path(path: &Path, must_exist: bool) -> anyhow::Result<PathBuf> {
+    reject_symlink_components(path)?;
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize bridge path {}", path.display()));
+    }
+    if must_exist {
+        return Err(anyhow!(
+            "session bridge path does not exist: {}",
+            path.display()
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("session bridge path has no parent: {}", path.display()))?;
+    reject_symlink_components(parent)?;
+    let parent = parent.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize bridge path parent {}",
+            parent.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("session bridge path has no file name: {}", path.display()))?;
+    Ok(parent.join(file_name))
+}
+
+fn reject_symlink_components(path: &Path) -> anyhow::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            return Err(anyhow!(
+                "session bridge path contains symlink: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn sync_all_bridged_sessions_once(state: StateHandle) -> BridgePollStats {
     let snapshot = state.snapshot().await;
     let mut poll = BridgePollStats::default();
@@ -412,7 +512,7 @@ pub async fn sync_all_bridged_sessions_once(state: StateHandle) -> BridgePollSta
     for (chat_id, by_agent) in snapshot.bridged_sessions {
         for (agent, mut bridge) in by_agent {
             poll.sessions += 1;
-            match sync_bridged_session(&mut bridge) {
+            match sync_bridged_session_locked(&chat_id, &agent, &mut bridge).await {
                 Ok(stats) => {
                     poll.copied += stats.copied();
                     poll.skipped += stats.skipped();
@@ -482,7 +582,27 @@ fn rewrite_jsonl_session(value: &mut Value, target_session_id: &str) {
         if obj.contains_key("sessionId") {
             obj.insert("sessionId".to_string(), json!(target_session_id));
         }
+        if obj.get("type").and_then(Value::as_str) == Some("session_meta") {
+            if let Some(payload) = obj.get_mut("payload").and_then(Value::as_object_mut) {
+                if payload.contains_key("id") {
+                    payload.insert("id".to_string(), json!(target_session_id));
+                }
+            }
+        }
     }
+}
+
+fn jsonl_session_id(value: &Value) -> Option<&str> {
+    value.get("sessionId").and_then(Value::as_str).or_else(|| {
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_str)
+        } else {
+            None
+        }
+    })
 }
 
 fn add_sync_metadata(
@@ -626,6 +746,72 @@ mod tests {
         assert!(desktop_content.contains(r#""sourceSessionId":"mobile-id""#));
     }
 
+    #[test]
+    fn test_sync_rewrites_codex_session_meta_payload_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let desktop = dir.path().join("desktop.jsonl");
+        let mobile = dir.path().join("mobile.jsonl");
+
+        let mut f = std::fs::File::create(&desktop).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"session_meta","payload":{{"id":"desktop-id","cwd":"/repo"}}}}"#
+        )
+        .unwrap();
+
+        let mut offset = 0;
+        let stats = sync_cycle(
+            AgentKind::Codex,
+            SyncDirection::DesktopToMobile,
+            &desktop,
+            &mobile,
+            &mut offset,
+            "mobile-id",
+        )
+        .unwrap();
+
+        assert_eq!(stats.copied, 1);
+        let mobile_content = std::fs::read_to_string(&mobile).unwrap();
+        assert!(mobile_content.contains(r#""id":"mobile-id""#));
+        assert!(mobile_content.contains(r#""sourceSessionId":"desktop-id""#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sync_bridged_session_rejects_symlink_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_desktop = dir.path().join("desktop-real.jsonl");
+        let desktop_link = dir.path().join("desktop-link.jsonl");
+        let mobile = dir.path().join("mobile.jsonl");
+
+        let mut f = std::fs::File::create(&real_desktop).unwrap();
+        writeln!(f, r#"{{"sessionId":"desktop-id","text":"hello"}}"#).unwrap();
+        std::os::unix::fs::symlink(&real_desktop, &desktop_link).unwrap();
+        std::fs::File::create(&mobile).unwrap();
+
+        let mut bridge = BridgedSessionState {
+            agent: AgentKind::Claude.to_string(),
+            repo_id: "repo".to_string(),
+            desktop_session_id: "desktop-id".to_string(),
+            desktop_path: desktop_link.display().to_string(),
+            mobile_session_id: "mobile-id".to_string(),
+            mobile_path: mobile.display().to_string(),
+            selected_at: "2026-04-19T00:00:00Z".to_string(),
+            sync: agent_bus_core::state::SessionSyncCursor {
+                desktop_offset: 0,
+                mobile_offset: 0,
+                last_synced_at: None,
+                last_error: None,
+            },
+        };
+
+        let err = sync_bridged_session(&mut bridge).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_sync_all_bridged_sessions_once_persists_offsets_and_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -727,16 +913,10 @@ mod tests {
             r#"{"type":"session_meta","payload":{"id":"new","cwd":"/repo/","timestamp":"2026-04-19T11:00:00Z"}}"#,
         )
         .unwrap();
-        filetime::set_file_mtime(
-            &older,
-            filetime::FileTime::from_unix_time(1_700_000_000, 0),
-        )
-        .unwrap();
-        filetime::set_file_mtime(
-            &newer,
-            filetime::FileTime::from_unix_time(1_700_000_100, 0),
-        )
-        .unwrap();
+        filetime::set_file_mtime(&older, filetime::FileTime::from_unix_time(1_700_000_000, 0))
+            .unwrap();
+        filetime::set_file_mtime(&newer, filetime::FileTime::from_unix_time(1_700_000_100, 0))
+            .unwrap();
         std::fs::write(
             &other_repo,
             r#"{"type":"session_meta","payload":{"id":"other","cwd":"/elsewhere"}}"#,
