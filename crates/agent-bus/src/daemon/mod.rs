@@ -1,6 +1,7 @@
 pub mod auth_cmds;
 pub mod claude_headless;
 pub mod cli_spawner;
+pub mod codex_ipc;
 pub mod context_lock;
 pub mod inbox;
 pub mod mobile_session;

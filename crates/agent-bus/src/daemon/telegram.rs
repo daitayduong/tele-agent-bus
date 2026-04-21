@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::daemon::auth_cmds;
 use crate::daemon::claude_headless;
+use crate::daemon::codex_ipc::{CodexIpcClient, CodexIpcError};
 use crate::daemon::mobile_session::{
     self, MobileCommand, SessionInfo, ARCHIVE_RETENTION, MOBILE_UUID,
 };
@@ -671,15 +672,6 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
     let Some(repo) = repo_by_id(config, &bridge.repo_id) else {
         return Err(TelegramError::UnknownRepo(bridge.repo_id.clone()));
     };
-    let Some(runner) = agent_runner else {
-        bot.send_message(
-            chat_id,
-            "Codex session bridge requires auth-contexts.yaml / AgentRunner.".to_string(),
-            None,
-        )
-        .await?;
-        return Ok(());
-    };
     if let Err(err) =
         session_bridge::sync_bridged_session_locked(&chat_id.to_string(), "codex", &mut bridge)
             .await
@@ -701,20 +693,42 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
         .ok();
 
     let prompt = codex_bridge_prompt(&bridge, repo, &body);
-    let reply = run_agent_via_runner(
-        runner,
-        AgentKind::Codex,
-        &bridge.repo_id,
-        PathBuf::from(&repo.path),
-        prompt,
-        AgentRunMode::CodexResume {
-            session_id: bridge.desktop_session_id.clone(),
-            transcript_path: Some(PathBuf::from(&bridge.desktop_path)),
-        },
-        Duration::from_secs(claude_headless::resolved_timeout_secs()),
-        chat_id,
-    )
-    .await;
+    let timeout = Duration::from_secs(claude_headless::resolved_timeout_secs());
+    let reply = match run_codex_bridge_via_desktop_ipc(&bridge, &prompt, timeout).await {
+        Ok(reply) => Ok(reply),
+        Err(CodexBridgeIpcRunError::Fallback(reason)) => {
+            tracing::warn!(
+                target: "agent_bus::session_bridge",
+                desktop_session_id = %bridge.desktop_session_id,
+                reason = %reason,
+                "falling back to Codex CLI resume because desktop IPC is unavailable"
+            );
+            let Some(runner) = agent_runner else {
+                bot.send_message(
+                    chat_id,
+                    "Codex session bridge requires a live desktop Codex session or auth-contexts.yaml / AgentRunner.".to_string(),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            };
+            run_agent_via_runner(
+                runner,
+                AgentKind::Codex,
+                &bridge.repo_id,
+                PathBuf::from(&repo.path),
+                prompt,
+                AgentRunMode::CodexResume {
+                    session_id: bridge.desktop_session_id.clone(),
+                    transcript_path: Some(PathBuf::from(&bridge.desktop_path)),
+                },
+                timeout,
+                chat_id,
+            )
+            .await
+        }
+        Err(CodexBridgeIpcRunError::StartedButNoReply(message)) => Err(message),
+    };
 
     let reply = match reply {
         Ok(out) => out,
@@ -749,6 +763,49 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
+}
+
+enum CodexBridgeIpcRunError {
+    Fallback(String),
+    StartedButNoReply(String),
+}
+
+async fn run_codex_bridge_via_desktop_ipc(
+    bridge: &BridgedSessionState,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, CodexBridgeIpcRunError> {
+    let desktop_path = PathBuf::from(&bridge.desktop_path);
+    let start_offset = std::fs::metadata(&desktop_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+
+    CodexIpcClient::default()
+        .start_thread_follower_turn(
+            &bridge.desktop_session_id,
+            prompt,
+            Duration::from_secs(8),
+        )
+        .await
+        .map_err(|err| match err {
+            CodexIpcError::Unavailable(reason)
+            | CodexIpcError::Protocol(reason)
+            | CodexIpcError::RequestFailed(reason) => CodexBridgeIpcRunError::Fallback(reason),
+            CodexIpcError::NoLiveOwner => {
+                CodexBridgeIpcRunError::Fallback("desktop session is not open".to_string())
+            }
+            CodexIpcError::Timeout => CodexBridgeIpcRunError::StartedButNoReply(
+                "Codex desktop IPC timed out before confirming the turn. Check the desktop Codex session before retrying to avoid duplicate work.".to_string(),
+            ),
+        })?;
+
+    session_bridge::wait_for_codex_desktop_reply(desktop_path, start_offset, timeout)
+        .await
+        .map_err(|err| {
+            CodexBridgeIpcRunError::StartedButNoReply(format!(
+                "Codex desktop accepted the Telegram turn, but agent-bus could not observe a completed reply in the desktop transcript: {err}"
+            ))
+        })
 }
 
 fn codex_bridge_prompt(
@@ -2479,14 +2536,12 @@ mod mobile_tests {
         assert!(sent
             .iter()
             .any(|m| m.text.contains("[agent-bus session bridge]")));
-        assert!(sent
-            .iter()
-            .any(|m| m.text.contains("User message from Telegram:\ncontinue this")));
-        assert!(
-            profile_dir
-                .join("sessions/agent-bus/rollout-codex-session-xyz.jsonl")
-                .exists()
-        );
+        assert!(sent.iter().any(|m| m
+            .text
+            .contains("User message from Telegram:\ncontinue this")));
+        assert!(profile_dir
+            .join("sessions/agent-bus/rollout-codex-session-xyz.jsonl")
+            .exists());
     }
 
     #[tokio::test]
@@ -2802,11 +2857,9 @@ mod mobile_tests {
         assert!(sent
             .iter()
             .any(|m| m.text.contains("OK, vậy là đúng rồi. Good job")));
-        assert!(
-            profile_dir
-                .join("sessions/agent-bus/rollout-codex-session-xyz.jsonl")
-                .exists()
-        );
+        assert!(profile_dir
+            .join("sessions/agent-bus/rollout-codex-session-xyz.jsonl")
+            .exists());
     }
 
     #[tokio::test]

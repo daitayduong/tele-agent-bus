@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context};
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -459,6 +459,128 @@ pub fn sync_bridged_session(bridge: &mut BridgedSessionState) -> anyhow::Result<
     })
 }
 
+pub async fn wait_for_codex_desktop_reply(
+    desktop_path: PathBuf,
+    start_offset: u64,
+    timeout: std::time::Duration,
+) -> anyhow::Result<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut offset = start_offset;
+    let mut last_agent_message = None;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("timed out waiting for Codex desktop reply"));
+        }
+
+        if let Some(reply) =
+            read_codex_reply_delta(&desktop_path, &mut offset, &mut last_agent_message)?
+        {
+            return Ok(reply);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+fn read_codex_reply_delta(
+    path: &Path,
+    offset: &mut u64,
+    last_agent_message: &mut Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let mut file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let len = file.metadata()?.len();
+    if len <= *offset {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(*offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let Some(last_newline) = bytes.iter().rposition(|b| *b == b'\n') else {
+        return Ok(None);
+    };
+    let complete_len = last_newline + 1;
+    let complete = &bytes[..complete_len];
+
+    for line in complete.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if let Some(message) = codex_agent_message(&value) {
+            *last_agent_message = Some(message);
+        }
+        if is_codex_task_complete(&value) {
+            if let Some(message) =
+                codex_task_complete_message(&value).or_else(|| last_agent_message.clone())
+            {
+                *offset += complete_len as u64;
+                return Ok(Some(message));
+            }
+        }
+    }
+
+    *offset += complete_len as u64;
+    Ok(None)
+}
+
+fn codex_agent_message(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) == Some("event_msg") {
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) == Some("agent_message") {
+            return payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+    }
+
+    if value.get("type").and_then(Value::as_str) == Some("response_item") {
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) == Some("message")
+            && payload.get("role").and_then(Value::as_str) == Some("assistant")
+        {
+            let mut parts = Vec::new();
+            for item in payload.get("content")?.as_array()? {
+                if item.get("type").and_then(Value::as_str) == Some("output_text") {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            if !parts.is_empty() {
+                return Some(parts.join("\n"));
+            }
+        }
+    }
+
+    None
+}
+
+fn is_codex_task_complete(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            == Some("task_complete")
+}
+
+fn codex_task_complete_message(value: &Value) -> Option<String> {
+    value
+        .get("payload")
+        .and_then(|payload| payload.get("last_agent_message"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn validate_bridge_path(path: &Path, must_exist: bool) -> anyhow::Result<PathBuf> {
     reject_symlink_components(path)?;
     if path.exists() {
@@ -774,6 +896,62 @@ mod tests {
         let mobile_content = std::fs::read_to_string(&mobile).unwrap();
         assert!(mobile_content.contains(r#""id":"mobile-id""#));
         assert!(mobile_content.contains(r#""sourceSessionId":"desktop-id""#));
+    }
+
+    #[tokio::test]
+    async fn wait_for_codex_desktop_reply_returns_last_agent_message_on_task_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let desktop = dir.path().join("desktop.jsonl");
+        {
+            let mut f = std::fs::File::create(&desktop).unwrap();
+            writeln!(f, r#"{{"type":"session_meta","payload":{{"id":"s1"}}}}"#).unwrap();
+        }
+        let offset = std::fs::metadata(&desktop).unwrap().len();
+        {
+            let mut f = OpenOptions::new().append(true).open(&desktop).unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"first reply"}}}}"#
+            )
+            .unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"final reply"}}}}"#
+            )
+            .unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"event_msg","payload":{{"type":"task_complete"}}}}"#
+            )
+            .unwrap();
+        }
+
+        let reply =
+            wait_for_codex_desktop_reply(desktop, offset, std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+        assert_eq!(reply, "final reply");
+    }
+
+    #[tokio::test]
+    async fn wait_for_codex_desktop_reply_reads_task_complete_last_agent_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let desktop = dir.path().join("desktop.jsonl");
+        let offset = 0;
+        {
+            let mut f = std::fs::File::create(&desktop).unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"event_msg","payload":{{"type":"task_complete","last_agent_message":"done from payload"}}}}"#
+            )
+            .unwrap();
+        }
+
+        let reply =
+            wait_for_codex_desktop_reply(desktop, offset, std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+        assert_eq!(reply, "done from payload");
     }
 
     #[cfg(unix)]
