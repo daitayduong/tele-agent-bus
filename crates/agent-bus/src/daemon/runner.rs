@@ -1,5 +1,4 @@
-//! Phase 4a — `AgentRunner` orchestration (§5 of
-//! `docs/specs/phase4-quota-rotation-lead.md`).
+//! `AgentRunner` orchestration for agent CLI execution and auth rotation.
 //!
 //! Wraps CLI invocation with:
 //! - candidate auth-context resolution

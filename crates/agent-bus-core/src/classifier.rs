@@ -1,4 +1,4 @@
-//! Phase 4a — Failure classifier (§6 of `docs/specs/phase4-quota-rotation-lead.md`).
+//! Failure classifier for agent CLI runs.
 //!
 //! Maps CLI run output `(exit_code, stdout, stderr, timed_out)` to a
 //! [`ResultKind`] used by `AgentRunner` for rotation decisions and audit logs.
@@ -9,7 +9,7 @@
 //!   declaration order, stderr first then stdout.
 //! - `timed_out=true` always classifies as [`ResultKind::Timeout`] in v1.
 //!   Pattern-aware timeout (e.g. "timed out while showing rate-limit text")
-//!   is left for a future stretch (spec §6.2).
+//!   is left for a future stretch.
 //! - Unknown non-zero exit → [`ResultKind::UnknownFailure`] (never rotates
 //!   automatically unless explicitly configured by policy).
 

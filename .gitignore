@@ -21,3 +21,8 @@ Thumbs.db
 # Test artifacts
 *.profraw
 tarpaulin-report.html
+
+# Internal planning/spec drafts
+/docs/spec.md
+/docs/phase2a-mvp.md
+/docs/specs/

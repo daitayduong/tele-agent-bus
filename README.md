@@ -2,7 +2,7 @@
 
 Multi-agent orchestration daemon (Claude Code / Gemini CLI / Codex CLI) over Telegram.
 
-**Status:** v0.1.0. See `docs/spec.md` for the full specification.
+**Status:** v0.1.0.
 
 ## Overview
 

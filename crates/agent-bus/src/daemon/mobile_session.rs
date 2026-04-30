@@ -1,7 +1,5 @@
 //! Phase 3 — Mobile Claude session management.
 //!
-//! See docs/specs/phase3-mobile-claude-session.md.
-//!
 //! This module implements session forking, active-session detection, delta extraction,
 //! and command parsing for the Telegram-controlled mobile Claude workflow.
 

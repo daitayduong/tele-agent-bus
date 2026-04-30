@@ -1,4 +1,4 @@
-//! Phase 4 — Auth context registry (§4.1 of `docs/specs/phase4-quota-rotation-lead.md`).
+//! Auth context registry for per-agent OAuth/profile rotation.
 //!
 //! Loads `~/.agent-bus/auth-contexts.yaml` with strict path/id validation.
 //! Pure parsing + string-level safety. Filesystem-level checks (mode 0700,
