@@ -32,17 +32,23 @@ pub fn parse_bridge_command(text: &str) -> Option<BridgeCommand> {
     }
 
     // AC-SB2: Generic Command Parser
-    // @list_claude
-    // @ls_cl_ses (legacy alias)
+    // /list_claude
+    // /ls_cl_ses (legacy alias)
     // @flush_claude
     // @flush_mobile (legacy alias)
     // @claude hi
 
-    if trimmed == "@list_claude" || trimmed == "@ls_cl_ses" {
+    if matches!(
+        trimmed,
+        "/list_claude" | "/ls_cl_ses"
+    ) {
         return Some(BridgeCommand::List(AgentKind::Claude));
     }
-    if trimmed == "@list_codex" {
+    if trimmed == "/list_codex" {
         return Some(BridgeCommand::List(AgentKind::Codex));
+    }
+    if trimmed == "/list_gemini" {
+        return Some(BridgeCommand::List(AgentKind::Gemini));
     }
     if trimmed == "@flush_claude" || trimmed == "@flush_mobile" {
         return Some(BridgeCommand::Flush(AgentKind::Claude));
@@ -1174,17 +1180,22 @@ mod tests {
     #[test]
     fn test_parse_list_commands() {
         assert_eq!(
-            parse_bridge_command("@list_claude"),
+            parse_bridge_command("/list_claude"),
             Some(BridgeCommand::List(AgentKind::Claude))
         );
         assert_eq!(
-            parse_bridge_command("@ls_cl_ses"),
+            parse_bridge_command("/ls_cl_ses"),
             Some(BridgeCommand::List(AgentKind::Claude))
         );
         assert_eq!(
-            parse_bridge_command("@list_codex"),
+            parse_bridge_command("/list_codex"),
             Some(BridgeCommand::List(AgentKind::Codex))
         );
+        assert_eq!(
+            parse_bridge_command("/list_gemini"),
+            Some(BridgeCommand::List(AgentKind::Gemini))
+        );
+        assert_eq!(parse_bridge_command("@list_codex"), None);
     }
 
     #[test]

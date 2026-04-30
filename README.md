@@ -151,8 +151,11 @@ Hot-reloading the repo registry is tracked in `TASKS.md`.
 ## Telegram Commands
 
 - `/list_rp` lists registered repositories and shows buttons to select the default repo for the current chat.
-- `/switch_rp <repo_id>` sets the current chat's default repo.
+- `/switch_rp` shows repository buttons and sets the current chat's default repo.
 - `/current` shows the current default repo.
+- `/list_claude` lists Claude desktop sessions for the current repo.
+- `/list_codex` lists Codex desktop sessions for the current repo.
+- `/list_gemini` reports that Gemini desktop session bridging is not implemented yet.
 - `@claude <message>` sends a message to the selected Claude session.
 - `@codex <message>` sends a message to the selected Codex session.
 - `@agent:<repo_id> <message>` routes explicitly to a repo and bypasses the default repo selection.

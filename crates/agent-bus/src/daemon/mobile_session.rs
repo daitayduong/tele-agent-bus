@@ -256,7 +256,7 @@ pub fn detect_active_sessions(
     Ok(sessions)
 }
 
-/// Build the inline keyboard rows for the `@list_claude` reply card.
+/// Build the inline keyboard rows for the `/list_claude` reply card.
 /// Each row is a Vec of (button_text, callback_data) tuples.
 pub fn build_session_cards(sessions: &[SessionInfo]) -> Vec<Vec<(String, String)>> {
     let now = OffsetDateTime::now_utc();
@@ -422,13 +422,17 @@ pub fn rotate_archives(archive_dir: &Path, keep: usize) -> Result<Vec<PathBuf>> 
 /// Parse a Telegram inbound text into a `MobileCommand`. Returns `None` if no match.
 ///
 /// Matches:
-///   - `@list_claude` or `@ls_cl_ses` (any case, leading whitespace allowed) → ListClaude
+///   - `/list_claude` or `/ls_cl_ses`
+///     (any case, leading whitespace allowed) → ListClaude
 ///   - `@flush_mobile` → FlushMobile
 ///   - `@claude <msg>` (with non-empty body) → ClaudeMsg(body.trim())
 pub fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
     let trimmed = text.trim();
     let lower = trimmed.to_lowercase();
-    if lower == "@list_claude" || lower == "@ls_cl_ses" {
+    if matches!(
+        lower.as_str(),
+        "/list_claude" | "/ls_cl_ses"
+    ) {
         return Some(MobileCommand::ListClaude);
     }
     if lower == "@flush_mobile" {
@@ -721,17 +725,18 @@ mod tests {
     #[test]
     fn test_parse_mobile_command_list_aliases() {
         assert_eq!(
-            parse_mobile_command("@list_claude"),
+            parse_mobile_command("/list_claude"),
             Some(MobileCommand::ListClaude)
         );
         assert_eq!(
-            parse_mobile_command("@ls_cl_ses"),
+            parse_mobile_command("/ls_cl_ses"),
             Some(MobileCommand::ListClaude)
         );
         assert_eq!(
-            parse_mobile_command("  @LIST_CLAUDE  "),
+            parse_mobile_command("  /LIST_CLAUDE  "),
             Some(MobileCommand::ListClaude)
         );
+        assert_eq!(parse_mobile_command("@list_claude"), None);
     }
 
     #[test]

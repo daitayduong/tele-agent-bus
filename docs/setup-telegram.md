@@ -112,7 +112,9 @@ Send these messages to your bot:
 ```text
 /list_rp
 /current
-/switch_rp <repo_id>
+/switch_rp
+/list_claude
+/list_codex
 ```
 
 Use `agent-bus repo list` locally to see repo IDs.

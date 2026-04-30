@@ -633,7 +633,7 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
         BridgeCommand::List(agent) | BridgeCommand::Flush(agent) => {
             bot.send_message(
                 chat_id,
-                format!("@list_{agent} / @flush_{agent} bridge is not implemented yet."),
+                format!("/list_{agent} / @flush_{agent} bridge is not implemented yet."),
                 None,
             )
             .await?;
@@ -642,7 +642,7 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
         BridgeCommand::Chat(agent, _) => {
             bot.send_message(
                 chat_id,
-                format!("@{agent} session bridge is not implemented yet. Use @list_{agent} first once the provider is available."),
+                format!("@{agent} session bridge is not implemented yet. Use /list_{agent} first once the provider is available."),
                 None,
             )
             .await?;
@@ -674,7 +674,7 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
     else {
         bot.send_message(
             chat_id,
-            "No codex session selected. Send @list_codex first.".to_string(),
+            "No codex session selected. Send /list_codex first.".to_string(),
             None,
         )
         .await?;
@@ -1272,7 +1272,7 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
     else {
         bot.send_message(
             chat_id,
-            "⚠️ No Claude session selected. Send @list_claude first to pick a desktop session."
+            "⚠️ No Claude session selected. Send /list_claude first to pick a desktop session."
                 .to_string(),
             None,
         )
@@ -2065,7 +2065,7 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(&bot, &config, state, &None, 100, None, "@list_claude", None)
+        handle_text_command(&bot, &config, state, &None, 100, None, "/list_claude", None)
             .await
             .unwrap();
 
@@ -2195,7 +2195,7 @@ mod mobile_tests {
             .unwrap();
         state.set_default_repo("100", "sample_repo").await.unwrap();
 
-        handle_text_command(&bot, &config, state, &None, 100, None, "@list_codex", None)
+        handle_text_command(&bot, &config, state, &None, 100, None, "/list_codex", None)
             .await
             .unwrap();
         *CODEX_HOME_OVERRIDE.lock().unwrap() = None;
@@ -2328,6 +2328,27 @@ mod mobile_tests {
     }
 
     #[tokio::test]
+    async fn list_gemini_reports_bridge_not_implemented() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(&bot, &config, state, &None, 100, None, "/list_gemini", None)
+            .await
+            .unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(
+            sent[0].text.contains("/list_gemini"),
+            "expected slash command guidance, got: {:?}",
+            sent[0].text
+        );
+    }
+
+    #[tokio::test]
     async fn codex_chat_uses_selected_session_via_runner() {
         use crate::daemon::cli_spawner::CliSpawner;
         use crate::daemon::runner::{AgentRunner, EventLog};
@@ -2432,7 +2453,7 @@ mod mobile_tests {
             .await
             .unwrap();
 
-        handle_text_command(&bot, &config, state, &None, 999, None, "@list_claude", None)
+        handle_text_command(&bot, &config, state, &None, 999, None, "/list_claude", None)
             .await
             .unwrap();
 
