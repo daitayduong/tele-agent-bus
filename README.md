@@ -152,6 +152,7 @@ Hot-reloading the repo registry is tracked in `TASKS.md`.
 
 - `/list_rp` lists registered repositories and shows buttons to select the default repo for the current chat.
 - `/switch_rp` shows repository buttons and sets the current chat's default repo.
+- `/switch_rp <repo_id>` switches directly to a repo without showing the picker.
 - `/current` shows the current default repo.
 - `/list_claude` lists Claude desktop sessions for the current repo.
 - `/list_codex` lists Codex desktop sessions for the current repo.

@@ -113,11 +113,14 @@ Send these messages to your bot:
 /list_rp
 /current
 /switch_rp
+/switch_rp <repo_id>
 /list_claude
 /list_codex
 ```
 
-Use `agent-bus repo list` locally to see repo IDs.
+Use `/switch_rp` without arguments to choose from Telegram buttons. Use
+`/switch_rp <repo_id>` when you already know the repo ID. Run
+`agent-bus repo list` locally to see repo IDs.
 
 After adding or removing repos, restart the daemon so Telegram sees the updated
 registry:
