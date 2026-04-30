@@ -140,8 +140,8 @@ agents:
   claude:
     mode: ide-first
 repos:
-  - id: rallyup
-    path: ~/Projects/RallyUp
+  - id: sample_repo
+    path: ~/Projects/SampleRepo
     agents: [claude]
 ";
         let config = Config::load_from_str(yaml).unwrap();
@@ -149,7 +149,7 @@ repos:
         assert_eq!(config.telegram.bot_token, "plain-token");
         assert_eq!(config.permissions.fail_mode, FailMode::Hybrid);
         assert!(config.agents.contains_key("claude"));
-        assert_eq!(config.repos[0].id, "rallyup");
+        assert_eq!(config.repos[0].id, "sample_repo");
     }
 
     #[test]
@@ -167,8 +167,21 @@ repos: []
 ";
         let config = Config::load_from_str(yaml).unwrap();
         assert_eq!(config.permissions.timeout_seconds, 30);
-    
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReposFile {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    repos: Vec<RepoConfig>,
+}
+
+pub fn load_repos_from_path<P: AsRef<Path>>(path: P) -> Result<Vec<RepoConfig>, ConfigError> {
+    let s = std::fs::read_to_string(path)?;
+    let file: ReposFile = serde_yaml::from_str(&s)?;
+    Ok(file.repos)
 }
 
 fn default_timeout_seconds() -> u64 {

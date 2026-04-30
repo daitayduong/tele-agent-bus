@@ -17,13 +17,14 @@ agent-bus-proto = { path = "../agent-bus-proto" }
 agent-bus-core = { path = "../agent-bus-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yaml.workspace = true
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 teloxide = { workspace = true }
+reqwest = { workspace = true }
 clap = { workspace = true }
 axum = { workspace = true }
 hyper = { workspace = true }
@@ -35,9 +36,13 @@ hex = { workspace = true }
 time = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
+nix.workspace = true
+shellexpand = "3.1.2"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 mockall = { workspace = true }
+filetime = "0.2"

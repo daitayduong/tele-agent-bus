@@ -1,10 +1,10 @@
+use crate::cli::get_bus_home;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use crate::cli::get_bus_home;
 
 pub fn run() -> anyhow::Result<()> {
     let bus_home = get_bus_home();
-    
+
     if !bus_home.exists() {
         fs::create_dir_all(&bus_home)?;
         #[cfg(unix)]
@@ -57,7 +57,7 @@ mod tests {
     fn test_init_writes_bot_token_env_var() {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("AGENT_BUS_HOME", dir.path());
-        
+
         run().unwrap();
 
         let config_path = dir.path().join("config.yaml");

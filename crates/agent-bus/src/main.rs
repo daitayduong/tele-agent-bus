@@ -4,8 +4,9 @@
 mod cli;
 mod daemon;
 
-use clap::{Parser, Subcommand};
+use crate::cli::auth::RegisterArgs;
 use crate::cli::blacklist::BlacklistCommands;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "agent-bus")]
@@ -34,8 +35,38 @@ enum Commands {
         #[command(subcommand)]
         command: BlacklistCommands,
     },
+    /// Auth-context management (per-agent OAuth profiles for rotation)
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
     /// Start the agent-bus daemon
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Register a new auth context (creates profile_dir with 0700)
+    Register {
+        agent: String,
+        id: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        require_owner_approval: bool,
+    },
+    /// Launch the provider's `login` flow inside the context's profile_dir
+    Login { agent: String, id: String },
+    /// List registered auth contexts
+    List { agent: Option<String> },
+    /// Mark a context as the persistent active one for its agent
+    Use { agent: String, id: String },
+    /// Disable a context (enabled=false)
+    Pause { agent: String, id: String },
+    /// Re-enable a context (enabled=true)
+    Resume { agent: String, id: String },
+    /// Quick health check: run `<bin> --version` under the context env
+    Recheck { agent: String, id: String },
 }
 
 #[derive(Subcommand)]
@@ -46,6 +77,8 @@ enum RepoCommands {
     List,
     /// Remove a repository by ID
     Remove { id: String },
+    /// Install the Claude Code permission hook for a repository
+    InstallHook { path: String },
 }
 
 #[derive(Subcommand)]
@@ -65,12 +98,36 @@ fn main() -> anyhow::Result<()> {
             RepoCommands::Add { path } => cli::repo::add(&path)?,
             RepoCommands::List => cli::repo::list()?,
             RepoCommands::Remove { id } => cli::repo::remove(&id)?,
+            RepoCommands::InstallHook { path } => cli::repo::install_hook(&path)?,
         },
         Commands::Config { command } => match command {
             ConfigCommands::Show => cli::config::show()?,
             ConfigCommands::Validate => cli::config::validate()?,
         },
         Commands::Blacklist { command } => cli::blacklist::handle(command)?,
+        Commands::Auth { command } => match command {
+            AuthCommands::Register {
+                agent,
+                id,
+                label,
+                require_owner_approval,
+            } => cli::auth::register(RegisterArgs {
+                agent,
+                id,
+                label,
+                require_owner_approval: if require_owner_approval {
+                    Some(true)
+                } else {
+                    None
+                },
+            })?,
+            AuthCommands::Login { agent, id } => cli::auth::login(agent, id)?,
+            AuthCommands::List { agent } => cli::auth::list(agent)?,
+            AuthCommands::Use { agent, id } => cli::auth::set_use(agent, id)?,
+            AuthCommands::Pause { agent, id } => cli::auth::pause(agent, id)?,
+            AuthCommands::Resume { agent, id } => cli::auth::resume(agent, id)?,
+            AuthCommands::Recheck { agent, id } => cli::auth::recheck(agent, id)?,
+        },
         Commands::Daemon => {
             tracing_subscriber::fmt::init();
             let config = daemon::load_daemon_config()?;

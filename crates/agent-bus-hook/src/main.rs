@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -185,10 +186,41 @@ fn socket_path() -> Result<PathBuf, HookError> {
 }
 
 fn repo_hint(cwd: &str) -> Option<String> {
-    std::path::Path::new(cwd)
+    let path = std::path::Path::new(cwd);
+    let display = path
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.to_ascii_lowercase())
+        .map(slugify)?;
+    let canonical = path.canonicalize().ok()?;
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let hash = hex::encode(digest);
+    Some(format!("{display}_{}", &hash[..8]))
+}
+
+fn slugify(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+
+    for byte in input.bytes() {
+        let ch = byte.to_ascii_lowercase() as char;
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+
+    while out.ends_with('-') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        "repo".to_string()
+    } else {
+        out
+    }
 }
 
 fn monotonic_nanos() -> u128 {
@@ -258,10 +290,13 @@ mod tests {
 
     #[test]
     fn request_body_matches_daemon_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("SampleRepo");
+        std::fs::create_dir(&repo).unwrap();
         let input = json!({
             "session_id": "sess-1",
             "tool_name": "Bash",
-            "cwd": "/tmp/RallyUp",
+            "cwd": repo,
             "tool_input": {"command": "ls"}
         });
 
@@ -271,6 +306,6 @@ mod tests {
         assert_eq!(body["session_id"], "sess-1");
         assert_eq!(body["tool"], "Bash");
         assert_eq!(body["command"], "ls");
-        assert_eq!(body["repo_id"], "rallyup");
+        assert!(body["repo_id"].as_str().unwrap().starts_with("samplerepo_"));
     }
 }

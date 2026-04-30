@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::auth_context::AgentKind;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -37,6 +39,102 @@ pub struct StateSnapshot {
     pub tg_offset: Option<i64>,
     pub sessions: BTreeMap<String, SessionState>,
     pub pending_perms: BTreeMap<String, PendingPerm>,
+    #[serde(default)]
+    pub mobile_sessions: BTreeMap<String, MobileSessionState>,
+    // Phase 4 additions (AC-Q9 backward-compat via serde defaults):
+    #[serde(default)]
+    pub auth_context_status: BTreeMap<String, BTreeMap<String, AuthContextStatus>>,
+    #[serde(default)]
+    pub active_auth_context: BTreeMap<String, String>,
+    #[serde(default)]
+    pub pending_rotations: BTreeMap<String, PendingRotation>,
+    #[serde(default)]
+    pub lead_overrides: LeadOverrides,
+    // Phase 5 additions:
+    #[serde(default)]
+    pub bridged_sessions: BTreeMap<String, BTreeMap<String, BridgedSessionState>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgedSessionState {
+    pub agent: String,
+    pub repo_id: String,
+    pub desktop_session_id: String,
+    pub desktop_path: String,
+    pub mobile_session_id: String,
+    pub mobile_path: String,
+    pub selected_at: String,
+    pub sync: SessionSyncCursor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSyncCursor {
+    pub desktop_offset: u64,
+    pub mobile_offset: u64,
+    pub last_synced_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LeadOverrides {
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub per_chat: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthContextStatusKind {
+    Available,
+    QuotaExhausted,
+    RateLimited,
+    AuthExpiringSoon,
+    AuthExpired,
+    ManualReauthRequired,
+    Disabled,
+    UnknownFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthContextStatus {
+    pub status: AuthContextStatusKind,
+    #[serde(default)]
+    pub cooldown_until: Option<String>, // RFC3339
+    #[serde(default)]
+    pub last_event_id: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingRotationStatus {
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingRotation {
+    pub id: String,
+    pub agent: String,
+    pub from: String,
+    pub to: String,
+    pub repo_id: String,
+    pub request_id: String,
+    pub chat_id: i64,
+    pub expires_at: String,
+    pub status: PendingRotationStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MobileSessionState {
+    pub mobile_uuid: String,
+    pub mobile_fork_source: String,
+    pub mobile_forked_at: String,
+    pub project_hash: String,
+    pub repo_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,7 +146,7 @@ pub struct SessionState {
     pub pid: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingPermStatus {
     Pending,
@@ -56,6 +154,25 @@ pub enum PendingPermStatus {
     Approved,
     Denied,
     TimedOut,
+    ApprovedByTelegram,
+    DeniedByTelegram,
+    ApprovedByDesktop,
+    DeniedByDesktop,
+    Cancelled,
+    Superseded,
+}
+
+impl PendingPermStatus {
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Pending | Self::Sent)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvePendingOutcome {
+    Resolved,
+    AlreadyResolved(PendingPermStatus),
+    Missing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +194,12 @@ impl Default for StateSnapshot {
             tg_offset: None,
             sessions: BTreeMap::new(),
             pending_perms: BTreeMap::new(),
+            mobile_sessions: BTreeMap::new(),
+            auth_context_status: BTreeMap::new(),
+            active_auth_context: BTreeMap::new(),
+            pending_rotations: BTreeMap::new(),
+            lead_overrides: LeadOverrides::default(),
+            bridged_sessions: BTreeMap::new(),
         }
     }
 }
@@ -106,8 +229,61 @@ enum StateCmd {
         verdict: PendingPermStatus,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
+    ResolvePendingIfOpen {
+        id: String,
+        verdict: PendingPermStatus,
+        reply: oneshot::Sender<Result<ResolvePendingOutcome, StateError>>,
+    },
     ExpirePending {
         id: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetMobileSession {
+        chat_id: String,
+        mobile: MobileSessionState,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetBridgedSession {
+        chat_id: String,
+        agent: String,
+        bridge: BridgedSessionState,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ClearMobileSession {
+        chat_id: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetAuthContextStatus {
+        agent: String,
+        id: String,
+        status: AuthContextStatus,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetActiveAuthContext {
+        agent: String,
+        id: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    InsertPendingRotation {
+        rotation: PendingRotation,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ResolvePendingRotation {
+        id: String,
+        status: PendingRotationStatus,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetLeadDefault {
+        agent: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetLeadForChat {
+        chat_id: String,
+        agent: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ClearLeadForChat {
+        chat_id: String,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
 }
@@ -160,6 +336,23 @@ impl StateHandle {
         rx.await.map_err(|_| StateError::ActorClosed)?
     }
 
+    pub async fn resolve_pending_if_open(
+        &self,
+        id: impl Into<String>,
+        verdict: PendingPermStatus,
+    ) -> Result<ResolvePendingOutcome, StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ResolvePendingIfOpen {
+                id: id.into(),
+                verdict,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
     pub async fn expire_pending(&self, id: impl Into<String>) -> Result<(), StateError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -170,6 +363,176 @@ impl StateHandle {
             .await
             .map_err(|_| StateError::ActorClosed)?;
         rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_mobile_session(
+        &self,
+        chat_id: impl Into<String>,
+        mobile: MobileSessionState,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetMobileSession {
+                chat_id: chat_id.into(),
+                mobile,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn clear_mobile_session(&self, chat_id: impl Into<String>) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ClearMobileSession {
+                chat_id: chat_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_bridged_session(
+        &self,
+        chat_id: impl Into<String>,
+        agent: impl Into<String>,
+        bridge: BridgedSessionState,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetBridgedSession {
+                chat_id: chat_id.into(),
+                agent: agent.into(),
+                bridge,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_auth_context_status(
+        &self,
+        agent: impl Into<String>,
+        id: impl Into<String>,
+        status: AuthContextStatus,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetAuthContextStatus {
+                agent: agent.into(),
+                id: id.into(),
+                status,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_active_auth_context(
+        &self,
+        agent: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetActiveAuthContext {
+                agent: agent.into(),
+                id: id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn insert_pending_rotation(
+        &self,
+        rotation: PendingRotation,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::InsertPendingRotation { rotation, reply })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn resolve_pending_rotation(
+        &self,
+        id: impl Into<String>,
+        status: PendingRotationStatus,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ResolvePendingRotation {
+                id: id.into(),
+                status,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_lead_default(&self, agent: impl Into<String>) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetLeadDefault {
+                agent: agent.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn set_lead_for_chat(
+        &self,
+        chat_id: impl Into<String>,
+        agent: impl Into<String>,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetLeadForChat {
+                chat_id: chat_id.into(),
+                agent: agent.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn clear_lead_for_chat(&self, chat_id: impl Into<String>) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ClearLeadForChat {
+                chat_id: chat_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn resolve_lead(&self, chat_id: impl AsRef<str>) -> Option<AgentKind> {
+        let snapshot = self.snapshot.read().await;
+        snapshot
+            .lead_overrides
+            .per_chat
+            .get(chat_id.as_ref())
+            .and_then(|agent| AgentKind::from_str(agent).ok())
+            .or_else(|| {
+                snapshot
+                    .lead_overrides
+                    .default
+                    .as_deref()
+                    .and_then(|agent| AgentKind::from_str(agent).ok())
+            })
     }
 }
 
@@ -204,10 +567,111 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
+                StateCmd::ResolvePendingIfOpen { id, verdict, reply } => {
+                    let outcome = match state.pending_perms.get_mut(&id) {
+                        Some(perm) if perm.status.is_open() => {
+                            perm.status = verdict;
+                            ResolvePendingOutcome::Resolved
+                        }
+                        Some(perm) => ResolvePendingOutcome::AlreadyResolved(perm.status),
+                        None => ResolvePendingOutcome::Missing,
+                    };
+                    let result = match outcome {
+                        ResolvePendingOutcome::Resolved => {
+                            publish_and_flush(&actor_snapshot, &path, &state)
+                                .await
+                                .map(|_| outcome)
+                        }
+                        _ => Ok(outcome),
+                    };
+                    let _ = reply.send(result);
+                }
                 StateCmd::ExpirePending { id, reply } => {
                     if let Some(perm) = state.pending_perms.get_mut(&id) {
-                        perm.status = PendingPermStatus::TimedOut;
+                        if perm.status.is_open() {
+                            perm.status = PendingPermStatus::TimedOut;
+                        }
                     }
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetMobileSession {
+                    chat_id,
+                    mobile,
+                    reply,
+                } => {
+                    state.mobile_sessions.insert(chat_id, mobile);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetBridgedSession {
+                    chat_id,
+                    agent,
+                    bridge,
+                    reply,
+                } => {
+                    state
+                        .bridged_sessions
+                        .entry(chat_id)
+                        .or_default()
+                        .insert(agent, bridge);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::ClearMobileSession { chat_id, reply } => {
+                    state.mobile_sessions.remove(&chat_id);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetAuthContextStatus {
+                    agent,
+                    id,
+                    status,
+                    reply,
+                } => {
+                    state
+                        .auth_context_status
+                        .entry(agent)
+                        .or_default()
+                        .insert(id, status);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetActiveAuthContext { agent, id, reply } => {
+                    state.active_auth_context.insert(agent, id);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::InsertPendingRotation { rotation, reply } => {
+                    state
+                        .pending_rotations
+                        .insert(rotation.id.clone(), rotation);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::ResolvePendingRotation { id, status, reply } => {
+                    if let Some(rot) = state.pending_rotations.get_mut(&id) {
+                        rot.status = status;
+                    }
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetLeadDefault { agent, reply } => {
+                    state.lead_overrides.default = Some(agent);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::SetLeadForChat {
+                    chat_id,
+                    agent,
+                    reply,
+                } => {
+                    state.lead_overrides.per_chat.insert(chat_id, agent);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::ClearLeadForChat { chat_id, reply } => {
+                    state.lead_overrides.per_chat.remove(&chat_id);
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
@@ -328,7 +792,7 @@ mod tests {
     fn pending(id: &str) -> PendingPerm {
         PendingPerm {
             id: id.to_string(),
-            repo_id: "rallyup_a1b2c3d4".to_string(),
+            repo_id: "sample_repo_a1b2c3d4".to_string(),
             command_hash: "sha256:abc".to_string(),
             status: PendingPermStatus::Pending,
             created_at: "2026-04-16T00:00:00Z".to_string(),
@@ -397,16 +861,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backward_compat_loads_state_without_phase4_fields() {
+        // AC-Q9: old state.json without auth_context_status etc. must deserialize.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"default_repo_by_chat":{},"tg_offset":null,"sessions":{},"pending_perms":{}}"#,
+        )
+        .unwrap();
+
+        let handle = spawn_state_actor(path).await.unwrap();
+        let snap = handle.snapshot().await;
+        assert!(snap.auth_context_status.is_empty());
+        assert!(snap.active_auth_context.is_empty());
+        assert!(snap.pending_rotations.is_empty());
+        assert!(snap.bridged_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_with_bridged_sessions_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = StateSnapshot::default();
+
+        let bridge = BridgedSessionState {
+            agent: "claude".to_string(),
+            repo_id: "sample_repo_123".to_string(),
+            desktop_session_id: "desk-uuid".to_string(),
+            desktop_path: "/path/to/desk.jsonl".to_string(),
+            mobile_session_id: "mob-uuid".to_string(),
+            mobile_path: "/path/to/mob.jsonl".to_string(),
+            selected_at: "2026-04-19T00:00:00Z".to_string(),
+            sync: SessionSyncCursor {
+                desktop_offset: 100,
+                mobile_offset: 200,
+                last_synced_at: Some("2026-04-19T00:00:30Z".to_string()),
+                last_error: None,
+            },
+        };
+
+        let mut chat_bridges = BTreeMap::new();
+        chat_bridges.insert("claude".to_string(), bridge.clone());
+        state
+            .bridged_sessions
+            .insert("chat1".to_string(), chat_bridges);
+
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let handle = spawn_state_actor(path).await.unwrap();
+        let snap = handle.snapshot().await;
+
+        assert_eq!(snap.bridged_sessions["chat1"]["claude"], bridge);
+    }
+
+    #[tokio::test]
+    async fn set_auth_context_status_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        let status = AuthContextStatus {
+            status: AuthContextStatusKind::QuotaExhausted,
+            cooldown_until: Some("2026-04-18T19:00:00Z".to_string()),
+            last_event_id: Some("qevt_01HV".to_string()),
+            updated_at: "2026-04-18T14:10:00Z".to_string(),
+        };
+        handle
+            .set_auth_context_status("claude", "john", status.clone())
+            .await
+            .unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(snap.auth_context_status["claude"]["john"], status);
+
+        drop(handle);
+        let reloaded: StateSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.auth_context_status["claude"]["john"].status,
+            AuthContextStatusKind::QuotaExhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn set_active_auth_context_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        handle
+            .set_active_auth_context("claude", "partner")
+            .await
+            .unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(snap.active_auth_context.get("claude").unwrap(), "partner");
+    }
+
+    #[tokio::test]
+    async fn lead_overrides_persist_and_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        handle.set_lead_default("codex").await.unwrap();
+        assert_eq!(handle.resolve_lead("456").await, Some(AgentKind::Codex));
+
+        handle.set_lead_for_chat("123", "gemini").await.unwrap();
+        assert_eq!(handle.resolve_lead("123").await, Some(AgentKind::Gemini));
+        assert_eq!(handle.resolve_lead("456").await, Some(AgentKind::Codex));
+
+        handle.clear_lead_for_chat("123").await.unwrap();
+        assert_eq!(handle.resolve_lead("123").await, Some(AgentKind::Codex));
+
+        drop(handle);
+        let reloaded: StateSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(reloaded.lead_overrides.default.as_deref(), Some("codex"));
+        assert!(!reloaded.lead_overrides.per_chat.contains_key("123"));
+    }
+
+    #[tokio::test]
+    async fn pending_rotation_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        let rot = PendingRotation {
+            id: "rot_01".to_string(),
+            agent: "claude".to_string(),
+            from: "john".to_string(),
+            to: "partner".to_string(),
+            repo_id: "sample_repo".to_string(),
+            request_id: "req_01".to_string(),
+            chat_id: 123456789,
+            expires_at: "2026-04-18T14:20:00Z".to_string(),
+            status: PendingRotationStatus::Pending,
+        };
+        handle.insert_pending_rotation(rot.clone()).await.unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(
+            snap.pending_rotations["rot_01"].status,
+            PendingRotationStatus::Pending
+        );
+
+        handle
+            .resolve_pending_rotation("rot_01", PendingRotationStatus::Approved)
+            .await
+            .unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(
+            snap.pending_rotations["rot_01"].status,
+            PendingRotationStatus::Approved
+        );
+    }
+
+    #[tokio::test]
     async fn pending_perm_insert_resolve_expire_persists_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let handle = spawn_state_actor(path.clone()).await.unwrap();
 
         handle.insert_pending(pending("perm-1")).await.unwrap();
-        handle
-            .resolve_pending("perm-1", PendingPermStatus::Approved)
-            .await
-            .unwrap();
         handle.expire_pending("perm-1").await.unwrap();
 
         let json = std::fs::read_to_string(path).unwrap();
@@ -421,6 +1040,62 @@ mod tests {
                 .get("perm-1")
                 .map(|perm| &perm.status),
             Some(&PendingPermStatus::TimedOut)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_perm_resolve_if_open_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path).await.unwrap();
+
+        handle.insert_pending(pending("perm-1")).await.unwrap();
+        let first = handle
+            .resolve_pending_if_open("perm-1", PendingPermStatus::ApprovedByDesktop)
+            .await
+            .unwrap();
+        let second = handle
+            .resolve_pending_if_open("perm-1", PendingPermStatus::DeniedByTelegram)
+            .await
+            .unwrap();
+
+        assert_eq!(first, ResolvePendingOutcome::Resolved);
+        assert_eq!(
+            second,
+            ResolvePendingOutcome::AlreadyResolved(PendingPermStatus::ApprovedByDesktop)
+        );
+        assert_eq!(
+            handle
+                .snapshot()
+                .await
+                .pending_perms
+                .get("perm-1")
+                .map(|perm| perm.status),
+            Some(PendingPermStatus::ApprovedByDesktop)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_perm_expire_does_not_override_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path).await.unwrap();
+
+        handle.insert_pending(pending("perm-1")).await.unwrap();
+        handle
+            .resolve_pending_if_open("perm-1", PendingPermStatus::ApprovedByTelegram)
+            .await
+            .unwrap();
+        handle.expire_pending("perm-1").await.unwrap();
+
+        assert_eq!(
+            handle
+                .snapshot()
+                .await
+                .pending_perms
+                .get("perm-1")
+                .map(|perm| perm.status),
+            Some(PendingPermStatus::ApprovedByTelegram)
         );
     }
 }
