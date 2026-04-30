@@ -157,8 +157,6 @@ After adding or removing repos, restart the daemon so Telegram sees the updated 
 systemctl --user restart agent-bus
 ```
 
-Hot-reloading the repo registry is tracked in `TASKS.md`.
-
 ## Telegram Commands
 
 - `/switch_rp` shows repository buttons and sets the current chat's default repo.

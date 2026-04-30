@@ -26,3 +26,5 @@ tarpaulin-report.html
 /docs/spec.md
 /docs/phase2a-mvp.md
 /docs/specs/
+/TASKS.md
+/.agents/
