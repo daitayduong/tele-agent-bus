@@ -103,7 +103,7 @@ pub trait BotClient: Send + Sync {
     ) -> BoxFuture<'a, Result<(), TelegramError>>;
 }
 
-pub async fn handle_list_rp_command<B: BotClient + ?Sized>(
+pub async fn handle_switch_rp_picker<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
     state: StateHandle,
@@ -253,11 +253,10 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
 
     let mut parts = text.split_whitespace();
     match parts.next() {
-        Some("/list_rp") => handle_list_rp_command(bot, config, state, chat_id).await,
         Some("/current") => handle_current_command(bot, config, state, chat_id).await,
         Some("/switch_rp") => {
             let Some(repo_id) = parts.next() else {
-                return handle_list_rp_command(bot, config, state, chat_id).await;
+                return handle_switch_rp_picker(bot, config, state, chat_id).await;
             };
             handle_switch_rp_command(bot, config, state, chat_id, repo_id.to_string()).await
         }

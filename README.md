@@ -150,7 +150,6 @@ Hot-reloading the repo registry is tracked in `TASKS.md`.
 
 ## Telegram Commands
 
-- `/list_rp` lists registered repositories and shows buttons to select the default repo for the current chat.
 - `/switch_rp` shows repository buttons and sets the current chat's default repo.
 - `/switch_rp <repo_id>` switches directly to a repo without showing the picker.
 - `/current` shows the current default repo.

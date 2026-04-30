@@ -337,7 +337,7 @@ mod tests {
 
     use super::telegram::{
         handle_callback_perm, handle_callback_switch, handle_current_command,
-        handle_list_rp_command, handle_switch_rp_command, handle_text_command, InlineKeyboard,
+        handle_switch_rp_command, handle_switch_rp_picker, handle_text_command, InlineKeyboard,
         MessageRef, MockBot, RepoEntry, TelegramConfig,
     };
     use super::{load_daemon_config, DaemonConfig};
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_rp_replies_with_switch_keyboard() {
+    async fn switch_rp_picker_replies_with_switch_keyboard() {
         let dir = tempfile::tempdir().unwrap();
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
@@ -392,7 +392,7 @@ mod tests {
             .unwrap();
         let bot = MockBot::default();
 
-        handle_list_rp_command(&bot, &config(), state, 123)
+        handle_switch_rp_picker(&bot, &config(), state, 123)
             .await
             .unwrap();
 

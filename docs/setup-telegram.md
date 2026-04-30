@@ -110,7 +110,6 @@ client is polling the same bot. Stop the other client or create a separate bot.
 Send these messages to your bot:
 
 ```text
-/list_rp
 /current
 /switch_rp
 /switch_rp <repo_id>
