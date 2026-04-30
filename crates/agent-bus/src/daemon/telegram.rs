@@ -257,11 +257,7 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
         Some("/current") => handle_current_command(bot, config, state, chat_id).await,
         Some("/switch_rp") => {
             let Some(repo_id) = parts.next() else {
-                if is_allowed(config, chat_id) {
-                    bot.send_message(chat_id, "Usage: /switch_rp <repo_id>".to_string(), None)
-                        .await?;
-                }
-                return Ok(());
+                return handle_list_rp_command(bot, config, state, chat_id).await;
             };
             handle_switch_rp_command(bot, config, state, chat_id, repo_id.to_string()).await
         }
@@ -462,7 +458,7 @@ async fn handle_unaddressed_lead_message<B: BotClient + ?Sized>(
     let Some(repo_id) = repo_id else {
         bot.send_message(
             chat_id,
-            "No default repo for this chat. Use /switch_rp <id> first.".to_string(),
+            "No default repo for this chat. Use /switch_rp first.".to_string(),
             None,
         )
         .await?;
@@ -924,7 +920,7 @@ pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
     let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
         bot.send_message(
             chat_id,
-            "No default repo. Use /switch_rp <id> first.".to_string(),
+            "No default repo. Use /switch_rp first.".to_string(),
             None,
         )
         .await?;
@@ -1582,7 +1578,7 @@ fn routing_error_message(err: &RoutingError) -> &'static str {
     match err {
         RoutingError::NoMatch => "",
         RoutingError::NoDefaultRepo => {
-            "No default repo for this chat. Use /switch_rp <id> or @agent:repo msg"
+            "No default repo for this chat. Use /switch_rp or @agent:repo msg"
         }
         RoutingError::InvalidAgentName => "Invalid agent name",
         RoutingError::InvalidRepoName => "Invalid repo name",

@@ -435,6 +435,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_rp_without_id_lists_repos_for_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        let bot = MockBot::default();
+
+        handle_text_command(
+            &bot,
+            &config(),
+            state,
+            &None,
+            123,
+            None,
+            "/switch_rp",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let sent = bot.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("Registered repos"));
+        assert!(sent[0].keyboard.is_some());
+    }
+
+    #[tokio::test]
     async fn callback_switch_edits_message_and_updates_state() {
         let dir = tempfile::tempdir().unwrap();
         let state = spawn_state_actor(dir.path().join("state.json"))
