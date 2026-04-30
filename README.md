@@ -10,7 +10,7 @@ A global daemon at `~/.agent-bus/` that:
 - Serves multiple projects (repos) from one always-on process
 - Routes Telegram commands to the right agent in the right repo
 - Gates dangerous Bash commands via a blacklist + Telegram approval UI
-- Runs independently of any IDE (systemd user service)
+- Runs independently of any IDE
 
 ## Workspace layout
 
@@ -24,12 +24,23 @@ crates/
 
 ## Requirements
 
-- Linux with systemd user services
+- Linux with systemd user services, or Windows for the experimental Telegram daemon MVP
 - Rust 1.75+
 - A dedicated Telegram bot token from `@BotFather`
 - Claude Code, Gemini CLI, or Codex CLI installed if you want to route work to those agents
 
-## Install from source
+## Platform Support
+
+- Linux is the primary supported platform. It includes the daemon, Telegram
+  commands, systemd service install, Unix-socket permission approvals, and
+  Claude Code hook integration.
+- Windows support is experimental. The daemon and Telegram repo/agent routing
+  can be built and run manually, but permission hook IPC and service
+  installation are not ported yet.
+- macOS is not officially supported yet, but should be closer to Linux than
+  Windows once launchd/service packaging and peer-credential checks are added.
+
+## Install from source on Linux
 
 Clone and build:
 
@@ -161,6 +172,7 @@ Hot-reloading the repo registry is tracked in `TASKS.md`.
 - `@agent:<repo_id> <message>` routes explicitly to a repo and bypasses the default repo selection.
 
 See `docs/setup-telegram.md` for the detailed Telegram setup flow.
+See `docs/setup-windows.md` for the experimental Windows setup flow.
 
 ## Security disclaimer
 
@@ -179,3 +191,12 @@ cargo test --workspace
 MIT. You may use, modify, distribute, and commercialize this project, provided that the copyright and license notice are preserved.
 
 Copyright (c) 2026 John Chuong.
+
+## About the Author
+
+tele-agent-bus is created by John Chuong, an amateur programmer pursuing a few
+free projects, including [docprivy.com](https://docprivy.com) and
+tele-agent-bus.
+
+If this project is useful to you, you can support the author with a
+"Buy me a coffee" contribution through PayPal: johnchuong5@gmail.com.

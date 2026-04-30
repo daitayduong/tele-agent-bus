@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -12,8 +13,11 @@ pub fn append_inbox(repo_path: &Path, agent: &str, username: &str, body: &str) -
     let inbox_dir = repo_path.join(".agents").join("inbox");
     fs::create_dir_all(&inbox_dir)
         .with_context(|| format!("failed to create {}", inbox_dir.display()))?;
-    fs::set_permissions(&inbox_dir, fs::Permissions::from_mode(0o750))
-        .with_context(|| format!("failed to chmod {}", inbox_dir.display()))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&inbox_dir, fs::Permissions::from_mode(0o750))
+            .with_context(|| format!("failed to chmod {}", inbox_dir.display()))?;
+    }
 
     let dest = inbox_dir.join(format!("{agent}.md"));
     let lock = lock_for(&dest);
@@ -34,11 +38,13 @@ pub fn append_inbox(repo_path: &Path, agent: &str, username: &str, body: &str) -
 
     let tmp = temp_path_for(&dest, std::process::id());
     {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o644)
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o644);
+        }
+        let mut file = options
             .open(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
         file.write_all(&contents)

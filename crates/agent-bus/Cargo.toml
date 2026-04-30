@@ -36,9 +36,11 @@ hex = { workspace = true }
 time = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
-nix.workspace = true
 shellexpand = "3.1.2"
 fs2 = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -38,10 +38,7 @@ pub fn parse_bridge_command(text: &str) -> Option<BridgeCommand> {
     // @flush_mobile (legacy alias)
     // @claude hi
 
-    if matches!(
-        trimmed,
-        "/list_claude" | "/ls_cl_ses"
-    ) {
+    if matches!(trimmed, "/list_claude" | "/ls_cl_ses") {
         return Some(BridgeCommand::List(AgentKind::Claude));
     }
     if trimmed == "/list_codex" {

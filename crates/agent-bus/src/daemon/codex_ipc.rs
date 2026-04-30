@@ -1,7 +1,9 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 const INITIALIZING_CLIENT: &str = "initializing-client";
@@ -34,10 +36,19 @@ impl CodexIpcClient {
     }
 
     pub fn default_socket_path() -> PathBuf {
-        let uid = nix::unistd::Uid::current().as_raw();
-        std::env::temp_dir()
-            .join("codex-ipc")
-            .join(format!("ipc-{uid}.sock"))
+        #[cfg(unix)]
+        {
+            let uid = nix::unistd::Uid::current().as_raw();
+            std::env::temp_dir()
+                .join("codex-ipc")
+                .join(format!("ipc-{uid}.sock"))
+        }
+        #[cfg(not(unix))]
+        {
+            std::env::temp_dir()
+                .join("codex-ipc")
+                .join("unsupported.sock")
+        }
     }
 
     pub fn default() -> Self {
@@ -50,52 +61,63 @@ impl CodexIpcClient {
         prompt: &str,
         timeout: Duration,
     ) -> Result<(), CodexIpcError> {
-        let run = async {
-            let mut stream = UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|err| CodexIpcError::Unavailable(err.to_string()))?;
-            let client_id = initialize_client(&mut stream).await?;
-            let request_id = request_id();
-            let request = json!({
-                "type": "request",
-                "requestId": request_id,
-                "sourceClientId": client_id,
-                "version": VERSION_THREAD_FOLLOWER_START_TURN,
-                "method": METHOD_THREAD_FOLLOWER_START_TURN,
-                "params": {
-                    "conversationId": conversation_id,
-                    "turnStartParams": {
-                        "input": [{
-                            "type": "text",
-                            "text": prompt,
-                            "text_elements": []
-                        }],
-                        "cwd": null,
-                        "approvalPolicy": null,
-                        "sandboxPolicy": null,
-                        "model": null,
-                        "effort": null,
-                        "summary": "auto",
-                        "personality": null,
-                        "outputSchema": null,
-                        "collaborationMode": null,
-                        "attachments": []
+        #[cfg(not(unix))]
+        {
+            let _ = (&self.socket_path, conversation_id, prompt, timeout);
+            return Err(CodexIpcError::Unavailable(
+                "Codex desktop live IPC is currently supported only on Unix platforms".to_string(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let run = async {
+                let mut stream = UnixStream::connect(&self.socket_path)
+                    .await
+                    .map_err(|err| CodexIpcError::Unavailable(err.to_string()))?;
+                let client_id = initialize_client(&mut stream).await?;
+                let request_id = request_id();
+                let request = json!({
+                    "type": "request",
+                    "requestId": request_id,
+                    "sourceClientId": client_id,
+                    "version": VERSION_THREAD_FOLLOWER_START_TURN,
+                    "method": METHOD_THREAD_FOLLOWER_START_TURN,
+                    "params": {
+                        "conversationId": conversation_id,
+                        "turnStartParams": {
+                            "input": [{
+                                "type": "text",
+                                "text": prompt,
+                                "text_elements": []
+                            }],
+                            "cwd": null,
+                            "approvalPolicy": null,
+                            "sandboxPolicy": null,
+                            "model": null,
+                            "effort": null,
+                            "summary": "auto",
+                            "personality": null,
+                            "outputSchema": null,
+                            "collaborationMode": null,
+                            "attachments": []
+                        }
                     }
-                }
-            });
-            write_frame(&mut stream, &request).await?;
-            wait_for_response(&mut stream, &request_id)
-                .await
-                .map(|_| ())
-        };
+                });
+                write_frame(&mut stream, &request).await?;
+                wait_for_response(&mut stream, &request_id)
+                    .await
+                    .map(|_| ())
+            };
 
-        match tokio::time::timeout(timeout, run).await {
-            Ok(result) => result,
-            Err(_) => Err(CodexIpcError::Timeout),
+            match tokio::time::timeout(timeout, run).await {
+                Ok(result) => result,
+                Err(_) => Err(CodexIpcError::Timeout),
+            }
         }
     }
 }
 
+#[cfg(unix)]
 async fn initialize_client(stream: &mut UnixStream) -> Result<String, CodexIpcError> {
     let request_id = request_id();
     let request = json!({
@@ -123,6 +145,7 @@ async fn initialize_client(stream: &mut UnixStream) -> Result<String, CodexIpcEr
         .ok_or_else(|| CodexIpcError::Protocol("initialize response missing clientId".to_string()))
 }
 
+#[cfg(unix)]
 async fn wait_for_response(
     stream: &mut UnixStream,
     request_id: &str,
@@ -157,6 +180,7 @@ async fn wait_for_response(
     }
 }
 
+#[cfg(unix)]
 async fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), CodexIpcError> {
     let bytes =
         serde_json::to_vec(value).map_err(|err| CodexIpcError::Protocol(err.to_string()))?;
@@ -173,6 +197,7 @@ async fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), Codex
         .map_err(|err| CodexIpcError::Unavailable(err.to_string()))
 }
 
+#[cfg(unix)]
 async fn read_frame(stream: &mut UnixStream) -> Result<Value, CodexIpcError> {
     let mut len = [0_u8; 4];
     stream
@@ -188,11 +213,12 @@ async fn read_frame(stream: &mut UnixStream) -> Result<Value, CodexIpcError> {
     serde_json::from_slice(&bytes).map_err(|err| CodexIpcError::Protocol(err.to_string()))
 }
 
+#[cfg(unix)]
 fn request_id() -> String {
     format!("agent-bus-{}", rand::random::<u64>())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

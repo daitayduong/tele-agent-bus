@@ -3,11 +3,10 @@
 //! This module implements session forking, active-session detection, delta extraction,
 //! and command parsing for the Telegram-controlled mobile Claude workflow.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
 use std::cmp::Reverse;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
@@ -427,10 +426,7 @@ pub fn rotate_archives(archive_dir: &Path, keep: usize) -> Result<Vec<PathBuf>> 
 pub fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
     let trimmed = text.trim();
     let lower = trimmed.to_lowercase();
-    if matches!(
-        lower.as_str(),
-        "/list_claude" | "/ls_cl_ses"
-    ) {
+    if matches!(lower.as_str(), "/list_claude" | "/ls_cl_ses") {
         return Some(MobileCommand::ListClaude);
     }
     if lower == "@flush_mobile" {
@@ -461,7 +457,8 @@ pub fn append_fork_marker(desktop_jsonl: &Path, mobile_uuid: &str) -> Result<()>
     let metadata = file.metadata()?;
     if metadata.len() > 0 {
         let mut last_byte = [0u8; 1];
-        file.read_exact_at(&mut last_byte, metadata.len() - 1)?;
+        file.seek(SeekFrom::Start(metadata.len() - 1))?;
+        file.read_exact(&mut last_byte)?;
         if last_byte[0] != b'\n' {
             writeln!(file)?;
         }

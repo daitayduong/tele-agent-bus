@@ -88,7 +88,7 @@ impl PeerUid<std::os::unix::net::UnixStream> for StdPeerUid {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 impl PeerUid<std::os::unix::net::UnixStream> for StdPeerUid {
     fn peer_uid(&self, _conn: &std::os::unix::net::UnixStream) -> Result<u32, PeerUidError> {
         Err(PeerUidError::Unsupported)
@@ -138,6 +138,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn std_peer_uid_reads_unix_stream_credential() {
         use std::os::unix::fs::MetadataExt;

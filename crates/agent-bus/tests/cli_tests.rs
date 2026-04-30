@@ -126,7 +126,13 @@ fn test_cli_list_per_repo_no_sudo_required() -> anyhow::Result<()> {
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args(["blacklist", "add", "--repo", "sample_repo", "secret-pattern"]);
+    cmd.args([
+        "blacklist",
+        "add",
+        "--repo",
+        "sample_repo",
+        "secret-pattern",
+    ]);
     cmd.assert().success();
 
     // Now list it

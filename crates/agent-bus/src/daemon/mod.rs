@@ -11,6 +11,7 @@ pub mod routing;
 pub mod runner;
 pub mod session_bridge;
 pub mod telegram;
+#[cfg(unix)]
 pub mod uds;
 
 #[cfg(test)]
@@ -168,8 +169,18 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         registry.clone(),
         Duration::from_secs(config.timeout_seconds),
     );
-    let uds_server = uds::UdsServer::new(config.home.join("daemon.sock"), state.clone(), perm);
-    let uds_task = tokio::spawn(uds::run_uds_server(uds_server));
+    #[cfg(unix)]
+    let uds_task = {
+        let uds_server = uds::UdsServer::new(config.home.join("daemon.sock"), state.clone(), perm);
+        tokio::spawn(uds::run_uds_server(uds_server))
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = perm;
+        tracing::warn!(
+            "permission hook IPC is not available on this platform yet; Telegram daemon will run without hook approvals"
+        );
+    }
     let bridge_sync_task =
         session_bridge::spawn_session_bridge_sync(state.clone(), Duration::from_secs(30));
 
@@ -190,6 +201,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         .dispatch()
         .await;
 
+    #[cfg(unix)]
     uds_task.abort();
     bridge_sync_task.abort();
     Ok(())
@@ -442,18 +454,9 @@ mod tests {
             .unwrap();
         let bot = MockBot::default();
 
-        handle_text_command(
-            &bot,
-            &config(),
-            state,
-            &None,
-            123,
-            None,
-            "/switch_rp",
-            None,
-        )
-        .await
-        .unwrap();
+        handle_text_command(&bot, &config(), state, &None, 123, None, "/switch_rp", None)
+            .await
+            .unwrap();
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);

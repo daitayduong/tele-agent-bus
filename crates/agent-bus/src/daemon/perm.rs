@@ -75,10 +75,7 @@ pub struct MergedBlacklistLoader {
 type RepoLoaderFn = Box<dyn Fn(&RepoId) -> Arc<dyn BlacklistLoader> + Send + Sync>;
 
 impl MergedBlacklistLoader {
-    pub fn new(
-        global_loader: Arc<dyn BlacklistLoader>,
-        repo_loader_fn: RepoLoaderFn,
-    ) -> Self {
+    pub fn new(global_loader: Arc<dyn BlacklistLoader>, repo_loader_fn: RepoLoaderFn) -> Self {
         Self {
             global_loader,
             repo_loader_fn,

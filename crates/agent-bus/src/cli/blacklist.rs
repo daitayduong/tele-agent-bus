@@ -2,14 +2,18 @@ use agent_bus_core::blacklist_integrity;
 use agent_bus_core::repo_id::RepoId;
 use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
+use fs2::FileExt;
 use rand::{thread_rng, RngCore};
 use regex::Regex;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 const DEFAULT_ETC_DIR: &str = "/etc/agent-bus";
 const DEFAULT_HOME_DIR: &str = "~/.agent-bus";
 
@@ -47,14 +51,38 @@ pub enum BlacklistCommands {
 pub fn handle(command: BlacklistCommands) -> Result<()> {
     let etc_dir: PathBuf = std::env::var("AGENT_BUS_ETC_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ETC_DIR));
+        .unwrap_or_else(|_| default_etc_dir());
     let home_dir: PathBuf = crate::cli::get_bus_home();
     handle_inner(command, &etc_dir, &home_dir, get_euid)
 }
 
+fn default_etc_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from(DEFAULT_ETC_DIR)
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"))
+            .join("agent-bus")
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        crate::cli::get_bus_home().join("etc")
+    }
+}
+
+#[cfg(unix)]
 #[allow(unsafe_code)]
 fn get_euid() -> u32 {
     unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn get_euid() -> u32 {
+    0
 }
 
 fn handle_inner(
@@ -78,8 +106,15 @@ fn handle_inner(
 }
 
 fn check_root(euid: fn() -> u32) -> Result<()> {
-    if euid() != 0 {
-        return Err(anyhow!("this subcommand requires sudo (effective UID 0)"));
+    #[cfg(unix)]
+    {
+        if euid() != 0 {
+            return Err(anyhow!("this subcommand requires sudo (effective UID 0)"));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = euid;
     }
     Ok(())
 }
@@ -89,6 +124,7 @@ fn init_inner(etc_dir: &Path, euid: fn() -> u32) -> Result<()> {
 
     if !etc_dir.exists() {
         fs::create_dir_all(etc_dir)?;
+        #[cfg(unix)]
         fs::set_permissions(etc_dir, fs::Permissions::from_mode(0o750))?;
     }
 
@@ -349,6 +385,7 @@ fn write_protected(path: &Path, data: &[u8], is_global: bool) -> Result<()> {
     options.write(true).create(true).truncate(true);
 
     let _ = is_global;
+    #[cfg(unix)]
     options.mode(0o640);
 
     let mut f = options.open(path)?;
@@ -362,7 +399,6 @@ struct Lock {
     _file: fs::File,
 }
 
-#[allow(unsafe_code)]
 impl Lock {
     fn new(dir: &Path) -> Result<Self> {
         let path = dir.join(".lock");
@@ -373,23 +409,15 @@ impl Lock {
             .truncate(false)
             .open(&path)?;
 
-        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
-        let res = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if res != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
+        file.lock_exclusive()?;
 
         Ok(Self { _file: file })
     }
 }
 
-#[allow(unsafe_code)]
 impl Drop for Lock {
     fn drop(&mut self) {
-        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&self._file);
-        unsafe {
-            libc::flock(fd, libc::LOCK_UN);
-        }
+        let _ = self._file.unlock();
     }
 }
 

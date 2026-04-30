@@ -7,9 +7,12 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
+#[cfg_attr(not(unix), allow(dead_code))]
 const PROTOCOL_VERSION: u32 = 1;
 const EXIT_APPROVE: i32 = 0;
 const EXIT_DENY: i32 = 2;
@@ -76,22 +79,33 @@ fn read_input() -> Result<Value, HookError> {
 }
 
 async fn ask_daemon(socket: &PathBuf, input: &Value, command: &str) -> Result<Verdict, HookError> {
-    let mut stream = UnixStream::connect(socket).await?;
-    let body = build_request_body(input, command);
-    let bytes = serde_json::to_vec(&body)?;
-    let headers = format!(
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, input, command);
+        return Err(HookError::Daemon(
+            "daemon IPC is not available on this platform yet".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let mut stream = UnixStream::connect(socket).await?;
+        let body = build_request_body(input, command);
+        let bytes = serde_json::to_vec(&body)?;
+        let headers = format!(
         "POST /perm/check HTTP/1.1\r\nHost: agent-bus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         bytes.len()
     );
-    stream.write_all(headers.as_bytes()).await?;
-    stream.write_all(&bytes).await?;
-    stream.shutdown().await?;
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(&bytes).await?;
+        stream.shutdown().await?;
 
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
-    parse_response(&response)
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        parse_response(&response)
+    }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn build_request_body(input: &Value, command: &str) -> Value {
     json!({
         "protocol_version": PROTOCOL_VERSION,
@@ -104,6 +118,7 @@ fn build_request_body(input: &Value, command: &str) -> Value {
     })
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn parse_response(response: &[u8]) -> Result<Verdict, HookError> {
     let split = response
         .windows(4)
@@ -181,10 +196,13 @@ fn socket_path() -> Result<PathBuf, HookError> {
     if let Ok(path) = env::var("AGENT_BUS_HOME") {
         return Ok(PathBuf::from(path).join("daemon.sock"));
     }
-    let home = env::var("HOME").map_err(|_| HookError::Config("HOME is not set".to_string()))?;
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .map_err(|_| HookError::Config("HOME or USERPROFILE is not set".to_string()))?;
     Ok(PathBuf::from(home).join(".agent-bus/daemon.sock"))
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn repo_hint(cwd: &str) -> Option<String> {
     let path = std::path::Path::new(cwd);
     let display = path
@@ -197,6 +215,7 @@ fn repo_hint(cwd: &str) -> Option<String> {
     Some(format!("{display}_{}", &hash[..8]))
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn slugify(input: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -223,6 +242,7 @@ fn slugify(input: &str) -> String {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn monotonic_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -231,6 +251,7 @@ fn monotonic_nanos() -> u128 {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum HookError {
     Config(String),
     Protocol(String),

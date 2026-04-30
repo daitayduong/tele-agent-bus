@@ -1,5 +1,6 @@
 use crate::cli::get_bus_home;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 pub fn run() -> anyhow::Result<()> {

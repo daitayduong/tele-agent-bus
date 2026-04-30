@@ -302,6 +302,7 @@ async fn run_child(
             // Timeout — SIGKILL the whole process group so children (e.g.
             // `sleep` spawned by a bash wrapper) die too; otherwise they
             // inherit our stdout/stderr pipes and block `read_to_end`.
+            #[cfg(unix)]
             if let Some(pid) = child_pid {
                 // killpg on the child's process group so any grandchildren
                 // spawned by a shell wrapper are also reaped. Errors (ESRCH
@@ -311,6 +312,8 @@ async fn run_child(
                     nix::sys::signal::Signal::SIGKILL,
                 );
             }
+            #[cfg(not(unix))]
+            let _ = child_pid;
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             (None, true)
