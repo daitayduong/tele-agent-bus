@@ -13,18 +13,22 @@ use std::time::Duration;
 use fs2::FileExt;
 use thiserror::Error;
 
+#[cfg_attr(not(test), allow(dead_code))]
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+#[cfg_attr(not(test), allow(dead_code))]
 const LOCK_FILE_NAME: &str = ".agent-bus.lock";
 
 /// RAII handle to an exclusive flock. Drop releases the lock.
 ///
 /// `_file` is kept alive so the flock persists; file descriptor close
 /// releases the advisory lock at the kernel level.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ContextLock {
     _file: std::fs::File,
     path: PathBuf,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl ContextLock {
     pub fn path(&self) -> &Path {
         &self.path
@@ -33,11 +37,14 @@ impl ContextLock {
 
 impl std::fmt::Debug for ContextLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ContextLock").field("path", &self.path).finish()
+        f.debug_struct("ContextLock")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
 #[derive(Debug, Error)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum LockError {
     #[error("timeout acquiring lock at {path}")]
     Timeout { path: PathBuf },
@@ -54,6 +61,7 @@ pub enum LockError {
 ///
 /// **Precondition**: `profile_dir` must exist. A missing parent returns
 /// `LockError::MissingDir` immediately (no polling).
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn acquire(profile_dir: &Path, timeout: Duration) -> Result<ContextLock, LockError> {
     if !profile_dir.exists() {
         return Err(LockError::MissingDir {
@@ -70,12 +78,7 @@ pub async fn acquire(profile_dir: &Path, timeout: Duration) -> Result<ContextLoc
             .map_err(|e| LockError::Io(std::io::Error::other(e)))?;
 
         match attempt {
-            Ok(Some(file)) => {
-                return Ok(ContextLock {
-                    _file: file,
-                    path,
-                })
-            }
+            Ok(Some(file)) => return Ok(ContextLock { _file: file, path }),
             Ok(None) => {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(LockError::Timeout { path });
@@ -89,6 +92,7 @@ pub async fn acquire(profile_dir: &Path, timeout: Duration) -> Result<ContextLoc
 
 /// Blocking single attempt. Returns `Ok(Some)` on acquired, `Ok(None)` on
 /// contention, `Err` on hard io failure.
+#[cfg_attr(not(test), allow(dead_code))]
 fn try_acquire(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -103,6 +107,7 @@ fn try_acquire(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_would_block(e: &std::io::Error) -> bool {
     // fs2 surfaces contention either as WouldBlock or raw EAGAIN/EWOULDBLOCK.
     if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -119,7 +124,9 @@ mod tests {
     #[tokio::test]
     async fn acquire_on_empty_dir_creates_lockfile() {
         let dir = TempDir::new().unwrap();
-        let lock = acquire(dir.path(), Duration::from_millis(100)).await.unwrap();
+        let lock = acquire(dir.path(), Duration::from_millis(100))
+            .await
+            .unwrap();
         assert!(lock.path().exists());
         assert_eq!(lock.path().file_name().unwrap(), LOCK_FILE_NAME);
     }
@@ -127,7 +134,9 @@ mod tests {
     #[tokio::test]
     async fn contended_lock_times_out() {
         let dir = TempDir::new().unwrap();
-        let _held = acquire(dir.path(), Duration::from_millis(100)).await.unwrap();
+        let _held = acquire(dir.path(), Duration::from_millis(100))
+            .await
+            .unwrap();
         // Second acquire within a short timeout must fail with Timeout.
         let start = std::time::Instant::now();
         let err = acquire(dir.path(), Duration::from_millis(400))
@@ -143,17 +152,23 @@ mod tests {
     async fn release_on_drop_allows_reacquire() {
         let dir = TempDir::new().unwrap();
         {
-            let _lock = acquire(dir.path(), Duration::from_millis(100)).await.unwrap();
+            let _lock = acquire(dir.path(), Duration::from_millis(100))
+                .await
+                .unwrap();
         }
         // Now immediately re-acquire.
-        let lock2 = acquire(dir.path(), Duration::from_millis(100)).await.unwrap();
+        let lock2 = acquire(dir.path(), Duration::from_millis(100))
+            .await
+            .unwrap();
         assert!(lock2.path().exists());
     }
 
     #[tokio::test]
     async fn missing_profile_dir_returns_error() {
         let missing = Path::new("/tmp/does-not-exist-abcdef-123456");
-        let err = acquire(missing, Duration::from_millis(100)).await.unwrap_err();
+        let err = acquire(missing, Duration::from_millis(100))
+            .await
+            .unwrap_err();
         assert!(matches!(err, LockError::MissingDir { .. }));
     }
 
@@ -166,9 +181,8 @@ mod tests {
 
         // Waiter in separate task, with a timeout longer than the hold window.
         let path_clone = path.clone();
-        let waiter = tokio::spawn(async move {
-            acquire(&path_clone, Duration::from_secs(2)).await
-        });
+        let waiter =
+            tokio::spawn(async move { acquire(&path_clone, Duration::from_secs(2)).await });
 
         // Hold briefly then drop.
         tokio::time::sleep(Duration::from_millis(300)).await;

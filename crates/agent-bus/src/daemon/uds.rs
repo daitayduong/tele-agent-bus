@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use agent_bus_core::peer_uid::{current_euid, verify_peer_uid, PeerUid, StdPeerUid};
 use agent_bus_core::state::StateHandle;
-use agent_bus_proto::{PermCheckRequest, SetDefaultRepoRequest, PROTOCOL_VERSION};
+use agent_bus_proto::{
+    PermCheckRequest, PermResolveRequest, SetDefaultRepoRequest, PROTOCOL_VERSION,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -116,6 +118,15 @@ async fn route_request(
             ensure_protocol(&request.body)?;
             let req: PermCheckRequest = serde_json::from_slice(&request.body)?;
             let resp = server.perm.check(req).await?;
+            Ok((200, serde_json::to_value(resp)?))
+        }
+        ("POST", "/perm/resolve") => {
+            ensure_protocol(&request.body)?;
+            let req: PermResolveRequest = serde_json::from_slice(&request.body)?;
+            let resp = server
+                .perm
+                .resolve_external(req.perm_id, req.decision, &req.source)
+                .await?;
             Ok((200, serde_json::to_value(resp)?))
         }
         ("GET", "/state") => Ok((200, serde_json::to_value(server.state.snapshot().await)?)),
@@ -252,12 +263,12 @@ fn chmod_socket_private(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
     use crate::daemon::perm::{BlacklistLoader, MergedBlacklistLoader, PendingPermRegistry};
     use crate::daemon::telegram::{MockBot, TelegramConfig};
     use agent_bus_core::peer_uid::MockPeerUid;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
     use std::time::SystemTime;
 
     struct EmptyLoader;
@@ -288,7 +299,8 @@ mod tests {
             config,
             Arc::new(MockBot::default()),
             loader,
-            PendingPermRegistry::default(), Duration::from_secs(30),
+            PendingPermRegistry::default(),
+            Duration::from_secs(30),
         );
         let mut server = UdsServer::new(socket.clone(), state, perm);
         server.daemon_uid = current_euid();

@@ -16,6 +16,7 @@ pub mod uds;
 #[cfg(test)]
 mod runner_cli_tests;
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,23 +95,24 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         // Phase 4a.12: Token expiry detection on startup
         for (agent_name, contexts) in &auth_cfg.agents {
             for ctx in contexts {
-                let status = agent_bus_core::token_expiry::read_for_agent(agent_name, &ctx.profile_dir);
-                use agent_bus_core::token_expiry::ExpiryStatus;
-                use agent_bus_core::state::{AuthContextStatus, AuthContextStatusKind};
-                let kind = match status {
-                    ExpiryStatus::Expired { .. } => Some(AuthContextStatusKind::AuthExpired),
-                    ExpiryStatus::ExpiringSoon { .. } => Some(AuthContextStatusKind::AuthExpiringSoon),
-                    _ => None,
-                };
+                let status =
+                    agent_bus_core::token_expiry::read_for_agent(agent_name, &ctx.profile_dir);
+                use agent_bus_core::state::AuthContextStatus;
+                let kind = startup_token_status_kind(agent_name, status);
                 if let Some(k) = kind {
                     let now = time::OffsetDateTime::now_utc();
                     let st = AuthContextStatus {
                         status: k,
                         cooldown_until: None,
                         last_event_id: None,
-                        updated_at: now.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                        updated_at: now
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default(),
                     };
-                    state.set_auth_context_status(agent_name, &ctx.id, st).await.ok();
+                    state
+                        .set_auth_context_status(agent_name, &ctx.id, st)
+                        .await
+                        .ok();
                 }
             }
         }
@@ -122,12 +124,17 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let agent_runner: SharedAgentRunner = config.auth_contexts.as_ref().map(|cfg| {
         let spawner = CliSpawner::new();
         let events = EventLog::new(config.home.join("events.jsonl"));
-        Arc::new(AgentRunner::new(spawner, cfg.clone(), state.clone(), events))
+        Arc::new(AgentRunner::new(
+            spawner,
+            cfg.clone(),
+            state.clone(),
+            events,
+        ))
     });
 
     let auth_contexts = Arc::new(config.auth_contexts);
     let telegram_config = Arc::new(config.telegram);
-    let bot = teloxide::Bot::new(config.bot_token);
+    let bot = telegram_bot(config.bot_token);
     let registry = PendingPermRegistry::default();
     let bot_client: Arc<dyn telegram::BotClient> = Arc::new(TeloxideBotClient::new(bot.clone()));
 
@@ -148,7 +155,10 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         )) as Arc<dyn perm::BlacklistLoader>
     };
 
-    let loader = Arc::new(MergedBlacklistLoader::new(global_loader, Box::new(repo_loader_fn)));
+    let loader = Arc::new(MergedBlacklistLoader::new(
+        global_loader,
+        Box::new(repo_loader_fn),
+    ));
 
     let perm = PermService::new(
         state.clone(),
@@ -183,6 +193,17 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     uds_task.abort();
     bridge_sync_task.abort();
     Ok(())
+}
+
+fn telegram_bot(token: String) -> teloxide::Bot {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(17))
+        .tcp_nodelay(true)
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .build()
+        .expect("Telegram reqwest client creation failed");
+    teloxide::Bot::with_client(token, client)
 }
 
 pub fn load_daemon_config() -> anyhow::Result<DaemonConfig> {
@@ -251,6 +272,27 @@ fn load_auth_contexts(home: &std::path::Path) -> anyhow::Result<Option<AuthConte
     Ok(Some(cfg))
 }
 
+fn startup_token_status_kind(
+    agent_name: &str,
+    status: agent_bus_core::token_expiry::ExpiryStatus,
+) -> Option<agent_bus_core::state::AuthContextStatusKind> {
+    use agent_bus_core::state::AuthContextStatusKind;
+    use agent_bus_core::token_expiry::ExpiryStatus;
+
+    match status {
+        ExpiryStatus::Healthy { .. } => Some(AuthContextStatusKind::Available),
+        ExpiryStatus::ExpiringSoon { .. } => Some(AuthContextStatusKind::AuthExpiringSoon),
+        ExpiryStatus::Expired { .. } if agent_name == "claude" => {
+            // Claude Code can refresh expired access tokens from the OAuth profile.
+            // Blocking at startup on the raw access-token expiry prevents valid Pro
+            // sessions from running; real auth failures are still classified after spawn.
+            Some(AuthContextStatusKind::Available)
+        }
+        ExpiryStatus::Expired { .. } => Some(AuthContextStatusKind::AuthExpired),
+        ExpiryStatus::Unknown => None,
+    }
+}
+
 fn agent_bus_home() -> anyhow::Result<PathBuf> {
     if let Ok(home) = std::env::var("AGENT_BUS_HOME") {
         return Ok(PathBuf::from(home));
@@ -307,9 +349,9 @@ mod tests {
             allowed_chats: vec!["123".to_string()],
             repos: vec![
                 RepoEntry {
-                    id: "rallyup_a1b2c3d4".to_string(),
-                    display: "RallyUp".to_string(),
-                    path: "/tmp/RallyUp".to_string(),
+                    id: "sample_repo_a1b2c3d4".to_string(),
+                    display: "SampleRepo".to_string(),
+                    path: "/tmp/SampleRepo".to_string(),
                     agents: vec![
                         "claude".to_string(),
                         "gemini".to_string(),
@@ -330,8 +372,8 @@ mod tests {
         TelegramConfig {
             allowed_chats: vec!["123".to_string()],
             repos: vec![RepoEntry {
-                id: "rallyup".to_string(),
-                display: "RallyUp".to_string(),
+                id: "sample_repo".to_string(),
+                display: "SampleRepo".to_string(),
                 path: path.display().to_string(),
                 agents: vec!["codex".to_string()],
             }],
@@ -345,7 +387,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .set_default_repo("123", "rallyup_a1b2c3d4")
+            .set_default_repo("123", "sample_repo_a1b2c3d4")
             .await
             .unwrap();
         let bot = MockBot::default();
@@ -357,14 +399,14 @@ mod tests {
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].text.contains("Registered repos"));
-        assert!(sent[0].text.contains("RallyUp"));
+        assert!(sent[0].text.contains("SampleRepo"));
         assert_eq!(
             sent[0].keyboard,
             Some(InlineKeyboard {
                 rows: vec![
                     vec![(
-                        "RallyUp *".to_string(),
-                        "switch:rallyup_a1b2c3d4".to_string()
+                        "SampleRepo *".to_string(),
+                        "switch:sample_repo_a1b2c3d4".to_string()
                     )],
                     vec![(
                         "DocPrivy".to_string(),
@@ -433,7 +475,7 @@ mod tests {
         state
             .insert_pending(PendingPerm {
                 id: "perm-1".to_string(),
-                repo_id: "rallyup_a1b2c3d4".to_string(),
+                repo_id: "sample_repo_a1b2c3d4".to_string(),
                 command_hash: "sha256:abc".to_string(),
                 status: PendingPermStatus::Sent,
                 created_at: "2026-04-16T00:00:00Z".to_string(),
@@ -469,9 +511,58 @@ mod tests {
                 .pending_perms
                 .get("perm-1")
                 .map(|perm| &perm.status),
-            Some(&PendingPermStatus::Denied)
+            Some(&PendingPermStatus::DeniedByTelegram)
         );
         assert_eq!(bot.edited_messages()[0].text, "Denied by @alice");
+        assert_eq!(bot.answered_callbacks(), vec!["cb-perm".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn callback_perm_does_not_override_desktop_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state
+            .insert_pending(PendingPerm {
+                id: "perm-1".to_string(),
+                repo_id: "sample_repo_a1b2c3d4".to_string(),
+                command_hash: "sha256:abc".to_string(),
+                status: PendingPermStatus::ApprovedByDesktop,
+                created_at: "2026-04-16T00:00:00Z".to_string(),
+                timeout_at: "2026-04-16T00:00:10Z".to_string(),
+                message_id: Some(42),
+            })
+            .await
+            .unwrap();
+        let registry = super::perm::PendingPermRegistry::default();
+        let bot = MockBot::default();
+
+        handle_callback_perm(
+            &bot,
+            state.clone(),
+            registry,
+            MessageRef {
+                chat_id: 123,
+                message_id: 42,
+            },
+            "cb-perm".to_string(),
+            "perm:deny:perm-1".to_string(),
+            Some("alice".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state
+                .snapshot()
+                .await
+                .pending_perms
+                .get("perm-1")
+                .map(|perm| &perm.status),
+            Some(&PendingPermStatus::ApprovedByDesktop)
+        );
+        assert!(bot.edited_messages().is_empty());
         assert_eq!(bot.answered_callbacks(), vec!["cb-perm".to_string()]);
     }
 
@@ -513,9 +604,14 @@ mod tests {
             .unwrap();
         let bot = MockBot::default();
 
-        handle_text_command(&bot, &config_with_repo_path(dir.path()), state, &None, 123,
+        handle_text_command(
+            &bot,
+            &config_with_repo_path(dir.path()),
+            state,
+            &None,
+            123,
             Some("alice"),
-            "@bogus:rallyup foo",
+            "@bogus:sample_repo foo",
             None,
         )
         .await
@@ -523,7 +619,7 @@ mod tests {
 
         assert_eq!(
             bot.sent_messages()[0].text,
-            "Unknown agent or repo: @bogus:rallyup foo"
+            "Unknown agent or repo: @bogus:sample_repo foo"
         );
         assert!(!dir.path().join(".agents/inbox/bogus.md").exists());
     }
@@ -562,9 +658,14 @@ mod tests {
                     .await
                     .unwrap();
                 let bot = MockBot::default();
-                handle_text_command(&bot, &config_with_repo_path(dir.path()), state, &None, 123,
+                handle_text_command(
+                    &bot,
+                    &config_with_repo_path(dir.path()),
+                    state,
+                    &None,
+                    123,
                     Some("alice"),
-                    "@codex:rallyup     ",
+                    "@codex:sample_repo     ",
                     None,
                 )
                 .await
@@ -575,7 +676,7 @@ mod tests {
         let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("routing_rejected"));
         assert!(logs.contains("reason=empty_body"));
-        assert!(logs.contains("raw_snippet=\"@codex:rallyup     \""));
+        assert!(logs.contains("raw_snippet=\"@codex:sample_repo     \""));
     }
 
     #[test]
@@ -599,9 +700,9 @@ log_level: info
             r#"
 schema_version: 1
 repos:
-  - id: rallyup_a1b2c3d4
-    display: RallyUp
-    path: /tmp/RallyUp
+  - id: sample_repo_a1b2c3d4
+    display: SampleRepo
+    path: /tmp/SampleRepo
     agents: [claude, gemini, codex]
 "#,
         )
@@ -615,12 +716,32 @@ repos:
         assert_daemon_config_home(&loaded, dir.path());
         assert_eq!(loaded.bot_token, "token");
         assert_eq!(loaded.telegram.allowed_chats, vec!["123".to_string()]);
-        assert_eq!(loaded.telegram.repos[0].display, "RallyUp");
+        assert_eq!(loaded.telegram.repos[0].display, "SampleRepo");
     }
 
     #[test]
     fn daemon_side_peer_uid_trait_is_usable_for_future_uds_server() {
         verify_peer_uid(&MockPeerUid::new(1000), &(), 1000).unwrap();
+    }
+
+    #[test]
+    fn startup_token_status_does_not_block_refreshable_claude_oauth() {
+        let expires_at = time::OffsetDateTime::UNIX_EPOCH;
+
+        assert_eq!(
+            super::startup_token_status_kind(
+                "claude",
+                agent_bus_core::token_expiry::ExpiryStatus::Expired { expires_at }
+            ),
+            Some(agent_bus_core::state::AuthContextStatusKind::Available)
+        );
+        assert_eq!(
+            super::startup_token_status_kind(
+                "codex",
+                agent_bus_core::token_expiry::ExpiryStatus::Expired { expires_at }
+            ),
+            Some(agent_bus_core::state::AuthContextStatusKind::AuthExpired)
+        );
     }
 
     #[test]

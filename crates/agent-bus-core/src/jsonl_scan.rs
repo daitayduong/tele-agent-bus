@@ -160,6 +160,20 @@ mod tests {
     }
 
     #[test]
+    fn hit_limit_phrase_in_synthetic_assistant_message_matches() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"You've hit your limit · resets 2pm (America/Regina)"}}]}}}}"#
+        )
+        .unwrap();
+
+        let (kind, classifier) = scan_and_classify(file.path()).unwrap();
+        assert_eq!(kind, ResultKind::QuotaExhausted);
+        assert_eq!(classifier, "jsonl_tail:claude_hit_limit");
+    }
+
+    #[test]
     fn auth_phrase_in_content_matches() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, r#"{{"role":"assistant","content":"not logged in"}}"#).unwrap();

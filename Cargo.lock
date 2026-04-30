@@ -23,6 +23,7 @@ dependencies = [
  "predicates",
  "rand",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -65,7 +66,9 @@ dependencies = [
 name = "agent-bus-hook"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

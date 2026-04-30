@@ -103,13 +103,13 @@ mod tests {
 
     #[test]
     fn test_parse_explicit_repo() {
-        let routed = RoutingParser::parse("@codex:rallyup fix the lint warning", None).unwrap();
+        let routed = RoutingParser::parse("@codex:sample_repo fix the lint warning", None).unwrap();
 
         assert_eq!(
             routed,
             Routed {
                 agent: "codex".to_string(),
-                repo: "rallyup".to_string(),
+                repo: "sample_repo".to_string(),
                 body: "fix the lint warning".to_string(),
             }
         );
@@ -117,21 +117,21 @@ mod tests {
 
     #[test]
     fn test_parse_default_repo_fallback() {
-        let routed = RoutingParser::parse("  @codex fix the bug", Some("rallyup")).unwrap();
+        let routed = RoutingParser::parse("  @codex fix the bug", Some("sample_repo")).unwrap();
 
         assert_eq!(routed.agent, "codex");
-        assert_eq!(routed.repo, "rallyup");
+        assert_eq!(routed.repo, "sample_repo");
         assert_eq!(routed.body, "fix the bug");
     }
 
     #[test]
     fn test_parse_rejects_traversal() {
         assert_eq!(
-            RoutingParser::parse("@../etc:rallyup pwn", Some("rallyup")).unwrap_err(),
+            RoutingParser::parse("@../etc:sample_repo pwn", Some("sample_repo")).unwrap_err(),
             RoutingError::InvalidAgentName
         );
         assert_eq!(
-            RoutingParser::parse("@codex:../../etc/passwd msg", Some("rallyup")).unwrap_err(),
+            RoutingParser::parse("@codex:../../etc/passwd msg", Some("sample_repo")).unwrap_err(),
             RoutingError::InvalidRepoName
         );
     }
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn test_parse_rejects_empty_body() {
         assert_eq!(
-            RoutingParser::parse("@codex:rallyup     ", None).unwrap_err(),
+            RoutingParser::parse("@codex:sample_repo     ", None).unwrap_err(),
             RoutingError::EmptyBody
         );
     }
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn test_parse_ignores_at_mid_message() {
         assert_eq!(
-            RoutingParser::parse("hello @codex foo", Some("rallyup")).unwrap_err(),
+            RoutingParser::parse("hello @codex foo", Some("sample_repo")).unwrap_err(),
             RoutingError::NoMatch
         );
     }
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn test_parse_rejects_body_over_4096() {
         let body = "a".repeat(4097);
-        let input = format!("@codex:rallyup {body}");
+        let input = format!("@codex:sample_repo {body}");
 
         assert_eq!(
             RoutingParser::parse(&input, None).unwrap_err(),

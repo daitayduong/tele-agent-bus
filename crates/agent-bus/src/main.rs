@@ -4,9 +4,9 @@
 mod cli;
 mod daemon;
 
-use clap::{Parser, Subcommand};
 use crate::cli::auth::RegisterArgs;
 use crate::cli::blacklist::BlacklistCommands;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "agent-bus")]
@@ -77,6 +77,8 @@ enum RepoCommands {
     List,
     /// Remove a repository by ID
     Remove { id: String },
+    /// Install the Claude Code permission hook for a repository
+    InstallHook { path: String },
 }
 
 #[derive(Subcommand)]
@@ -96,6 +98,7 @@ fn main() -> anyhow::Result<()> {
             RepoCommands::Add { path } => cli::repo::add(&path)?,
             RepoCommands::List => cli::repo::list()?,
             RepoCommands::Remove { id } => cli::repo::remove(&id)?,
+            RepoCommands::InstallHook { path } => cli::repo::install_hook(&path)?,
         },
         Commands::Config { command } => match command {
             ConfigCommands::Show => cli::config::show()?,
@@ -112,7 +115,11 @@ fn main() -> anyhow::Result<()> {
                 agent,
                 id,
                 label,
-                require_owner_approval: if require_owner_approval { Some(true) } else { None },
+                require_owner_approval: if require_owner_approval {
+                    Some(true)
+                } else {
+                    None
+                },
             })?,
             AuthCommands::Login { agent, id } => cli::auth::login(agent, id)?,
             AuthCommands::List { agent } => cli::auth::list(agent)?,

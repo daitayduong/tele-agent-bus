@@ -113,8 +113,8 @@ fn validate_inner(bus: &Path) -> anyhow::Result<()> {
 }
 
 fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_yaml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
@@ -125,8 +125,8 @@ fn load_repos(path: &Path) -> anyhow::Result<ReposFile> {
             repos: Vec::new(),
         });
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_yaml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
@@ -142,7 +142,11 @@ mod tests {
             "schema_version: 1\ntelegram:\n  bot_token: abc\n  allowed_chats: [\"123\"]\n",
         )
         .unwrap();
-        std::fs::write(bus.path().join("repos.yaml"), "schema_version: 1\nrepos: []\n").unwrap();
+        std::fs::write(
+            bus.path().join("repos.yaml"),
+            "schema_version: 1\nrepos: []\n",
+        )
+        .unwrap();
 
         validate_inner(bus.path()).unwrap();
     }

@@ -1,5 +1,5 @@
-use std::path::Path;
 use std::fmt;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -22,7 +22,9 @@ pub struct RepoId(String);
 impl RepoId {
     pub fn new(id: String) -> Result<Self, RepoIdError> {
         // Validation logic from AC-R4
-        let is_valid = id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        let is_valid = id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             && !id.is_empty()
             && id.len() <= 64
             && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
@@ -50,7 +52,6 @@ impl fmt::Display for RepoId {
         write!(f, "{}", self.0)
     }
 }
-
 
 pub fn compute_repo_id(display_slug: &str, path: impl AsRef<Path>) -> Result<String, RepoIdError> {
     let path_ref = path.as_ref();

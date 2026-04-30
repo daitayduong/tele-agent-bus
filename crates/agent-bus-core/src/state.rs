@@ -146,7 +146,7 @@ pub struct SessionState {
     pub pid: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingPermStatus {
     Pending,
@@ -154,6 +154,25 @@ pub enum PendingPermStatus {
     Approved,
     Denied,
     TimedOut,
+    ApprovedByTelegram,
+    DeniedByTelegram,
+    ApprovedByDesktop,
+    DeniedByDesktop,
+    Cancelled,
+    Superseded,
+}
+
+impl PendingPermStatus {
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Pending | Self::Sent)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvePendingOutcome {
+    Resolved,
+    AlreadyResolved(PendingPermStatus),
+    Missing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,6 +228,11 @@ enum StateCmd {
         id: String,
         verdict: PendingPermStatus,
         reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    ResolvePendingIfOpen {
+        id: String,
+        verdict: PendingPermStatus,
+        reply: oneshot::Sender<Result<ResolvePendingOutcome, StateError>>,
     },
     ExpirePending {
         id: String,
@@ -303,6 +327,23 @@ impl StateHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(StateCmd::ResolvePending {
+                id: id.into(),
+                verdict,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn resolve_pending_if_open(
+        &self,
+        id: impl Into<String>,
+        verdict: PendingPermStatus,
+    ) -> Result<ResolvePendingOutcome, StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::ResolvePendingIfOpen {
                 id: id.into(),
                 verdict,
                 reply,
@@ -526,9 +567,30 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
+                StateCmd::ResolvePendingIfOpen { id, verdict, reply } => {
+                    let outcome = match state.pending_perms.get_mut(&id) {
+                        Some(perm) if perm.status.is_open() => {
+                            perm.status = verdict;
+                            ResolvePendingOutcome::Resolved
+                        }
+                        Some(perm) => ResolvePendingOutcome::AlreadyResolved(perm.status),
+                        None => ResolvePendingOutcome::Missing,
+                    };
+                    let result = match outcome {
+                        ResolvePendingOutcome::Resolved => {
+                            publish_and_flush(&actor_snapshot, &path, &state)
+                                .await
+                                .map(|_| outcome)
+                        }
+                        _ => Ok(outcome),
+                    };
+                    let _ = reply.send(result);
+                }
                 StateCmd::ExpirePending { id, reply } => {
                     if let Some(perm) = state.pending_perms.get_mut(&id) {
-                        perm.status = PendingPermStatus::TimedOut;
+                        if perm.status.is_open() {
+                            perm.status = PendingPermStatus::TimedOut;
+                        }
                     }
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
@@ -730,7 +792,7 @@ mod tests {
     fn pending(id: &str) -> PendingPerm {
         PendingPerm {
             id: id.to_string(),
-            repo_id: "rallyup_a1b2c3d4".to_string(),
+            repo_id: "sample_repo_a1b2c3d4".to_string(),
             command_hash: "sha256:abc".to_string(),
             status: PendingPermStatus::Pending,
             created_at: "2026-04-16T00:00:00Z".to_string(),
@@ -825,7 +887,7 @@ mod tests {
 
         let bridge = BridgedSessionState {
             agent: "claude".to_string(),
-            repo_id: "rallyup_123".to_string(),
+            repo_id: "sample_repo_123".to_string(),
             desktop_session_id: "desk-uuid".to_string(),
             desktop_path: "/path/to/desk.jsonl".to_string(),
             mobile_session_id: "mob-uuid".to_string(),
@@ -931,7 +993,7 @@ mod tests {
             agent: "claude".to_string(),
             from: "john".to_string(),
             to: "partner".to_string(),
-            repo_id: "rallyup".to_string(),
+            repo_id: "sample_repo".to_string(),
             request_id: "req_01".to_string(),
             chat_id: 123456789,
             expires_at: "2026-04-18T14:20:00Z".to_string(),
@@ -964,10 +1026,6 @@ mod tests {
         let handle = spawn_state_actor(path.clone()).await.unwrap();
 
         handle.insert_pending(pending("perm-1")).await.unwrap();
-        handle
-            .resolve_pending("perm-1", PendingPermStatus::Approved)
-            .await
-            .unwrap();
         handle.expire_pending("perm-1").await.unwrap();
 
         let json = std::fs::read_to_string(path).unwrap();
@@ -982,6 +1040,62 @@ mod tests {
                 .get("perm-1")
                 .map(|perm| &perm.status),
             Some(&PendingPermStatus::TimedOut)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_perm_resolve_if_open_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path).await.unwrap();
+
+        handle.insert_pending(pending("perm-1")).await.unwrap();
+        let first = handle
+            .resolve_pending_if_open("perm-1", PendingPermStatus::ApprovedByDesktop)
+            .await
+            .unwrap();
+        let second = handle
+            .resolve_pending_if_open("perm-1", PendingPermStatus::DeniedByTelegram)
+            .await
+            .unwrap();
+
+        assert_eq!(first, ResolvePendingOutcome::Resolved);
+        assert_eq!(
+            second,
+            ResolvePendingOutcome::AlreadyResolved(PendingPermStatus::ApprovedByDesktop)
+        );
+        assert_eq!(
+            handle
+                .snapshot()
+                .await
+                .pending_perms
+                .get("perm-1")
+                .map(|perm| perm.status),
+            Some(PendingPermStatus::ApprovedByDesktop)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_perm_expire_does_not_override_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path).await.unwrap();
+
+        handle.insert_pending(pending("perm-1")).await.unwrap();
+        handle
+            .resolve_pending_if_open("perm-1", PendingPermStatus::ApprovedByTelegram)
+            .await
+            .unwrap();
+        handle.expire_pending("perm-1").await.unwrap();
+
+        assert_eq!(
+            handle
+                .snapshot()
+                .await
+                .pending_perms
+                .get("perm-1")
+                .map(|perm| perm.status),
+            Some(PendingPermStatus::ApprovedByTelegram)
         );
     }
 }

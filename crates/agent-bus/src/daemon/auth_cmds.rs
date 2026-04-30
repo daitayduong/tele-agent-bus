@@ -612,7 +612,7 @@ agents:
             agent: "claude".to_string(),
             from: "john".to_string(),
             to: "partner".to_string(),
-            repo_id: "rallyup".to_string(),
+            repo_id: "sample_repo".to_string(),
             request_id: "req1".to_string(),
             chat_id: 100,
             expires_at: "future".to_string(),

@@ -63,10 +63,7 @@ pub async fn spawn_claude_resume(
     let output = match timeout(dur, child.wait_with_output()).await {
         Ok(res) => res.context("claude process io error")?,
         Err(_) => {
-            return Err(anyhow!(
-                "claude headless timeout after {}s",
-                timeout_secs
-            ));
+            return Err(anyhow!("claude headless timeout after {}s", timeout_secs));
         }
     };
 

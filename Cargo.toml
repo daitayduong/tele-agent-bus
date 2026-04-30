@@ -12,6 +12,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
+authors = ["John Chuong"]
 repository = "https://github.com/daitayduong/tele-agent-bus"
 
 [workspace.dependencies]
@@ -32,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 # Telegram
 teloxide = { version = "0.13", default-features = false, features = ["rustls", "ctrlc_handler"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

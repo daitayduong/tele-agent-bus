@@ -9,6 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::cmp::Reverse;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
@@ -19,9 +20,6 @@ use time::OffsetDateTime;
 
 /// Fixed mobile session uuid reused across all forks. See spec §Data Model.
 pub const MOBILE_UUID: &str = "00000000-0000-4000-8000-000000000001";
-
-/// Maximum number of mobile archive files retained (see AC-10).
-pub const ARCHIVE_RETENTION: usize = 10;
 
 /// One active Claude desktop session discovered in \`~/.claude/projects/<hash>/\`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +35,7 @@ pub struct SessionInfo {
 
 /// Outcome of a fork operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ForkStats {
     pub lines_rewritten: usize,
     pub archived_previous: bool,
@@ -56,6 +55,7 @@ pub enum MobileCommand {
 /// - Other fields (cwd, gitBranch, uuid, parentUuid, promptId) are preserved.
 /// - Returns error if the line is not valid JSON.
 /// - Strips leading NUL/whitespace padding that appears in torn concurrent writes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn rewrite_session_id(line: &str, new_uuid: &str) -> Result<String> {
     let stripped = line.trim_start_matches(|c: char| c == '\0' || c.is_whitespace());
     if stripped.is_empty() {
@@ -78,6 +78,7 @@ pub fn rewrite_session_id(line: &str, new_uuid: &str) -> Result<String> {
 /// Fork a source JSONL session into a target file, rewriting sessionId to \`new_uuid\`.
 ///
 /// If \`target\` already exists, it MUST be archived. Returns stats for logging/Telegram reply.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn fork_session(source: &Path, target: &Path, new_uuid: &str) -> Result<ForkStats> {
     let mut archived_previous = false;
     if target.exists() {
@@ -92,10 +93,12 @@ pub fn fork_session(source: &Path, target: &Path, new_uuid: &str) -> Result<Fork
     let src_file = File::open(source)?;
     let reader = BufReader::new(src_file);
 
-    let tmp_path = target.with_file_name(format!("{}.tmp.{}", 
-        target.file_name().unwrap().to_str().unwrap(), 
-        std::process::id()));
-    
+    let tmp_path = target.with_file_name(format!(
+        "{}.tmp.{}",
+        target.file_name().unwrap().to_str().unwrap(),
+        std::process::id()
+    ));
+
     let mut lines_rewritten = 0;
     let mut lines_skipped = 0;
     {
@@ -137,7 +140,7 @@ pub fn fork_session(source: &Path, target: &Path, new_uuid: &str) -> Result<Fork
     }
 
     fs::rename(&tmp_path, target)?;
-    
+
     if let Some(parent) = target.parent() {
         File::open(parent)?.sync_all()?;
     }
@@ -155,7 +158,7 @@ pub fn detect_active_sessions(
     mtime_threshold_secs: u64,
 ) -> Result<Vec<SessionInfo>> {
     let mut active_uuids = std::collections::HashSet::new();
-    
+
     // Scan /proc for running claude processes
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
@@ -168,10 +171,10 @@ pub fn detect_active_sessions(
                             .map(|b| String::from_utf8_lossy(b).into_owned())
                             .filter(|s| !s.is_empty())
                             .collect();
-                        
+
                         for i in 0..args.len() {
                             if args[i] == "--resume" && i + 1 < args.len() {
-                                active_uuids.insert(args[i+1].clone());
+                                active_uuids.insert(args[i + 1].clone());
                             }
                         }
                     }
@@ -200,37 +203,37 @@ pub fn detect_active_sessions(
                 if is_fresh || is_active {
                     let file = File::open(&path)?;
                     let reader = BufReader::new(file);
-                    
+
                     let mut cwd = String::new();
                     let mut ai_title = None;
                     let mut first_prompt: Option<String> = None;
                     let mut turn_count = 0;
 
-                    for line in reader.lines() {
-                        if let Ok(line) = line {
-                            let stripped = line
-                                .trim_start_matches(|c: char| c == '\0' || c.is_whitespace());
-                            if let Ok(v) = serde_json::from_str::<Value>(stripped) {
-                                let t = v["type"].as_str().unwrap_or("");
-                                if t == "user" || t == "assistant" {
-                                    turn_count += 1;
-                                    if cwd.is_empty() {
-                                        if let Some(c) = v["cwd"].as_str() {
-                                            cwd = c.to_string();
-                                        }
+                    for line in reader.lines().map_while(Result::ok) {
+                        let stripped =
+                            line.trim_start_matches(|c: char| c == '\0' || c.is_whitespace());
+                        if let Ok(v) = serde_json::from_str::<Value>(stripped) {
+                            let t = v["type"].as_str().unwrap_or("");
+                            if t == "user" || t == "assistant" {
+                                turn_count += 1;
+                                if cwd.is_empty() {
+                                    if let Some(c) = v["cwd"].as_str() {
+                                        cwd = c.to_string();
                                     }
                                 }
-                                if t == "user" && first_prompt.is_none() {
-                                    if let Some(text) = extract_user_text(&v) {
-                                        if let Some(cleaned) = clean_prompt_snippet(&text) {
-                                            first_prompt = Some(cleaned);
-                                        }
+                            }
+                            if t == "user" && first_prompt.is_none() {
+                                if let Some(text) = extract_user_text(&v) {
+                                    if let Some(cleaned) = clean_prompt_snippet(&text) {
+                                        first_prompt = Some(cleaned);
                                     }
                                 }
-                                if t == "ai-title" {
-                                    if let Some(title) = v["title"].as_str() {
-                                        ai_title = Some(title.to_string());
-                                    }
+                            }
+                            if t == "ai-title" {
+                                if let Some(title) =
+                                    v["aiTitle"].as_str().or_else(|| v["title"].as_str())
+                                {
+                                    ai_title = Some(title.to_string());
                                 }
                             }
                         }
@@ -249,7 +252,7 @@ pub fn detect_active_sessions(
         }
     }
 
-    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    sessions.sort_by_key(|session| Reverse(session.last_modified));
     Ok(sessions)
 }
 
@@ -270,7 +273,7 @@ pub fn build_session_cards(sessions: &[SessionInfo]) -> Vec<Vec<(String, String)
 }
 
 /// Pick a concise label for the session card: ai-title → first-prompt → uuid fallback.
-fn pick_session_label(s: &SessionInfo) -> String {
+pub(crate) fn pick_session_label(s: &SessionInfo) -> String {
     const MAX: usize = 52;
     if let Some(t) = s.ai_title.as_ref() {
         if !t.trim().is_empty() {
@@ -293,13 +296,22 @@ fn pick_session_label(s: &SessionInfo) -> String {
 fn truncate_label(s: &str, max_chars: usize) -> String {
     let single_line: String = s
         .chars()
-        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let collapsed = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= max_chars {
         return collapsed;
     }
-    let head: String = collapsed.chars().take(max_chars.saturating_sub(1)).collect();
+    let head: String = collapsed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
     format!("{}…", head)
 }
 
@@ -326,7 +338,9 @@ fn extract_user_text(v: &Value) -> Option<String> {
 /// the first non-empty text chunk, or None if nothing usable remains.
 fn clean_prompt_snippet(text: &str) -> Option<String> {
     static TAG_RE: OnceLock<Regex> = OnceLock::new();
-    let re = TAG_RE.get_or_init(|| Regex::new(r"(?s)<[a-zA-Z_][a-zA-Z0-9_-]*>.*?</[a-zA-Z_][a-zA-Z0-9_-]*>").unwrap());
+    let re = TAG_RE.get_or_init(|| {
+        Regex::new(r"(?s)<[a-zA-Z_][a-zA-Z0-9_-]*>.*?</[a-zA-Z_][a-zA-Z0-9_-]*>").unwrap()
+    });
     let stripped = re.replace_all(text, " ");
     let cleaned = stripped.trim();
     if cleaned.is_empty() {
@@ -349,6 +363,7 @@ fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
 }
 
 /// Extract mobile turns (user+assistant messages) added after \`since\` from the mobile JSONL.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn extract_delta(jsonl_path: &Path, since: OffsetDateTime) -> Result<String> {
     let file = File::open(jsonl_path)?;
     let reader = BufReader::new(file);
@@ -376,6 +391,7 @@ pub fn extract_delta(jsonl_path: &Path, since: OffsetDateTime) -> Result<String>
 }
 
 /// Keep only the \`keep\` most-recent files in \`archive_dir\` (matching \`mobile-*.jsonl\`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn rotate_archives(archive_dir: &Path, keep: usize) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(archive_dir) {
@@ -390,7 +406,7 @@ pub fn rotate_archives(archive_dir: &Path, keep: usize) -> Result<Vec<PathBuf>> 
         }
     }
 
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|entry| Reverse(entry.1));
 
     let mut deleted = Vec::new();
     if files.len() > keep {
@@ -432,6 +448,7 @@ pub fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
 }
 
 /// Append a user-type marker JSONL line to a desktop session file (see AC-5).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn append_fork_marker(desktop_jsonl: &Path, mobile_uuid: &str) -> Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -449,8 +466,11 @@ pub fn append_fork_marker(desktop_jsonl: &Path, mobile_uuid: &str) -> Result<()>
     }
 
     let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    let msg = format!("[Mobile session {} forked at {}. Pending merge available on next prompt.]", mobile_uuid, now);
-    
+    let msg = format!(
+        "[Mobile session {} forked at {}. Pending merge available on next prompt.]",
+        mobile_uuid, now
+    );
+
     let line = json!({
         "type": "user",
         "isSidechain": true,
@@ -559,7 +579,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let active = dir.path().join("active-uuid.jsonl");
         let mobile = dir.path().join(format!("{MOBILE_UUID}.jsonl"));
-        fs::write(&active, r#"{"type":"user","sessionId":"active-uuid","timestamp":"2026-04-18T00:00:00Z"}"#).unwrap();
+        fs::write(
+            &active,
+            r#"{"type":"user","sessionId":"active-uuid","timestamp":"2026-04-18T00:00:00Z"}"#,
+        )
+        .unwrap();
         fs::write(&mobile, r#"{"type":"user","sessionId":"mobile"}"#).unwrap();
 
         let sessions = detect_active_sessions(dir.path(), MOBILE_UUID, 3600).unwrap();
@@ -599,6 +623,36 @@ mod tests {
         let sessions = detect_active_sessions(dir.path(), MOBILE_UUID, 3600).unwrap();
         // newest first
         assert!(sessions[0].last_modified >= sessions[1].last_modified);
+    }
+
+    #[test]
+    fn test_detect_active_sessions_reads_claude_ai_title_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r##"{"type":"user","sessionId":"desktop-session","cwd":"/repo","message":{"role":"user","content":"# Plan Command This command invokes the planner"}}"##,
+                "\n",
+                r#"{"type":"ai-title","sessionId":"desktop-session","aiTitle":"Plan Phase 4 tele-agent-bus quota rotation"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let sessions = detect_active_sessions(dir.path(), MOBILE_UUID, 3600).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.uuid == "desktop-session")
+            .expect("desktop session should be detected");
+
+        assert_eq!(
+            session.ai_title.as_deref(),
+            Some("Plan Phase 4 tele-agent-bus quota rotation")
+        );
+        assert!(build_session_cards(std::slice::from_ref(session))[0][0]
+            .0
+            .contains("Plan Phase 4 tele-agent-bus quota rotation"));
     }
 
     // ── build_session_cards ────────────────────────────────────────────────
@@ -666,14 +720,26 @@ mod tests {
 
     #[test]
     fn test_parse_mobile_command_list_aliases() {
-        assert_eq!(parse_mobile_command("@list_claude"), Some(MobileCommand::ListClaude));
-        assert_eq!(parse_mobile_command("@ls_cl_ses"), Some(MobileCommand::ListClaude));
-        assert_eq!(parse_mobile_command("  @LIST_CLAUDE  "), Some(MobileCommand::ListClaude));
+        assert_eq!(
+            parse_mobile_command("@list_claude"),
+            Some(MobileCommand::ListClaude)
+        );
+        assert_eq!(
+            parse_mobile_command("@ls_cl_ses"),
+            Some(MobileCommand::ListClaude)
+        );
+        assert_eq!(
+            parse_mobile_command("  @LIST_CLAUDE  "),
+            Some(MobileCommand::ListClaude)
+        );
     }
 
     #[test]
     fn test_parse_mobile_command_flush() {
-        assert_eq!(parse_mobile_command("@flush_mobile"), Some(MobileCommand::FlushMobile));
+        assert_eq!(
+            parse_mobile_command("@flush_mobile"),
+            Some(MobileCommand::FlushMobile)
+        );
     }
 
     #[test]
@@ -713,7 +779,8 @@ mod tests {
         let cutoff = OffsetDateTime::parse(
             "2026-04-18T00:30:00Z",
             &time::format_description::well_known::Rfc3339,
-        ).unwrap();
+        )
+        .unwrap();
         let delta = extract_delta(&path, cutoff).unwrap();
 
         assert!(delta.contains("new"));
@@ -740,7 +807,9 @@ mod tests {
     fn test_rotate_archives_keeps_n_most_recent() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..15 {
-            let path = dir.path().join(format!("mobile-2026-04-18T00-0{:02}-00Z.jsonl", i));
+            let path = dir
+                .path()
+                .join(format!("mobile-2026-04-18T00-0{:02}-00Z.jsonl", i));
             fs::write(&path, format!("archive {i}")).unwrap();
             // Space out mtimes
             let ts = std::time::SystemTime::now() - std::time::Duration::from_secs((14 - i) * 60);
@@ -748,7 +817,8 @@ mod tests {
         }
         let deleted = rotate_archives(dir.path(), 10).unwrap();
         assert_eq!(deleted.len(), 5);
-        let remaining: Vec<_> = fs::read_dir(dir.path()).unwrap()
+        let remaining: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with("mobile-"))
             .collect();
@@ -772,7 +842,11 @@ mod tests {
     fn test_append_fork_marker_adds_sidechain_line() {
         let dir = tempfile::tempdir().unwrap();
         let desktop = dir.path().join("desktop.jsonl");
-        fs::write(&desktop, r#"{"type":"user","sessionId":"x","message":"first"}"#).unwrap();
+        fs::write(
+            &desktop,
+            r#"{"type":"user","sessionId":"x","message":"first"}"#,
+        )
+        .unwrap();
 
         append_fork_marker(&desktop, MOBILE_UUID).unwrap();
 
@@ -788,7 +862,7 @@ mod tests {
     fn real_sessions_smoke() {
         let home = std::env::var("HOME").unwrap();
         let dir = PathBuf::from(format!(
-            "{}/.claude/projects/-home-john-chuong-Projects-RallyUp",
+            "{}/.claude/projects/-home-john-chuong-Projects-SampleRepo",
             home
         ));
         if !dir.exists() {

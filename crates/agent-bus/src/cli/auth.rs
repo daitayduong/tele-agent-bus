@@ -25,9 +25,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agent_bus_core::auth_context::{
-    AuthContextsFile, RawAgentBlock, RawContext, SUPPORTED_AGENTS,
-};
+use agent_bus_core::auth_context::{AuthContextsFile, RawContext, SUPPORTED_AGENTS};
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 
@@ -53,10 +51,7 @@ fn check_agent(agent: &str) -> Result<()> {
 
 fn check_id(id: &str) -> Result<()> {
     if !id_rx().is_match(id) {
-        bail!(
-            "invalid id '{}': must match ^[a-z][a-z0-9_-]{{0,31}}$",
-            id
-        );
+        bail!("invalid id '{}': must match ^[a-z][a-z0-9_-]{{0,31}}$", id);
     }
     Ok(())
 }
@@ -75,21 +70,18 @@ fn load_or_new(path: &Path) -> Result<AuthContextsFile> {
             mobile_context: None,
         });
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let raw: AuthContextsFile = serde_yaml::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw: AuthContextsFile =
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(raw)
 }
 
 fn save_atomic(path: &Path, file: &AuthContextsFile) -> Result<()> {
-    let yaml = serde_yaml::to_string(file)
-        .context("serializing auth-contexts.yaml")?;
+    let yaml = serde_yaml::to_string(file).context("serializing auth-contexts.yaml")?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("auth-contexts.yaml has no parent dir"))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let tmp = path.with_extension("yaml.tmp");
     {
         let mut f = fs::OpenOptions::new()
@@ -116,13 +108,11 @@ fn default_profile_dir(home: &Path, agent: &str, id: &str) -> PathBuf {
 }
 
 fn create_profile_dir(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     #[cfg(unix)]
     {
         let perms = fs::Permissions::from_mode(0o700);
-        fs::set_permissions(dir, perms)
-            .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+        fs::set_permissions(dir, perms).with_context(|| format!("chmod 0700 {}", dir.display()))?;
     }
     Ok(())
 }
@@ -201,10 +191,7 @@ fn register_inner(home: &Path, bus: &Path, args: RegisterArgs) -> Result<()> {
         id: args.id.clone(),
         label: args.label,
         owner: None,
-        profile_dir: format!(
-            "~/.agent-bus/auth/{}/{}",
-            args.agent, args.id
-        ),
+        profile_dir: format!("~/.agent-bus/auth/{}/{}", args.agent, args.id),
         enabled: true,
         auto_rotate: None,
         require_owner_approval: args.require_owner_approval,
@@ -222,11 +209,7 @@ fn register_inner(home: &Path, bus: &Path, args: RegisterArgs) -> Result<()> {
     Ok(())
 }
 
-fn list_inner(
-    bus: &Path,
-    agent_filter: Option<&str>,
-    out: &mut dyn Write,
-) -> Result<()> {
+fn list_inner(bus: &Path, agent_filter: Option<&str>, out: &mut dyn Write) -> Result<()> {
     if let Some(a) = agent_filter {
         check_agent(a)?;
     }
@@ -248,14 +231,14 @@ fn list_inner(
             writeln!(out, "  (no contexts)")?;
         }
         for c in &block.contexts {
-            let marker = if active == Some(c.id.as_str()) { "*" } else { " " };
+            let marker = if active == Some(c.id.as_str()) {
+                "*"
+            } else {
+                " "
+            };
             let enabled = if c.enabled { "enabled " } else { "disabled" };
             let label = c.label.as_deref().unwrap_or("");
-            writeln!(
-                out,
-                "  {} {:12} {} {}",
-                marker, c.id, enabled, label
-            )?;
+            writeln!(out, "  {} {:12} {} {}", marker, c.id, enabled, label)?;
         }
     }
     Ok(())
@@ -326,17 +309,13 @@ fn login_args(agent: &str) -> &'static [&'static str] {
     }
 }
 
-fn resolve_profile_dir(
-    home: &Path,
-    bus: &Path,
-    agent: &str,
-    id: &str,
-) -> Result<PathBuf> {
+fn resolve_profile_dir(home: &Path, bus: &Path, agent: &str, id: &str) -> Result<PathBuf> {
     let path = auth_contexts_path(bus);
     if !path.exists() {
         bail!(
             "no auth-contexts.yaml — run `agent-bus auth register {} {}` first",
-            agent, id
+            agent,
+            id
         );
     }
     let file = load_or_new(&path)?;
@@ -442,7 +421,10 @@ fn recheck_inner(home: &Path, bus: &Path, agent: &str, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn fake_env() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let td = tempdir().unwrap();
@@ -564,10 +546,9 @@ mod tests {
         let (_td, home, bus) = fake_env();
         register_inner(&home, &bus, args("claude", "john")).unwrap();
         use_inner(&bus, "claude", "john").unwrap();
-        let file: AuthContextsFile = serde_yaml::from_str(
-            &fs::read_to_string(bus.join(AUTH_CONTEXTS_FILE)).unwrap(),
-        )
-        .unwrap();
+        let file: AuthContextsFile =
+            serde_yaml::from_str(&fs::read_to_string(bus.join(AUTH_CONTEXTS_FILE)).unwrap())
+                .unwrap();
         assert_eq!(
             file.agents.get("claude").unwrap().active.as_deref(),
             Some("john")
@@ -588,17 +569,15 @@ mod tests {
         register_inner(&home, &bus, args("claude", "john")).unwrap();
 
         enabled_inner(&bus, "claude", "john", false).unwrap();
-        let file: AuthContextsFile = serde_yaml::from_str(
-            &fs::read_to_string(bus.join(AUTH_CONTEXTS_FILE)).unwrap(),
-        )
-        .unwrap();
+        let file: AuthContextsFile =
+            serde_yaml::from_str(&fs::read_to_string(bus.join(AUTH_CONTEXTS_FILE)).unwrap())
+                .unwrap();
         assert!(!file.agents["claude"].contexts[0].enabled);
 
         enabled_inner(&bus, "claude", "john", true).unwrap();
-        let file: AuthContextsFile = serde_yaml::from_str(
-            &fs::read_to_string(bus.join(AUTH_CONTEXTS_FILE)).unwrap(),
-        )
-        .unwrap();
+        let file: AuthContextsFile =
+            serde_yaml::from_str(&fs::read_to_string(bus.join(AUTH_CONTEXTS_FILE)).unwrap())
+                .unwrap();
         assert!(file.agents["claude"].contexts[0].enabled);
     }
 
@@ -614,7 +593,10 @@ mod tests {
 
     #[test]
     fn provider_env_maps_agents() {
-        assert_eq!(provider_env("claude").unwrap(), ("claude", "CLAUDE_CONFIG_DIR"));
+        assert_eq!(
+            provider_env("claude").unwrap(),
+            ("claude", "CLAUDE_CONFIG_DIR")
+        );
         assert_eq!(provider_env("codex").unwrap(), ("codex", "CODEX_HOME"));
         assert!(provider_env("gemini").is_err());
         assert!(provider_env("unknown").is_err());
@@ -630,6 +612,7 @@ mod tests {
 
     #[test]
     fn recheck_invokes_fake_bin_with_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Fake bin: a shell script that echoes the env var and exits 0.
         let (_td, home, bus) = fake_env();
         register_inner(&home, &bus, args("claude", "john")).unwrap();
@@ -658,11 +641,12 @@ mod tests {
     // ── login arg dispatch (phase4c bugfix) ──────────────────────────────
 
     fn write_argv_capture_script(path: &Path, argv_file: &Path) {
+        let quoted_argv = argv_file.display().to_string().replace('\'', "'\\''");
         fs::write(
             path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
-                argv_file.display()
+                "#!/bin/sh\nmkdir -p \"$(dirname '{0}')\"\nprintf '%s\\n' \"$@\" > '{0}'\nexit 0\n",
+                quoted_argv
             ),
         )
         .unwrap();
@@ -673,6 +657,7 @@ mod tests {
 
     #[test]
     fn login_spawns_auth_login_for_claude() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Claude Code CLI dispatches auth via `claude auth login`, not `claude login`.
         let (_td, home, bus) = fake_env();
         register_inner(&home, &bus, args("claude", "john")).unwrap();
@@ -703,6 +688,7 @@ mod tests {
 
     #[test]
     fn login_spawns_login_for_codex() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let (_td, home, bus) = fake_env();
         register_inner(&home, &bus, args("codex", "john")).unwrap();
 

@@ -25,9 +25,7 @@ use tokio::process::Command;
 
 use crate::daemon::runner::{AgentRunMode, AgentRunRequest, AgentSpawner, SpawnOutcome};
 
-const ENV_WHITELIST: &[&str] = &[
-    "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TMPDIR",
-];
+const ENV_WHITELIST: &[&str] = &["PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TMPDIR"];
 
 /// Concrete `AgentSpawner` that shells out to real CLI binaries.
 pub struct CliSpawner {
@@ -48,6 +46,7 @@ impl CliSpawner {
     }
 
     /// Override the binary for a single agent. Useful in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_bin(mut self, agent: &str, bin: PathBuf) -> Self {
         self.bins.insert(agent.to_string(), bin);
         self
@@ -109,11 +108,12 @@ impl AgentSpawner for CliSpawner {
         let mode = req.mode.clone();
 
         Box::pin(async move {
-            let bin = bin_opt
-                .ok_or_else(|| format!("spawn: no binary configured for '{agent}'"))?;
+            let bin =
+                bin_opt.ok_or_else(|| format!("spawn: no binary configured for '{agent}'"))?;
             let args = args_result?;
-            let mirror = materialize_codex_resume_session(&agent, &profile_dir, &mode)?;
-            let outcome = run_child(&agent, &bin, &args, &profile_dir, &cwd, &prompt, timeout).await;
+            let mirror = materialize_resume_session(&agent, &profile_dir, &cwd, &mode)?;
+            let outcome =
+                run_child(&agent, &bin, &args, &profile_dir, &cwd, &prompt, timeout).await;
             if let Some(mirror) = mirror {
                 mirror.copy_back()?;
             }
@@ -122,12 +122,12 @@ impl AgentSpawner for CliSpawner {
     }
 }
 
-struct CodexSessionMirror {
+struct SessionMirror {
     source_path: PathBuf,
     profile_path: PathBuf,
 }
 
-impl CodexSessionMirror {
+impl SessionMirror {
     fn copy_back(&self) -> Result<(), String> {
         if !self.profile_path.exists() {
             return Ok(());
@@ -137,31 +137,51 @@ impl CodexSessionMirror {
     }
 }
 
-fn materialize_codex_resume_session(
+fn materialize_resume_session(
     agent: &str,
     profile_dir: &Path,
+    repo_path: &Path,
     mode: &AgentRunMode,
-) -> Result<Option<CodexSessionMirror>, String> {
-    if agent != "codex" {
-        return Ok(None);
+) -> Result<Option<SessionMirror>, String> {
+    match (agent, mode) {
+        (
+            "codex",
+            AgentRunMode::CodexResume {
+                session_id,
+                transcript_path: Some(source_path),
+            },
+        ) => {
+            let source_path = source_path
+                .canonicalize()
+                .map_err(|e| format!("codex transcript path invalid: {e}"))?;
+            let profile_path = codex_profile_session_path(profile_dir, session_id, &source_path);
+            copy_file_atomic(&source_path, &profile_path)
+                .map_err(|e| format!("codex session materialize failed: {e}"))?;
+            Ok(Some(SessionMirror {
+                source_path,
+                profile_path,
+            }))
+        }
+        ("claude", AgentRunMode::ClaudeResume { mobile_uuid }) => {
+            let Some(source_path) = claude_default_session_path(repo_path, mobile_uuid) else {
+                return Ok(None);
+            };
+            let source_path = source_path
+                .canonicalize()
+                .map_err(|e| format!("claude transcript path invalid: {e}"))?;
+            let profile_path = claude_profile_session_path(profile_dir, repo_path, mobile_uuid);
+            if source_path == profile_path {
+                return Ok(None);
+            }
+            copy_file_atomic(&source_path, &profile_path)
+                .map_err(|e| format!("claude session materialize failed: {e}"))?;
+            Ok(Some(SessionMirror {
+                source_path,
+                profile_path,
+            }))
+        }
+        _ => Ok(None),
     }
-    let AgentRunMode::CodexResume {
-        session_id,
-        transcript_path: Some(source_path),
-    } = mode
-    else {
-        return Ok(None);
-    };
-    let source_path = source_path
-        .canonicalize()
-        .map_err(|e| format!("codex transcript path invalid: {e}"))?;
-    let profile_path = codex_profile_session_path(profile_dir, session_id, &source_path);
-    copy_file_atomic(&source_path, &profile_path)
-        .map_err(|e| format!("codex session materialize failed: {e}"))?;
-    Ok(Some(CodexSessionMirror {
-        source_path,
-        profile_path,
-    }))
 }
 
 fn codex_profile_session_path(profile_dir: &Path, session_id: &str, source_path: &Path) -> PathBuf {
@@ -180,6 +200,28 @@ fn codex_profile_session_path(profile_dir: &Path, session_id: &str, source_path:
         .join("sessions")
         .join("agent-bus")
         .join(format!("rollout-{session_id}.jsonl"))
+}
+
+fn claude_default_session_path(repo_path: &Path, session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(
+        home.join(".claude")
+            .join("projects")
+            .join(project_hash_for_repo(repo_path))
+            .join(format!("{session_id}.jsonl")),
+    )
+    .filter(|path| path.exists())
+}
+
+fn claude_profile_session_path(profile_dir: &Path, repo_path: &Path, session_id: &str) -> PathBuf {
+    profile_dir
+        .join("projects")
+        .join(project_hash_for_repo(repo_path))
+        .join(format!("{session_id}.jsonl"))
+}
+
+fn project_hash_for_repo(repo_path: &Path) -> String {
+    repo_path.to_string_lossy().replace('/', "-")
 }
 
 fn copy_file_atomic(source: &Path, target: &Path) -> std::io::Result<()> {
@@ -301,8 +343,7 @@ mod tests {
     use crate::daemon::runner::AgentRunMode;
 
     fn fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/fake-cli")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cli")
     }
 
     fn ctx(agent: &str, profile_dir: PathBuf) -> AuthContext {
@@ -321,7 +362,7 @@ mod tests {
     fn req(agent: &str, prompt: &str, cwd: PathBuf) -> AgentRunRequest {
         AgentRunRequest {
             agent: agent.to_string(),
-            repo_id: "rallyup".to_string(),
+            repo_id: "sample_repo".to_string(),
             repo_path: cwd,
             prompt: prompt.to_string(),
             mode: AgentRunMode::Fresh,
@@ -340,15 +381,24 @@ mod tests {
         let spawner = CliSpawner::new().with_bin("claude", bin);
 
         let outcome = spawner
-            .spawn(&ctx("claude", profile.clone()), &req("claude", "hello", tmp.path().to_path_buf()))
+            .spawn(
+                &ctx("claude", profile.clone()),
+                &req("claude", "hello", tmp.path().to_path_buf()),
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome.exit_code, Some(0));
         assert!(!outcome.timed_out);
-        assert!(outcome.stdout.contains("ok: hello"), "stdout: {}", outcome.stdout);
         assert!(
-            outcome.stdout.contains(&format!("[config={}]", profile.display())),
+            outcome.stdout.contains("ok: hello"),
+            "stdout: {}",
+            outcome.stdout
+        );
+        assert!(
+            outcome
+                .stdout
+                .contains(&format!("[config={}]", profile.display())),
             "stdout should echo CLAUDE_CONFIG_DIR: {}",
             outcome.stdout
         );
@@ -362,12 +412,19 @@ mod tests {
         let spawner = CliSpawner::new().with_bin("claude", bin);
 
         let outcome = spawner
-            .spawn(&ctx("claude", tmp.path().to_path_buf()), &req("claude", "", tmp.path().to_path_buf()))
+            .spawn(
+                &ctx("claude", tmp.path().to_path_buf()),
+                &req("claude", "", tmp.path().to_path_buf()),
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome.exit_code, Some(1));
-        assert!(outcome.stderr.contains("usage limit"), "stderr: {}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("usage limit"),
+            "stderr: {}",
+            outcome.stderr
+        );
     }
 
     #[tokio::test]
@@ -378,13 +435,18 @@ mod tests {
         let spawner = CliSpawner::new().with_bin("codex", bin);
 
         let outcome = spawner
-            .spawn(&ctx("codex", profile.clone()), &req("codex", "hi", tmp.path().to_path_buf()))
+            .spawn(
+                &ctx("codex", profile.clone()),
+                &req("codex", "hi", tmp.path().to_path_buf()),
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.stdout.contains("codex-ok: hi"));
-        assert!(outcome.stdout.contains(&format!("[config={}]", profile.display())));
+        assert!(outcome
+            .stdout
+            .contains(&format!("[config={}]", profile.display())));
     }
 
     #[tokio::test]
@@ -399,10 +461,7 @@ mod tests {
             session_id: "codex-session-123".to_string(),
             transcript_path: None,
         };
-        let outcome = spawner
-            .spawn(&ctx("codex", profile), &r)
-            .await
-            .unwrap();
+        let outcome = spawner.spawn(&ctx("codex", profile), &r).await.unwrap();
 
         assert_eq!(outcome.exit_code, Some(0));
         assert!(
@@ -458,8 +517,7 @@ echo codex-ok
             .unwrap();
 
         assert_eq!(outcome.exit_code, Some(0));
-        let profile_copy =
-            profile.join("sessions/2026/04/20/rollout-codex-session-123.jsonl");
+        let profile_copy = profile.join("sessions/2026/04/20/rollout-codex-session-123.jsonl");
         assert!(profile_copy.exists());
         let copied_back = std::fs::read_to_string(&source).unwrap();
         assert!(copied_back.contains("from profile"));
@@ -487,14 +545,84 @@ echo codex-ok
     }
 
     #[tokio::test]
+    async fn spawn_claude_resume_materializes_desktop_transcript_into_auth_profile_and_copies_back()
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("Projects/SampleRepo");
+        let profile = home.join(".agent-bus/auth/claude/john");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let session_id = "783f5777-38f9-4152-8692-17b175c44aff";
+        let project_hash = project_hash_for_repo(&repo);
+        let desktop = home
+            .join(".claude/projects")
+            .join(&project_hash)
+            .join(format!("{session_id}.jsonl"));
+        std::fs::create_dir_all(desktop.parent().unwrap()).unwrap();
+        std::fs::write(&desktop, "{\"type\":\"user\",\"message\":\"desktop\"}\n").unwrap();
+
+        let bin = tmp.path().join("claude_materialize.sh");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+target="$CLAUDE_CONFIG_DIR/projects/{project_hash}/{session_id}.jsonl"
+test -f "$target"
+printf '{{"type":"assistant","message":"from profile"}}\n' >> "$target"
+echo claude-ok
+"#
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let spawner = CliSpawner::new().with_bin("claude", bin);
+        let mut r = req("claude", "msg", repo.clone());
+        r.mode = AgentRunMode::ClaudeResume {
+            mobile_uuid: session_id.to_string(),
+        };
+
+        let outcome = spawner
+            .spawn(&ctx("claude", profile.clone()), &r)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(
+                profile
+                    .join("projects")
+                    .join(&project_hash)
+                    .join(format!("{session_id}.jsonl"))
+            )
+            .unwrap()
+            .matches("from profile")
+            .count(),
+            1
+        );
+        assert!(std::fs::read_to_string(&desktop)
+            .unwrap()
+            .contains("from profile"));
+
+        std::env::remove_var("HOME");
+    }
+
+    #[tokio::test]
     async fn spawn_env_is_isolated() {
         // Parent has SECRET_TOKEN; child must NOT see it because env_clear()
         // is applied and SECRET_TOKEN is not in the whitelist.
         std::env::set_var("SECRET_TOKEN", "sk-should-not-leak");
         let tmp = tempfile::TempDir::new().unwrap();
+        let script_dir = tempfile::TempDir::new().unwrap();
 
         // Inline script that echoes SECRET_TOKEN if present.
-        let script = tmp.path().join("echo_secret.sh");
+        let script = script_dir.path().join("echo_secret.sh");
         std::fs::write(
             &script,
             "#!/usr/bin/env bash\ncat -\necho \"leak=${SECRET_TOKEN:-none}\"\nexit 0\n",
@@ -502,10 +630,14 @@ echo codex-ok
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::File::open(&script).unwrap().sync_all().unwrap();
 
         let spawner = CliSpawner::new().with_bin("claude", script);
         let outcome = spawner
-            .spawn(&ctx("claude", tmp.path().to_path_buf()), &req("claude", "x", tmp.path().to_path_buf()))
+            .spawn(
+                &ctx("claude", tmp.path().to_path_buf()),
+                &req("claude", "x", tmp.path().to_path_buf()),
+            )
             .await
             .unwrap();
 
@@ -521,11 +653,7 @@ echo codex-ok
     async fn spawn_timeout_kills_process() {
         let tmp = tempfile::TempDir::new().unwrap();
         let script = tmp.path().join("hang.sh");
-        std::fs::write(
-            &script,
-            "#!/usr/bin/env bash\ncat - >/dev/null\nsleep 10\n",
-        )
-        .unwrap();
+        std::fs::write(&script, "#!/usr/bin/env bash\ncat - >/dev/null\nsleep 10\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -555,7 +683,10 @@ echo codex-ok
         let tmp = tempfile::TempDir::new().unwrap();
         let spawner = CliSpawner::new();
         let err = spawner
-            .spawn(&ctx("gemini", tmp.path().to_path_buf()), &req("gemini", "hi", tmp.path().to_path_buf()))
+            .spawn(
+                &ctx("gemini", tmp.path().to_path_buf()),
+                &req("gemini", "hi", tmp.path().to_path_buf()),
+            )
             .await
             .unwrap_err();
         assert!(err.contains("gemini"), "err: {err}");

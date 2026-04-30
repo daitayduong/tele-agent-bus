@@ -37,6 +37,23 @@ pub struct PermCheckResponse {
     pub destructive: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct PermResolveRequest {
+    pub protocol_version: u32,
+    pub perm_id: String,
+    pub decision: Decision,
+    /// Source that made the decision, e.g. "desktop" or "native".
+    pub source: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct PermResolveResponse {
+    pub protocol_version: u32,
+    pub perm_id: String,
+    pub resolved: bool,
+    pub status: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
@@ -102,8 +119,8 @@ mod tests {
             session_id: "sess-456".to_string(),
             tool: "Bash".to_string(),
             command: "ls".to_string(),
-            repo_id: Some("rallyup_a1b2c3d4".to_string()),
-            repo_hint: Some("rallyup".to_string()),
+            repo_id: Some("sample_repo_a1b2c3d4".to_string()),
+            repo_hint: Some("sample_repo".to_string()),
             timeout_ms: 10000,
         };
         let j = serde_json::to_value(&req).unwrap();
@@ -132,6 +149,23 @@ mod tests {
 
         let de: PermCheckResponse = serde_json::from_value(j).unwrap();
         assert_eq!(de, resp);
+    }
+
+    #[test]
+    fn test_perm_resolve_request_serialization() {
+        let req = PermResolveRequest {
+            protocol_version: PROTOCOL_VERSION,
+            perm_id: "perm-123".to_string(),
+            decision: Decision::Approve,
+            source: "desktop".to_string(),
+        };
+        let j = serde_json::to_value(&req).unwrap();
+        assert_eq!(j["perm_id"], "perm-123");
+        assert_eq!(j["decision"], "approve");
+        assert_eq!(j["source"], "desktop");
+
+        let de: PermResolveRequest = serde_json::from_value(j).unwrap();
+        assert_eq!(de, req);
     }
 
     #[test]

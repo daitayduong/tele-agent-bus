@@ -140,8 +140,8 @@ agents:
   claude:
     mode: ide-first
 repos:
-  - id: rallyup
-    path: ~/Projects/RallyUp
+  - id: sample_repo
+    path: ~/Projects/SampleRepo
     agents: [claude]
 ";
         let config = Config::load_from_str(yaml).unwrap();
@@ -149,7 +149,7 @@ repos:
         assert_eq!(config.telegram.bot_token, "plain-token");
         assert_eq!(config.permissions.fail_mode, FailMode::Hybrid);
         assert!(config.agents.contains_key("claude"));
-        assert_eq!(config.repos[0].id, "rallyup");
+        assert_eq!(config.repos[0].id, "sample_repo");
     }
 
     #[test]
@@ -167,7 +167,6 @@ repos: []
 ";
         let config = Config::load_from_str(yaml).unwrap();
         assert_eq!(config.permissions.timeout_seconds, 30);
-    
     }
 }
 

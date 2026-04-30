@@ -1,7 +1,7 @@
-use std::path::Path;
-use std::fs;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::fs;
+use std::path::Path;
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -26,8 +26,7 @@ pub fn compute_hmac(key: &[u8], body: &[u8]) -> String {
 }
 
 pub fn verify_hmac(key: &[u8], body: &[u8], hex_sig: &str) -> Result<(), IntegrityError> {
-    let sig = hex::decode(hex_sig.trim())
-        .map_err(|e| IntegrityError::InvalidHex(e.to_string()))?;
+    let sig = hex::decode(hex_sig.trim()).map_err(|e| IntegrityError::InvalidHex(e.to_string()))?;
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(body);
     mac.verify_slice(&sig).map_err(|_| IntegrityError::Mismatch)
@@ -79,7 +78,10 @@ mod tests {
         let key = b"secret";
         let body = b"hello world";
         let sig = compute_hmac(key, body);
-        assert!(matches!(verify_hmac(key, b"tampered", &sig), Err(IntegrityError::Mismatch)));
+        assert!(matches!(
+            verify_hmac(key, b"tampered", &sig),
+            Err(IntegrityError::Mismatch)
+        ));
     }
 
     #[test]

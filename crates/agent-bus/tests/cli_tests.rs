@@ -1,9 +1,9 @@
 use assert_cmd::prelude::*;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
-use std::fs;
-use std::path::Path;
-use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn test_init_creates_config_and_repos() -> anyhow::Result<()> {
@@ -35,14 +35,18 @@ fn setup_test_env(bus_home: &Path, etc_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(bus_home.join("repos"))?;
 
     fs::create_dir_all(etc_dir)?;
-    fs::write(etc_dir.join("blacklist.key"), "01234567890123456789012345678901")?;
+    fs::write(
+        etc_dir.join("blacklist.key"),
+        "01234567890123456789012345678901",
+    )?;
     fs::set_permissions(
         etc_dir.join("blacklist.key"),
         fs::Permissions::from_mode(0o640),
     )?;
 
     // repos.yaml wraps the list under schema_version + repos.
-    let yaml = "schema_version: 1\nrepos:\n  - id: rallyup\n    path: /tmp/rallyup\n    agents: []\n";
+    let yaml =
+        "schema_version: 1\nrepos:\n  - id: sample_repo\n    path: /tmp/sample_repo\n    agents: []\n";
     fs::write(bus_home.join("repos.yaml"), yaml)?;
     Ok(())
 }
@@ -57,17 +61,11 @@ fn test_cli_add_per_repo_writes_user_owned_file() -> anyhow::Result<()> {
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path()); // Custom env var for testing
-    cmd.args([
-        "blacklist",
-        "add",
-        "--repo",
-        "rallyup",
-        "^git push",
-    ]);
+    cmd.args(["blacklist", "add", "--repo", "sample_repo", "^git push"]);
     cmd.assert().success();
 
-    let blacklist_path = bus_home.join("repos/rallyup/blacklist.conf");
-    let hmac_path = bus_home.join("repos/rallyup/blacklist.conf.hmac");
+    let blacklist_path = bus_home.join("repos/sample_repo/blacklist.conf");
+    let hmac_path = bus_home.join("repos/sample_repo/blacklist.conf.hmac");
 
     assert!(blacklist_path.exists());
     assert!(hmac_path.exists());
@@ -100,13 +98,7 @@ fn test_cli_add_per_repo_fails_when_key_unreadable() -> anyhow::Result<()> {
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args([
-        "blacklist",
-        "add",
-        "--repo",
-        "rallyup",
-        "^git push",
-    ]);
+    cmd.args(["blacklist", "add", "--repo", "sample_repo", "^git push"]);
 
     cmd.assert()
         .failure()
@@ -116,7 +108,7 @@ fn test_cli_add_per_repo_fails_when_key_unreadable() -> anyhow::Result<()> {
         .stderr(predicates::str::contains(
             "add current user to the agent-bus group",
         ));
-    
+
     // Restore permissions for cleanup
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o640))?;
 
@@ -134,21 +126,15 @@ fn test_cli_list_per_repo_no_sudo_required() -> anyhow::Result<()> {
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args([
-        "blacklist",
-        "add",
-        "--repo",
-        "rallyup",
-        "secret-pattern",
-    ]);
+    cmd.args(["blacklist", "add", "--repo", "sample_repo", "secret-pattern"]);
     cmd.assert().success();
 
     // Now list it
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args(["blacklist", "list", "--repo", "rallyup"]);
-    
+    cmd.args(["blacklist", "list", "--repo", "sample_repo"]);
+
     cmd.assert()
         .success()
         .stdout(predicates::str::contains("secret-pattern"));
@@ -166,16 +152,11 @@ fn test_cli_add_rejects_unknown_repo() -> anyhow::Result<()> {
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args([
-        "blacklist",
-        "add",
-        "--repo",
-        "nonexistent-repo",
-        "pattern",
-    ]);
+    cmd.args(["blacklist", "add", "--repo", "nonexistent-repo", "pattern"]);
 
     cmd.assert()
-        .failure().stderr(predicates::str::contains("unknown repo: nonexistent-repo"));
+        .failure()
+        .stderr(predicates::str::contains("unknown repo: nonexistent-repo"));
 
     Ok(())
 }

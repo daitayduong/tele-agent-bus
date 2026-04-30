@@ -60,7 +60,7 @@ impl Blacklist {
             pattern,
             destructive,
         });
-        
+
         // Invalidate compiled set
         self.regex_set = None;
 
@@ -117,7 +117,7 @@ impl Blacklist {
 fn is_suspicious(command: &str) -> bool {
     // Spec §10.1: base64, eval, $(), ``, |sh, |bash, |python, exec
     let patterns = [
-        "base64", "eval", "$(", "`", "|sh", "|bash", "|python", "exec"
+        "base64", "eval", "$(", "`", "|sh", "|bash", "|python", "exec",
     ];
     for p in patterns {
         if command.contains(p) {
@@ -169,7 +169,7 @@ mod tests {
         let start = std::time::Instant::now();
         let matched = bl.check("final_pattern").unwrap();
         let duration = start.elapsed();
-        
+
         assert_eq!(matched.pattern, "final_pattern");
         // Should be fast
         assert!(duration.as_millis() < 100);

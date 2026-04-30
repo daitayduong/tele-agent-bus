@@ -43,12 +43,16 @@ pub type SharedAgentRunner = Option<Arc<AgentRunner<crate::daemon::cli_spawner::
 #[derive(Debug, Clone)]
 pub enum AgentRunMode {
     Fresh,
-    ClaudeResume { mobile_uuid: String },
+    ClaudeResume {
+        mobile_uuid: String,
+    },
     CodexResume {
         session_id: String,
         transcript_path: Option<PathBuf>,
     },
-    WithMobileContext { mobile_uuid: String },
+    WithMobileContext {
+        mobile_uuid: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -301,7 +305,7 @@ impl<S: AgentSpawner> AgentRunner<S> {
             } else {
                 let claude_ctx_id = snap.active_auth_context.get("claude");
                 let claude_ctx = claude_ctx_id.and_then(|id| self.cfg.context("claude", id));
-                
+
                 let jsonl_path = claude_ctx.map(|ctx| {
                     ctx.profile_dir
                         .join("projects")
@@ -319,7 +323,10 @@ impl<S: AgentSpawner> AgentRunner<S> {
                                     mobile_cfg.max_messages,
                                     mobile_cfg.include_tool_use,
                                 );
-                                req.prompt = format!("{}\n\n<user_prompt>\n{}\n</user_prompt>", rendered, req.prompt);
+                                req.prompt = format!(
+                                    "{}\n\n<user_prompt>\n{}\n</user_prompt>",
+                                    rendered, req.prompt
+                                );
                                 let _ = self.events.append(&serde_json::json!({
                                     "ts": (self.now_fn)().format(&Rfc3339).unwrap_or_default(),
                                     "event": "mobile_context_injected",
@@ -477,14 +484,24 @@ impl<S: AgentSpawner> AgentRunner<S> {
                     )
                     .await?;
 
-                    // Try next? Check policy for current ctx (auto_rotate).
-                    let can_rotate = ctx.auto_rotate || self.cfg.defaults.auto_rotate;
+                    // Try next? Allow rotation when either the exhausted source
+                    // permits leaving it or the target permits rotating into it.
+                    let next = usable.get(idx + 1);
+                    let can_rotate = self.cfg.defaults.auto_rotate
+                        || ctx.auto_rotate
+                        || next.is_some_and(|next| next.auto_rotate);
                     if !can_rotate || idx + 1 >= self.max_attempts {
-                        return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind, mobile_ctx_injected));
+                        return Ok(self.failure_response(
+                            outcome,
+                            ctx.id.clone(),
+                            attempts,
+                            kind,
+                            mobile_ctx_injected,
+                        ));
                     }
 
                     // Check next candidate's approval gate.
-                    if let Some(next) = usable.get(idx + 1) {
+                    if let Some(next) = next {
                         if next.require_owner_approval {
                             let request_id = format!("rot_{}", short_id(finished_at));
                             let rot = PendingRotation {
@@ -530,15 +547,30 @@ impl<S: AgentSpawner> AgentRunner<S> {
                     )
                     .await?;
                     // Rotation under normal policy
-                    let can_rotate = ctx.auto_rotate || self.cfg.defaults.auto_rotate;
+                    let next = usable.get(idx + 1);
+                    let can_rotate = self.cfg.defaults.auto_rotate
+                        || ctx.auto_rotate
+                        || next.is_some_and(|next| next.auto_rotate);
                     if !can_rotate || idx + 1 >= self.max_attempts {
-                        return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind, mobile_ctx_injected));
+                        return Ok(self.failure_response(
+                            outcome,
+                            ctx.id.clone(),
+                            attempts,
+                            kind,
+                            mobile_ctx_injected,
+                        ));
                     }
                     continue;
                 }
                 ResultKind::Timeout | ResultKind::UnknownFailure => {
                     // Do NOT auto-rotate on unknown/timeout in v1.
-                    return Ok(self.failure_response(outcome, ctx.id.clone(), attempts, kind, mobile_ctx_injected));
+                    return Ok(self.failure_response(
+                        outcome,
+                        ctx.id.clone(),
+                        attempts,
+                        kind,
+                        mobile_ctx_injected,
+                    ));
                 }
             }
         }
@@ -741,7 +773,10 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<SpawnOutcome, String>> + Send + '_>,
         > {
-            self.calls.lock().unwrap().push((ctx.id.clone(), req.prompt.clone()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((ctx.id.clone(), req.prompt.clone()));
             let next = {
                 let mut s = self.script.lock().unwrap();
                 if s.is_empty() {
@@ -784,26 +819,36 @@ mod tests {
         auto_rotate: bool,
         approval: bool,
     ) -> AuthContextsConfig {
+        cfg_two_claude_contexts_explicit(home, auto_rotate, false, approval)
+    }
+
+    fn cfg_two_claude_contexts_explicit(
+        home: &Path,
+        john_auto_rotate: bool,
+        partner_auto_rotate: bool,
+        approval: bool,
+    ) -> AuthContextsConfig {
         // Build a config directly via parse to exercise the real path validator.
         let y = format!(
             r#"
 version: 1
 defaults:
-  auto_rotate: {auto}
+  auto_rotate: false
   require_owner_approval: {appr}
 agents:
   claude:
     contexts:
       - id: john
         profile_dir: ~/.agent-bus/auth/claude/john
-        auto_rotate: {auto}
+        auto_rotate: {john_auto}
         require_owner_approval: false
       - id: partner
         profile_dir: ~/.agent-bus/auth/claude/partner
-        auto_rotate: false
+        auto_rotate: {partner_auto}
         require_owner_approval: {appr}
 "#,
-            auto = auto_rotate,
+            john_auto = john_auto_rotate,
+            partner_auto = partner_auto_rotate,
             appr = approval,
         );
         AuthContextsConfig::parse(&y, home).unwrap()
@@ -812,7 +857,7 @@ agents:
     fn req(agent: &str) -> AgentRunRequest {
         AgentRunRequest {
             agent: agent.to_string(),
-            repo_id: "rallyup".to_string(),
+            repo_id: "sample_repo".to_string(),
             repo_path: PathBuf::from("/tmp/rp"),
             prompt: "hi".to_string(),
             mode: AgentRunMode::Fresh,
@@ -878,6 +923,24 @@ agents:
         assert_eq!(resp.attempts.len(), 2);
         assert_eq!(resp.attempts[0].kind, ResultKind::QuotaExhausted);
         assert_eq!(resp.attempts[1].kind, ResultKind::Success);
+        let calls = spawner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "john");
+        assert_eq!(calls[1].0, "partner");
+    }
+
+    #[tokio::test]
+    async fn auto_rotates_when_target_context_allows_rotation() {
+        let (dir, state) = fresh_state().await;
+        let home = PathBuf::from("/home/alice");
+        let cfg = cfg_two_claude_contexts_explicit(&home, false, true, false);
+        let spawner = FakeSpawner::new(vec![quota_out(), ok_out("partner ok")]);
+        let events = events_log(dir.path());
+        let runner = AgentRunner::new(spawner.clone(), cfg, state, events);
+
+        let resp = runner.run(req("claude")).await.unwrap();
+        assert_eq!(resp.final_kind, ResultKind::Success);
+        assert_eq!(resp.auth_context, "partner");
         let calls = spawner.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "john");
@@ -1095,14 +1158,19 @@ agents:
         let (dir, state) = fresh_state().await;
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        
+
         let claude_profile = home.join(".agent-bus/auth/claude/john");
         let proj_dir = claude_profile.join("projects/-tmp-rp");
         std::fs::create_dir_all(&proj_dir).unwrap();
         let jsonl_path = proj_dir.join("mobile-123.jsonl");
-        std::fs::write(&jsonl_path, r#"{"type":"user","message":{"role":"user","content":"hello from mobile"}}"#).unwrap();
+        std::fs::write(
+            &jsonl_path,
+            r#"{"type":"user","message":{"role":"user","content":"hello from mobile"}}"#,
+        )
+        .unwrap();
 
-        let cfg_yaml = format!(r#"
+        let cfg_yaml = format!(
+            r#"
 version: 1
 agents:
   claude:
@@ -1113,21 +1181,31 @@ agents:
     contexts:
       - id: john
         profile_dir: {home}/.agent-bus/auth/codex/john
-"#, home=home.display());
+"#,
+            home = home.display()
+        );
         let cfg = AuthContextsConfig::parse(&cfg_yaml, &home).unwrap();
-        
-        state.set_active_auth_context("claude", "john").await.unwrap();
-        state.set_active_auth_context("codex", "john").await.unwrap();
+
+        state
+            .set_active_auth_context("claude", "john")
+            .await
+            .unwrap();
+        state
+            .set_active_auth_context("codex", "john")
+            .await
+            .unwrap();
 
         let spawner = FakeSpawner::new(vec![ok_out("codex reply")]);
         let runner = AgentRunner::new(spawner.clone(), cfg, state, events_log(dir.path()));
 
         let mut r = req("codex");
-        r.mode = AgentRunMode::WithMobileContext { mobile_uuid: "mobile-123".into() };
-        
+        r.mode = AgentRunMode::WithMobileContext {
+            mobile_uuid: "mobile-123".into(),
+        };
+
         let resp = runner.run(r).await.unwrap();
         assert!(resp.mobile_ctx_injected);
-        
+
         let calls = spawner.calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].1.contains("<mobile_session_context>"));

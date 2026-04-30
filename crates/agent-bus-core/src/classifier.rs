@@ -215,6 +215,11 @@ const CLAUDE_SPECS: &[(ResultKind, &str, &str)] = &[
     ),
     (
         ResultKind::QuotaExhausted,
+        "claude_hit_limit",
+        r"(?i)(you('ve| have)?\s+)?hit\s+your\s+limit",
+    ),
+    (
+        ResultKind::QuotaExhausted,
         "claude_quota_exceeded",
         r"(?i)quota.*exceeded",
     ),
@@ -353,6 +358,22 @@ mod tests {
         assert_eq!(
             r.classifier.as_deref(),
             Some("stderr_regex:claude_usage_limit")
+        );
+    }
+
+    #[test]
+    fn claude_hit_limit_message_is_quota() {
+        let c = default_classifier("claude").unwrap();
+        let r = c.classify(&out(
+            Some(1),
+            "",
+            "You've hit your limit · resets 2pm (America/Regina)",
+            false,
+        ));
+        assert_eq!(r.kind, ResultKind::QuotaExhausted);
+        assert_eq!(
+            r.classifier.as_deref(),
+            Some("stdout_regex:claude_hit_limit")
         );
     }
 

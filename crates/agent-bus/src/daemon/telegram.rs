@@ -9,15 +9,13 @@ use std::time::Duration;
 use crate::daemon::auth_cmds;
 use crate::daemon::claude_headless;
 use crate::daemon::codex_ipc::{CodexIpcClient, CodexIpcError};
-use crate::daemon::mobile_session::{
-    self, MobileCommand, SessionInfo, ARCHIVE_RETENTION, MOBILE_UUID,
-};
+use crate::daemon::mobile_session::{self, MobileCommand, SessionInfo, MOBILE_UUID};
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
 use crate::daemon::runner::{AgentRunMode, AgentRunRequest, RunnerError, SharedAgentRunner};
 use crate::daemon::session_bridge::{self, BridgeCommand, BridgeSyncStats};
 use agent_bus_core::auth_context::{AgentKind, AuthContextsConfig, LeadSource};
 use agent_bus_core::state::{
-    BridgedSessionState, MobileSessionState, PendingPermStatus, SessionSyncCursor, StateHandle,
+    BridgedSessionState, PendingPermStatus, ResolvePendingOutcome, SessionSyncCursor, StateHandle,
 };
 use teloxide::payloads::{AnswerCallbackQuerySetters, SendMessageSetters};
 use teloxide::prelude::{Requester, ResponseResult};
@@ -28,8 +26,6 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[cfg(test)]
 static CODEX_HOME_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-const CODEX_MOBILE_SESSION_ID: &str = "agent-bus-mobile-codex";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramConfig {
@@ -230,6 +226,7 @@ pub async fn handle_current_command<B: BotClient + ?Sized>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_text_command<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
@@ -358,6 +355,15 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
             .await
         }
     }
+}
+
+struct AgentRunInput {
+    repo_id: String,
+    repo_path: PathBuf,
+    prompt: String,
+    mode: AgentRunMode,
+    timeout: Duration,
+    chat_id: i64,
 }
 
 async fn handle_legacy_lead_command<B: BotClient + ?Sized>(
@@ -494,12 +500,14 @@ async fn handle_unaddressed_lead_message<B: BotClient + ?Sized>(
     let reply = run_agent_via_runner(
         runner,
         agent,
-        &repo.id,
-        PathBuf::from(&repo.path),
-        text.trim().to_string(),
-        mode,
-        Duration::from_secs(timeout_secs),
-        chat_id,
+        AgentRunInput {
+            repo_id: repo.id.clone(),
+            repo_path: PathBuf::from(&repo.path),
+            prompt: text.trim().to_string(),
+            mode,
+            timeout: Duration::from_secs(timeout_secs),
+            chat_id,
+        },
     )
     .await;
     let reply = match reply {
@@ -528,7 +536,14 @@ fn lead_has_selected_session(
 ) -> bool {
     let chat_key = chat_id.to_string();
     match agent {
-        AgentKind::Claude => snapshot.mobile_sessions.contains_key(&chat_key),
+        AgentKind::Claude => {
+            snapshot
+                .bridged_sessions
+                .get(&chat_key)
+                .and_then(|by_agent| by_agent.get("claude"))
+                .is_some()
+                || snapshot.mobile_sessions.contains_key(&chat_key)
+        }
         AgentKind::Codex => snapshot
             .bridged_sessions
             .get(&chat_key)
@@ -692,9 +707,9 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
         .await
         .ok();
 
-    let prompt = codex_bridge_prompt(&bridge, repo, &body);
+    let fallback_prompt = codex_bridge_prompt(&bridge, repo, &body);
     let timeout = Duration::from_secs(claude_headless::resolved_timeout_secs());
-    let reply = match run_codex_bridge_via_desktop_ipc(&bridge, &prompt, timeout).await {
+    let reply = match run_codex_bridge_via_desktop_ipc(&bridge, &body, timeout).await {
         Ok(reply) => Ok(reply),
         Err(CodexBridgeIpcRunError::Fallback(reason)) => {
             tracing::warn!(
@@ -715,15 +730,17 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
             run_agent_via_runner(
                 runner,
                 AgentKind::Codex,
-                &bridge.repo_id,
-                PathBuf::from(&repo.path),
-                prompt,
-                AgentRunMode::CodexResume {
-                    session_id: bridge.desktop_session_id.clone(),
-                    transcript_path: Some(PathBuf::from(&bridge.desktop_path)),
+                AgentRunInput {
+                    repo_id: bridge.repo_id.clone(),
+                    repo_path: PathBuf::from(&repo.path),
+                    prompt: fallback_prompt,
+                    mode: AgentRunMode::CodexResume {
+                        session_id: bridge.desktop_session_id.clone(),
+                        transcript_path: Some(PathBuf::from(&bridge.desktop_path)),
+                    },
+                    timeout,
+                    chat_id,
                 },
-                timeout,
-                chat_id,
             )
             .await
         }
@@ -814,19 +831,17 @@ fn codex_bridge_prompt(
     user_message: &str,
 ) -> String {
     format!(
-        "[agent-bus session bridge]\n\
-You are continuing the selected desktop Codex session.\n\
-Use the selected session transcript as the primary context for this Telegram message.\n\
+        "[agent-bus desktop session bridge]\n\
+You are continuing the selected desktop Codex session directly.\n\
+Use the selected desktop session transcript as the primary context for this Telegram message.\n\
 Repo id: {repo_id}\n\
 Repo path: {repo_path}\n\
 Desktop session id: {desktop_session_id}\n\
-Mobile session id: {mobile_session_id}\n\
 \n\
 User message from Telegram:\n{user_message}",
         repo_id = bridge.repo_id,
         repo_path = repo.path,
         desktop_session_id = bridge.desktop_session_id,
-        mobile_session_id = bridge.mobile_session_id,
     )
 }
 
@@ -1049,56 +1064,6 @@ fn codex_home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".codex"))
 }
 
-fn codex_mobile_session_path(codex_home: &Path, repo_path: &str) -> PathBuf {
-    codex_home
-        .join("agent-bus")
-        .join("mobile")
-        .join(project_hash_for_repo(repo_path))
-        .join(format!("{CODEX_MOBILE_SESSION_ID}.jsonl"))
-}
-
-fn fork_codex_session_to_mobile(source_path: &Path, target_path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp_path = target_path.with_extension(format!("jsonl.tmp.{}", std::process::id()));
-    let text = std::fs::read_to_string(source_path)?;
-    let mut rendered = String::new();
-    for line in text.lines() {
-        let rewritten = rewrite_codex_mobile_line(line);
-        rendered.push_str(&rewritten);
-        rendered.push('\n');
-    }
-    std::fs::write(&tmp_path, rendered)?;
-    std::fs::rename(tmp_path, target_path)?;
-    Ok(())
-}
-
-fn rewrite_codex_mobile_line(line: &str) -> String {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return line.to_string();
-    };
-    if let Some(obj) = value.as_object_mut() {
-        if obj.contains_key("sessionId") {
-            obj.insert(
-                "sessionId".to_string(),
-                serde_json::json!(CODEX_MOBILE_SESSION_ID),
-            );
-        }
-        if obj.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
-            if let Some(payload) = obj
-                .get_mut("payload")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                if payload.contains_key("id") {
-                    payload.insert("id".to_string(), serde_json::json!(CODEX_MOBILE_SESSION_ID));
-                }
-            }
-        }
-    }
-    serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
-}
-
 pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
@@ -1128,7 +1093,6 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
 
     let project_dir = claude_project_dir(&repo.path);
     let source_path = project_dir.join(format!("{}.jsonl", desktop_uuid));
-    let target_path = project_dir.join(format!("{}.jsonl", MOBILE_UUID));
 
     let sessions = match mobile_session::detect_active_sessions(
         &project_dir,
@@ -1152,7 +1116,7 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         bot.edit_message_text(
             message,
             format!(
-                "⚠️ Session cwd {} does not match repo {}. Cannot fork across projects.",
+                "⚠️ Session cwd {} does not match repo {}. Cannot bridge across projects.",
                 session.cwd, repo.path
             ),
         )
@@ -1162,110 +1126,37 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         return Ok(());
     }
 
-    let archive_dir = agents_archive_dir(&repo.path);
-    if let Err(err) = std::fs::create_dir_all(&archive_dir) {
-        bot.answer_callback(
-            callback_id,
-            short_err("archive dir error", &err.to_string()),
-        )
-        .await?;
-        return Ok(());
-    }
-    if target_path.exists() {
-        let ts = timestamp_tag();
-        let archive_target = archive_dir.join(format!("mobile-{}.jsonl", ts));
-        if let Err(err) = std::fs::rename(&target_path, &archive_target) {
-            bot.answer_callback(
-                callback_id,
-                short_err("archive rename failed", &err.to_string()),
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-
-    if let Some(dir) = target_path.parent() {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let prefix = format!(
-                "{}.tmp.",
-                target_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-            );
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with(&prefix) {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
-        }
-    }
-
-    let fork_stats = match mobile_session::fork_session(&source_path, &target_path, MOBILE_UUID) {
-        Ok(s) => s,
-        Err(err) => {
-            bot.answer_callback(callback_id, short_err("fork failed", &err.to_string()))
-                .await?;
-            return Ok(());
-        }
-    };
-
-    if let Err(err) = mobile_session::append_fork_marker(&source_path, MOBILE_UUID) {
-        tracing::warn!(target: "agent_bus::mobile", error = %err, "append_fork_marker failed");
-    }
-
-    if let Err(err) = mobile_session::rotate_archives(&archive_dir, ARCHIVE_RETENTION) {
-        tracing::warn!(target: "agent_bus::mobile", error = %err, "rotate_archives failed");
-    }
-
     let now = time::OffsetDateTime::now_utc();
     let forked_at = now
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| now.unix_timestamp().to_string());
-    let project_hash = project_hash_for_repo(&repo.path);
-    let mobile = MobileSessionState {
-        mobile_uuid: MOBILE_UUID.to_string(),
-        mobile_fork_source: desktop_uuid.clone(),
-        mobile_forked_at: forked_at.clone(),
-        project_hash,
-        repo_id: repo.id.clone(),
-    };
     let desktop_offset = source_path.metadata().map(|m| m.len()).unwrap_or(0);
-    let mobile_offset = target_path.metadata().map(|m| m.len()).unwrap_or(0);
     let bridge = BridgedSessionState {
         agent: AgentKind::Claude.to_string(),
         repo_id: repo.id.clone(),
         desktop_session_id: desktop_uuid.clone(),
         desktop_path: source_path.display().to_string(),
-        mobile_session_id: MOBILE_UUID.to_string(),
-        mobile_path: target_path.display().to_string(),
+        mobile_session_id: desktop_uuid.clone(),
+        mobile_path: source_path.display().to_string(),
         selected_at: forked_at.clone(),
         sync: SessionSyncCursor {
             desktop_offset,
-            mobile_offset,
+            mobile_offset: desktop_offset,
             last_synced_at: None,
             last_error: None,
         },
     };
     state
-        .set_mobile_session(chat_id.to_string(), mobile)
-        .await?;
-    state
         .set_bridged_session(chat_id.to_string(), AgentKind::Claude.to_string(), bridge)
         .await?;
 
-    let title = session
-        .ai_title
-        .clone()
-        .unwrap_or_else(|| desktop_uuid.get(..8).unwrap_or(&desktop_uuid).to_string());
+    let title = mobile_session::pick_session_label(session);
     let confirm = format!(
-        "✅ Mobile forked from \"{}\" ({} lines rewritten). Send @claude <msg> to continue.",
-        title, fork_stats.lines_rewritten
+        "✅ Claude session \"{}\" selected. Send @claude <msg> to continue.",
+        title
     );
     bot.edit_message_text(message, confirm).await?;
-    bot.answer_callback(callback_id, "Forked".to_string())
+    bot.answer_callback(callback_id, "Selected".to_string())
         .await?;
     Ok(())
 }
@@ -1316,47 +1207,19 @@ pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
     let selected_at = now
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| now.unix_timestamp().to_string());
-    let codex_home = codex_home_dir();
-    let target_path = codex_mobile_session_path(&codex_home, &repo.path);
-    let archive_dir = agents_archive_dir(&repo.path);
-    if let Err(err) = std::fs::create_dir_all(&archive_dir) {
-        bot.answer_callback(
-            callback_id,
-            short_err("archive dir error", &err.to_string()),
-        )
-        .await?;
-        return Ok(());
-    }
-    if target_path.exists() {
-        let archive_target = archive_dir.join(format!("codex-mobile-{}.jsonl", timestamp_tag()));
-        if let Err(err) = std::fs::rename(&target_path, &archive_target) {
-            bot.answer_callback(
-                callback_id,
-                short_err("archive rename failed", &err.to_string()),
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-    if let Err(err) = fork_codex_session_to_mobile(&session.path, &target_path) {
-        bot.answer_callback(callback_id, short_err("fork failed", &err.to_string()))
-            .await?;
-        return Ok(());
-    }
 
     let desktop_offset = session.path.metadata().map(|m| m.len()).unwrap_or(0);
-    let mobile_offset = target_path.metadata().map(|m| m.len()).unwrap_or(0);
     let bridge = BridgedSessionState {
         agent: AgentKind::Codex.to_string(),
         repo_id: repo.id.clone(),
         desktop_session_id: session.id.clone(),
         desktop_path: session.path.display().to_string(),
-        mobile_session_id: CODEX_MOBILE_SESSION_ID.to_string(),
-        mobile_path: target_path.display().to_string(),
+        mobile_session_id: session.id.clone(),
+        mobile_path: session.path.display().to_string(),
         selected_at,
         sync: SessionSyncCursor {
             desktop_offset,
-            mobile_offset,
+            mobile_offset: desktop_offset,
             last_synced_at: None,
             last_error: None,
         },
@@ -1369,7 +1232,7 @@ pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
     let label = session.title.as_deref().unwrap_or(short);
     bot.edit_message_text(
         message,
-        format!("{label} selected. Mobile context replaced; send @codex <msg> to continue."),
+        format!("{label} selected. Send @codex <msg> to continue."),
     )
     .await?;
     bot.answer_callback(callback_id, "Selected".to_string())
@@ -1395,17 +1258,33 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
     }
 
     let snapshot = state.snapshot().await;
-    let Some(mobile) = snapshot.mobile_sessions.get(&chat_id.to_string()) else {
+    let chat_key = chat_id.to_string();
+    let bridge = snapshot
+        .bridged_sessions
+        .get(&chat_key)
+        .and_then(|by_agent| by_agent.get("claude"))
+        .cloned();
+    let mobile = snapshot.mobile_sessions.get(&chat_key).cloned();
+    let Some((repo_id, resume_uuid)) = bridge
+        .as_ref()
+        .map(|bridge| (bridge.repo_id.as_str(), bridge.desktop_session_id.as_str()))
+        .or_else(|| {
+            mobile
+                .as_ref()
+                .map(|mobile| (mobile.repo_id.as_str(), mobile.mobile_uuid.as_str()))
+        })
+    else {
         bot.send_message(
             chat_id,
-            "⚠️ No mobile session. Send @list_claude first to pick a desktop session.".to_string(),
+            "⚠️ No Claude session selected. Send @list_claude first to pick a desktop session."
+                .to_string(),
             None,
         )
         .await?;
         return Ok(());
     };
-    let Some(repo) = repo_by_id(config, &mobile.repo_id) else {
-        return Err(TelegramError::UnknownRepo(mobile.repo_id.clone()));
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.to_string()));
     };
 
     let cwd = PathBuf::from(&repo.path);
@@ -1422,16 +1301,16 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
     let reply = if let Some(runner) = agent_runner {
         run_claude_via_runner(
             runner,
-            &mobile.repo_id,
+            repo_id,
             cwd.clone(),
-            mobile.mobile_uuid.clone(),
+            resume_uuid.to_string(),
             body.clone(),
             Duration::from_secs(timeout_secs),
             chat_id,
         )
         .await
     } else {
-        run_claude_legacy(&cwd, &mobile.mobile_uuid, &body, timeout_secs).await
+        run_claude_legacy(&cwd, resume_uuid, &body, timeout_secs).await
     };
 
     let reply = match reply {
@@ -1530,12 +1409,7 @@ async fn run_claude_via_runner(
 async fn run_agent_via_runner(
     runner: &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
     agent: AgentKind,
-    repo_id: &str,
-    repo_path: PathBuf,
-    prompt: String,
-    mode: AgentRunMode,
-    timeout: Duration,
-    chat_id: i64,
+    input: AgentRunInput,
 ) -> Result<String, String> {
     let request_id = format!(
         "req_{}",
@@ -1543,14 +1417,14 @@ async fn run_agent_via_runner(
     );
     let req = AgentRunRequest {
         agent: agent.to_string(),
-        repo_id: repo_id.to_string(),
-        repo_path,
-        prompt,
-        mode,
+        repo_id: input.repo_id,
+        repo_path: input.repo_path,
+        prompt: input.prompt,
+        mode: input.mode,
         preferred_context: None,
-        timeout,
+        timeout: input.timeout,
         request_id,
-        chat_id: Some(chat_id),
+        chat_id: Some(input.chat_id),
     };
     match runner.run(req).await {
         Ok(resp) => match resp.final_kind {
@@ -1603,20 +1477,9 @@ fn project_hash_for_repo(repo_path: &str) -> String {
     repo_path.replace('/', "-")
 }
 
-fn agents_archive_dir(repo_path: &str) -> PathBuf {
-    PathBuf::from(repo_path).join(".agents").join("archive")
-}
-
 fn cwd_matches_repo(session_cwd: &str, repo_path: &str) -> bool {
     let normalize = |s: &str| s.trim_end_matches('/').to_string();
     normalize(session_cwd) == normalize(repo_path)
-}
-
-fn timestamp_tag() -> String {
-    let now = time::OffsetDateTime::now_utc();
-    now.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| now.unix_timestamp().to_string())
-        .replace(':', "-")
 }
 
 fn claude_bin_path() -> String {
@@ -1792,20 +1655,39 @@ pub async fn handle_callback_perm<B: BotClient + ?Sized>(
 
     let (status, verdict, text) = match action {
         "approve" => (
-            PendingPermStatus::Approved,
+            PendingPermStatus::ApprovedByTelegram,
             crate::daemon::perm::PermVerdict::Approve,
             "Approved",
         ),
         "deny" => (
-            PendingPermStatus::Denied,
+            PendingPermStatus::DeniedByTelegram,
             crate::daemon::perm::PermVerdict::Deny,
             "Denied",
         ),
         _ => return Err(TelegramError::InvalidCallback(callback_data)),
     };
 
-    registry.resolve(perm_id, verdict).await;
-    state.resolve_pending(perm_id.to_string(), status).await?;
+    match state
+        .resolve_pending_if_open(perm_id.to_string(), status)
+        .await?
+    {
+        ResolvePendingOutcome::Resolved => {
+            registry.resolve(perm_id, verdict).await;
+        }
+        ResolvePendingOutcome::AlreadyResolved(existing) => {
+            bot.answer_callback(
+                callback_id,
+                format!("Already resolved: {}", pending_perm_status_label(existing)),
+            )
+            .await?;
+            return Ok(());
+        }
+        ResolvePendingOutcome::Missing => {
+            bot.answer_callback(callback_id, "Permission request not found".to_string())
+                .await?;
+            return Ok(());
+        }
+    }
 
     let snapshot = state.snapshot().await;
     if snapshot
@@ -1820,6 +1702,26 @@ pub async fn handle_callback_perm<B: BotClient + ?Sized>(
     }
 
     bot.answer_callback(callback_id, text.to_string()).await
+}
+
+fn pending_perm_status_label(status: PendingPermStatus) -> &'static str {
+    pending_perm_status_text(status)
+}
+
+pub fn pending_perm_status_text(status: PendingPermStatus) -> &'static str {
+    match status {
+        PendingPermStatus::Pending => "pending",
+        PendingPermStatus::Sent => "sent",
+        PendingPermStatus::Approved => "approved",
+        PendingPermStatus::Denied => "denied",
+        PendingPermStatus::TimedOut => "timed_out",
+        PendingPermStatus::ApprovedByTelegram => "approved_by_telegram",
+        PendingPermStatus::DeniedByTelegram => "denied_by_telegram",
+        PendingPermStatus::ApprovedByDesktop => "approved_by_desktop",
+        PendingPermStatus::DeniedByDesktop => "denied_by_desktop",
+        PendingPermStatus::Cancelled => "cancelled",
+        PendingPermStatus::Superseded => "superseded",
+    }
 }
 
 fn is_allowed(config: &TelegramConfig, chat_id: i64) -> bool {
@@ -2121,18 +2023,21 @@ mod mobile_tests {
     use super::*;
     use agent_bus_core::state::spawn_state_actor;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
+    static CODEX_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn test_config() -> TelegramConfig {
-        config_with_repo_path("/tmp/rallyup-test")
+        config_with_repo_path("/tmp/sample_repo-test")
     }
 
     fn config_with_repo_path(path: impl Into<String>) -> TelegramConfig {
         TelegramConfig {
             allowed_chats: vec!["100".to_string()],
             repos: vec![RepoEntry {
-                id: "rallyup".to_string(),
-                display: "RallyUp".to_string(),
+                id: "sample_repo".to_string(),
+                display: "SampleRepo".to_string(),
                 path: path.into(),
                 agents: vec!["claude".to_string(), "codex".to_string()],
             }],
@@ -2174,7 +2079,7 @@ mod mobile_tests {
     }
 
     #[tokio::test]
-    async fn claude_msg_without_mobile_session_sends_guard_warning() {
+    async fn claude_msg_without_selected_session_sends_guard_warning() {
         let bot = MockBot::default();
         let config = test_config();
         let dir = tempdir().unwrap();
@@ -2198,7 +2103,7 @@ mod mobile_tests {
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
         assert!(
-            sent[0].text.contains("No mobile session"),
+            sent[0].text.contains("No Claude session selected"),
             "expected guard message, got: {:?}",
             sent[0].text
         );
@@ -2228,7 +2133,7 @@ mod mobile_tests {
                 AgentKind::Claude.to_string(),
                 BridgedSessionState {
                     agent: AgentKind::Claude.to_string(),
-                    repo_id: "rallyup".to_string(),
+                    repo_id: "sample_repo".to_string(),
                     desktop_session_id: "desktop-id".to_string(),
                     desktop_path: desktop.display().to_string(),
                     mobile_session_id: "mobile-id".to_string(),
@@ -2278,7 +2183,9 @@ mod mobile_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn list_codex_lists_matching_sessions() {
+        let _guard = CODEX_OVERRIDE_TEST_LOCK.lock().unwrap();
         let bot = MockBot::default();
         let dir = tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -2290,7 +2197,7 @@ mod mobile_tests {
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
 
         handle_text_command(&bot, &config, state, &None, 100, None, "@list_codex", None)
             .await
@@ -2305,7 +2212,9 @@ mod mobile_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn selecting_codex_writes_generic_bridge_state() {
+        let _guard = CODEX_OVERRIDE_TEST_LOCK.lock().unwrap();
         let bot = MockBot::default();
         let dir = tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -2317,7 +2226,7 @@ mod mobile_tests {
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
 
         handle_callback_sel_codex(
             &bot,
@@ -2340,19 +2249,16 @@ mod mobile_tests {
         assert_eq!(bridge.agent, "codex");
         assert_eq!(bridge.desktop_session_id, "codex-session-2");
         assert_eq!(bridge.desktop_path, session_path.display().to_string());
-        assert_ne!(bridge.mobile_path, session_path.display().to_string());
-        assert_eq!(bridge.mobile_session_id, CODEX_MOBILE_SESSION_ID);
-        assert!(bridge.mobile_path.ends_with(&format!(
-            "agent-bus/mobile/{}/{}.jsonl",
-            project_hash_for_repo(&repo.display().to_string()),
-            CODEX_MOBILE_SESSION_ID
-        )));
+        assert_eq!(bridge.mobile_session_id, "codex-session-2");
+        assert_eq!(bridge.mobile_path, session_path.display().to_string());
         assert_eq!(bot.answered_callbacks(), vec!["cb1".to_string()]);
         assert!(bot.edited_messages()[0].text.contains("selected"));
     }
 
     #[tokio::test]
-    async fn selecting_codex_replaces_fixed_mobile_transcript_and_archives_old_one() {
+    #[allow(clippy::await_holding_lock)]
+    async fn selecting_codex_targets_desktop_transcript_without_mobile_copy() {
+        let _guard = CODEX_OVERRIDE_TEST_LOCK.lock().unwrap();
         let bot = MockBot::default();
         let dir = tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -2365,15 +2271,8 @@ mod mobile_tests {
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
 
-        let mobile_path = codex_mobile_session_path(&codex_home, &repo.display().to_string());
-        std::fs::create_dir_all(mobile_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &mobile_path,
-            r#"{"sessionId":"agent-bus-mobile-codex","text":"old mobile data"}"#,
-        )
-        .unwrap();
         std::fs::write(
             &new_session_path,
             format!(
@@ -2404,27 +2303,11 @@ mod mobile_tests {
         let bridge = &snapshot.bridged_sessions["100"]["codex"];
         assert_eq!(bridge.desktop_session_id, "codex-session-new");
         assert_eq!(bridge.desktop_path, new_session_path.display().to_string());
-        assert_eq!(bridge.mobile_session_id, CODEX_MOBILE_SESSION_ID);
-        assert_eq!(bridge.mobile_path, mobile_path.display().to_string());
-
-        let mobile_content = std::fs::read_to_string(&mobile_path).unwrap();
-        assert!(mobile_content.contains("new desktop data"));
-        assert!(mobile_content.contains(CODEX_MOBILE_SESSION_ID));
-        assert!(!mobile_content.contains("old mobile data"));
-
-        let archive_dir = agents_archive_dir(&repo.display().to_string());
-        let archived = std::fs::read_dir(&archive_dir)
+        assert_eq!(bridge.mobile_session_id, "codex-session-new");
+        assert_eq!(bridge.mobile_path, new_session_path.display().to_string());
+        assert!(std::fs::read_to_string(&new_session_path)
             .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("codex-mobile-"))
-            })
-            .expect("old mobile transcript archived");
-        let archived_content = std::fs::read_to_string(archived).unwrap();
-        assert!(archived_content.contains("old mobile data"));
+            .contains("new desktop data"));
     }
 
     #[tokio::test]
@@ -2464,7 +2347,7 @@ mod mobile_tests {
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
         let session_path = dir.path().join("rollout-codex-session-xyz.jsonl");
         std::fs::write(
             &session_path,
@@ -2477,7 +2360,7 @@ mod mobile_tests {
                 "codex",
                 BridgedSessionState {
                     agent: "codex".to_string(),
-                    repo_id: "rallyup".to_string(),
+                    repo_id: "sample_repo".to_string(),
                     desktop_session_id: "codex-session-xyz".to_string(),
                     desktop_path: session_path.display().to_string(),
                     mobile_session_id: "codex-session-xyz".to_string(),
@@ -2535,7 +2418,7 @@ mod mobile_tests {
         );
         assert!(sent
             .iter()
-            .any(|m| m.text.contains("[agent-bus session bridge]")));
+            .any(|m| m.text.contains("[agent-bus desktop session bridge]")));
         assert!(sent.iter().any(|m| m
             .text
             .contains("User message from Telegram:\ncontinue this")));
@@ -2561,21 +2444,21 @@ mod mobile_tests {
     }
 
     #[tokio::test]
-    async fn claude_mobile_msg_uses_stored_repo_and_uuid() {
+    async fn claude_msg_without_selected_session_uses_guard_message() {
         let bot = MockBot::default();
         let config = test_config();
         let dir = tempdir().unwrap();
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
 
         handle_text_command(&bot, &config, state, &None, 100, None, "@claude hi", None)
             .await
             .unwrap();
 
         let sent = bot.sent_messages();
-        assert!(sent[0].text.contains("No mobile session"));
+        assert!(sent[0].text.contains("No Claude session selected"));
     }
 
     #[tokio::test]
@@ -2589,8 +2472,8 @@ mod mobile_tests {
     #[tokio::test]
     async fn project_hash_replaces_slashes() {
         assert_eq!(
-            project_hash_for_repo("/home/user/Projects/RallyUp"),
-            "-home-user-Projects-RallyUp"
+            project_hash_for_repo("/home/user/Projects/SampleRepo"),
+            "-home-user-Projects-SampleRepo"
         );
     }
 
@@ -2610,9 +2493,9 @@ mod mobile_tests {
         let bot = MockBot::default();
         let config = test_config();
         let dir = tempdir().unwrap();
-        // test_config uses `/tmp/rallyup-test` as repo.path and Command::current_dir
+        // test_config uses `/tmp/sample_repo-test` as repo.path and Command::current_dir
         // fails with ENOENT if the directory is missing. Ensure it exists.
-        std::fs::create_dir_all("/tmp/rallyup-test").unwrap();
+        std::fs::create_dir_all("/tmp/sample_repo-test").unwrap();
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
@@ -2622,7 +2505,7 @@ mod mobile_tests {
             .set_mobile_session(
                 "100".to_string(),
                 MobileSessionState {
-                    repo_id: "rallyup".to_string(),
+                    repo_id: "sample_repo".to_string(),
                     mobile_uuid: "aaaa-bbbb".to_string(),
                     mobile_fork_source: String::new(),
                     mobile_forked_at: String::new(),
@@ -2700,8 +2583,8 @@ mod mobile_tests {
         let config = TelegramConfig {
             allowed_chats: vec!["100".to_string()],
             repos: vec![RepoEntry {
-                id: "rallyup".to_string(),
-                display: "RallyUp".to_string(),
+                id: "sample_repo".to_string(),
+                display: "SampleRepo".to_string(),
                 path: repo_path.display().to_string(),
                 agents: vec!["claude".to_string()],
             }],
@@ -2709,12 +2592,12 @@ mod mobile_tests {
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
         state
             .set_mobile_session(
                 "100",
                 MobileSessionState {
-                    repo_id: "rallyup".to_string(),
+                    repo_id: "sample_repo".to_string(),
                     mobile_uuid: "mobile-uuid-123".to_string(),
                     mobile_fork_source: String::new(),
                     mobile_forked_at: String::new(),
@@ -2774,8 +2657,8 @@ mod mobile_tests {
         let config = TelegramConfig {
             allowed_chats: vec!["100".to_string()],
             repos: vec![RepoEntry {
-                id: "rallyup".to_string(),
-                display: "RallyUp".to_string(),
+                id: "sample_repo".to_string(),
+                display: "SampleRepo".to_string(),
                 path: repo_path.display().to_string(),
                 agents: vec!["codex".to_string()],
             }],
@@ -2783,7 +2666,7 @@ mod mobile_tests {
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
         state.set_lead_for_chat("100", "codex").await.unwrap();
         let session_path = dir.path().join("rollout-codex-session-xyz.jsonl");
         std::fs::write(
@@ -2799,7 +2682,7 @@ mod mobile_tests {
                 "codex",
                 BridgedSessionState {
                     agent: "codex".to_string(),
-                    repo_id: "rallyup".to_string(),
+                    repo_id: "sample_repo".to_string(),
                     desktop_session_id: "codex-session-xyz".to_string(),
                     desktop_path: session_path.display().to_string(),
                     mobile_session_id: "agent-bus-mobile-codex".to_string(),
@@ -2853,7 +2736,7 @@ mod mobile_tests {
         );
         assert!(sent
             .iter()
-            .any(|m| m.text.contains("[agent-bus session bridge]")));
+            .any(|m| m.text.contains("[agent-bus desktop session bridge]")));
         assert!(sent
             .iter()
             .any(|m| m.text.contains("OK, vậy là đúng rồi. Good job")));
@@ -2888,8 +2771,8 @@ mod mobile_tests {
         let config = TelegramConfig {
             allowed_chats: vec!["100".to_string()],
             repos: vec![RepoEntry {
-                id: "rallyup".to_string(),
-                display: "RallyUp".to_string(),
+                id: "sample_repo".to_string(),
+                display: "SampleRepo".to_string(),
                 path: repo_path.display().to_string(),
                 agents: vec!["claude".to_string()],
             }],
@@ -2897,7 +2780,7 @@ mod mobile_tests {
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
-        state.set_default_repo("100", "rallyup").await.unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
 
         handle_callback_sel_claude(
             &bot,
@@ -2926,5 +2809,18 @@ mod mobile_tests {
             snap.bridged_sessions["100"].contains_key("claude"),
             "bridged_sessions['100'] should contain 'claude'"
         );
+        assert!(
+            !snap.mobile_sessions.contains_key("100"),
+            "new Claude selections should not create a legacy mobile session"
+        );
+        let bridge = &snap.bridged_sessions["100"]["claude"];
+        assert_eq!(bridge.desktop_session_id, desktop_uuid);
+        assert_eq!(bridge.mobile_session_id, desktop_uuid);
+        assert_eq!(bridge.desktop_path, bridge.mobile_path);
+
+        let edited = bot.edited_messages();
+        assert_eq!(edited.len(), 1);
+        assert!(edited[0].text.contains("Claude session \"hello\" selected"));
+        assert!(!edited[0].text.contains("\"11111111\""));
     }
 }
