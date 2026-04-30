@@ -3,6 +3,7 @@ use agent_bus_core::state::{BridgedSessionState, StateHandle};
 use anyhow::{anyhow, Context};
 use fs2::FileExt;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -94,10 +95,11 @@ pub fn detect_codex_sessions(
     let repo_path = normalize_path_text(repo_path);
     let mut files = Vec::new();
     collect_codex_rollouts(&root, &mut files)?;
+    let titles = load_codex_session_titles(codex_home);
 
     let mut sessions = Vec::new();
     for path in files {
-        let Some(mut session) = read_codex_session_meta(&path)? else {
+        let Some(mut session) = read_codex_session_meta(&path, &titles)? else {
             continue;
         };
         if normalize_path_text(&session.cwd) != repo_path {
@@ -140,7 +142,36 @@ fn collect_codex_rollouts(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<
     Ok(())
 }
 
-fn read_codex_session_meta(path: &Path) -> anyhow::Result<Option<CodexSessionInfo>> {
+fn load_codex_session_titles(codex_home: &Path) -> HashMap<String, String> {
+    let path = codex_home.join("session_index.jsonl");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+
+    let mut titles = HashMap::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(title) = value
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .and_then(clean_codex_title)
+        else {
+            continue;
+        };
+        titles.insert(id.to_string(), title);
+    }
+    titles
+}
+
+fn read_codex_session_meta(
+    path: &Path,
+    titles: &HashMap<String, String>,
+) -> anyhow::Result<Option<CodexSessionInfo>> {
     let text = std::fs::read_to_string(path)?;
     for line in text.lines().take(20) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -175,6 +206,7 @@ fn read_codex_session_meta(path: &Path) -> anyhow::Result<Option<CodexSessionInf
                 .get("title")
                 .and_then(Value::as_str)
                 .and_then(clean_codex_title)
+                .or_else(|| titles.get(id).cloned())
                 .or_else(|| infer_codex_title(&text)),
             updated_secs,
         }));
@@ -1106,6 +1138,36 @@ mod tests {
         assert_eq!(
             sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             vec!["new", "old"]
+        );
+    }
+
+    #[test]
+    fn test_detect_codex_sessions_uses_session_index_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex_home = dir.path().join("codex");
+        let sessions_dir = codex_home.join("sessions/2026/04/19");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            codex_home.join("session_index.jsonl"),
+            r#"{"id":"session-a","thread_name":"Huong dan repo Telegram","updated_at":"2026-04-19T10:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("rollout-session-a.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-a","cwd":"/repo","timestamp":"2026-04-19T10:00:00Z"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fallback prompt"}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let sessions = detect_codex_sessions(&codex_home, "/repo", 10).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].title.as_deref(),
+            Some("Huong dan repo Telegram")
         );
     }
 
