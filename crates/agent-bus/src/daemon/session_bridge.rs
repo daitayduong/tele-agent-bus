@@ -72,6 +72,15 @@ pub fn parse_bridge_command(text: &str) -> Option<BridgeCommand> {
         }
     }
 
+    if let Some(rest) = trimmed.strip_prefix("@gemini") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            let msg = rest.trim();
+            if !msg.is_empty() {
+                return Some(BridgeCommand::Chat(AgentKind::Gemini, msg.to_string()));
+            }
+        }
+    }
+
     None
 }
 
@@ -1227,12 +1236,20 @@ mod tests {
                 "list files".to_string()
             ))
         );
+        assert_eq!(
+            parse_bridge_command("@gemini explain this"),
+            Some(BridgeCommand::Chat(
+                AgentKind::Gemini,
+                "explain this".to_string()
+            ))
+        );
     }
 
     #[test]
     fn test_parse_ignores_inbox_routing() {
         assert_eq!(parse_bridge_command("@codex:repo hello"), None);
         assert_eq!(parse_bridge_command("@claude:repo hello"), None);
+        assert_eq!(parse_bridge_command("@gemini:repo hello"), None);
     }
 
     #[test]

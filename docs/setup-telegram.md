@@ -115,11 +115,17 @@ Send these messages to your bot:
 /switch_rp <repo_id>
 /list_claude
 /list_codex
+/list_gemini
+@gemini hello from Telegram
 ```
 
 Use `/switch_rp` without arguments to choose from Telegram buttons. Use
 `/switch_rp <repo_id>` when you already know the repo ID. Run
 `agent-bus repo list` locally to see repo IDs.
+
+`@gemini <message>` runs Gemini CLI headless in the current default repo. It
+uses `--approval-mode plan` by default; set `AGENT_BUS_GEMINI_APPROVAL_MODE`
+only if you want to test a less restrictive mode.
 
 After adding or removing repos, restart the daemon so Telegram sees the updated
 registry:

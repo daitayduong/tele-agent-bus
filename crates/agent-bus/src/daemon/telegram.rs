@@ -626,6 +626,9 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
         BridgeCommand::Chat(AgentKind::Codex, body) => {
             handle_codex_bridge_msg(bot, config, state, chat_id, body, agent_runner).await
         }
+        BridgeCommand::Chat(AgentKind::Gemini, body) => {
+            handle_gemini_headless_msg(bot, config, state, chat_id, body).await
+        }
         BridgeCommand::Flush(AgentKind::Claude) => {
             flush_bridge_session(bot, state, chat_id, AgentKind::Claude).await
         }
@@ -638,16 +641,81 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
             .await?;
             Ok(())
         }
-        BridgeCommand::Chat(agent, _) => {
-            bot.send_message(
-                chat_id,
-                format!("@{agent} session bridge is not implemented yet. Use /list_{agent} first once the provider is available."),
-                None,
-            )
-            .await?;
-            Ok(())
-        }
     }
+}
+
+async fn handle_gemini_headless_msg<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    body: String,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let Some(repo_id) = snapshot
+        .default_repo_by_chat
+        .get(&chat_id.to_string())
+        .map(String::as_str)
+    else {
+        bot.send_message(
+            chat_id,
+            "No default repo for this chat. Use /switch_rp first.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.to_string()));
+    };
+    if !repo.agents.iter().any(|allowed| allowed == "gemini") {
+        bot.send_message(
+            chat_id,
+            format!("Agent gemini is not enabled for repo {}", repo.id),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let timeout_secs = claude_headless::resolved_timeout_secs();
+    let approval_mode = gemini_approval_mode();
+    bot.send_message(
+        chat_id,
+        format!("⏳ gemini thinking... (timeout {timeout_secs}s, approval={approval_mode})"),
+        None,
+    )
+    .await
+    .ok();
+
+    let reply = match run_gemini_headless(
+        &PathBuf::from(&repo.path),
+        &body,
+        timeout_secs,
+        &approval_mode,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(msg) => {
+            bot.send_message(chat_id, msg, None).await?;
+            return Ok(());
+        }
+    };
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        bot.send_message(chat_id, "(empty reply from gemini)".to_string(), None)
+            .await?;
+        return Ok(());
+    }
+    for chunk in claude_headless::chunk_for_telegram(trimmed, 4000) {
+        bot.send_message(chat_id, chunk, None).await?;
+    }
+    Ok(())
 }
 
 async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
@@ -1342,6 +1410,46 @@ async fn run_claude_legacy(
         .map_err(|err| format!("❌ claude failed: {err}"))
 }
 
+async fn run_gemini_headless(
+    cwd: &Path,
+    body: &str,
+    timeout_secs: u64,
+    approval_mode: &str,
+) -> Result<String, String> {
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        tokio::process::Command::new(gemini_bin_path())
+            .arg("--prompt")
+            .arg(body)
+            .arg("--output-format")
+            .arg("text")
+            .arg("--approval-mode")
+            .arg(approval_mode)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .output()
+            .await
+    })
+    .await
+    .map_err(|_| format!("❌ gemini timed out after {timeout_secs}s"))?
+    .map_err(|err| format!("❌ gemini failed to start: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(format!(
+        "❌ gemini failed (exit {:?}): {}",
+        output.status.code(),
+        short_err("stderr", detail)
+    ))
+}
+
 async fn run_claude_via_runner(
     runner: &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
     repo_id: &str,
@@ -1479,6 +1587,14 @@ fn cwd_matches_repo(session_cwd: &str, repo_path: &str) -> bool {
 
 fn claude_bin_path() -> String {
     std::env::var("AGENT_BUS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+}
+
+fn gemini_bin_path() -> String {
+    std::env::var("AGENT_BUS_GEMINI_BIN").unwrap_or_else(|_| "gemini".to_string())
+}
+
+fn gemini_approval_mode() -> String {
+    std::env::var("AGENT_BUS_GEMINI_APPROVAL_MODE").unwrap_or_else(|_| "plan".to_string())
 }
 
 fn short_err(label: &str, err: &str) -> String {
@@ -2034,8 +2150,20 @@ mod mobile_tests {
                 id: "sample_repo".to_string(),
                 display: "SampleRepo".to_string(),
                 path: path.into(),
-                agents: vec!["claude".to_string(), "codex".to_string()],
+                agents: vec![
+                    "claude".to_string(),
+                    "codex".to_string(),
+                    "gemini".to_string(),
+                ],
             }],
+        }
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
         }
     }
 
@@ -2345,6 +2473,93 @@ mod mobile_tests {
             "expected slash command guidance, got: {:?}",
             sent[0].text
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_chat_requires_default_repo() {
+        let bot = MockBot::default();
+        let config = test_config();
+        let dir = tempdir().unwrap();
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+
+        handle_text_command(
+            &bot,
+            &config,
+            state,
+            &None,
+            100,
+            None,
+            "@gemini hello",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(
+            sent[0].text.contains("No default repo"),
+            "expected default repo guidance, got: {:?}",
+            sent[0].text
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gemini_chat_runs_headless_cli() {
+        static GEMINI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+        let _guard = GEMINI_TEST_LOCK.lock().unwrap();
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let fake_gemini = dir.path().join("fake-gemini.sh");
+        std::fs::write(
+            &fake_gemini,
+            "#!/bin/sh\necho \"gemini reply: $*\"\necho \"cwd=$PWD\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_gemini, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let old_bin = std::env::var("AGENT_BUS_GEMINI_BIN").ok();
+        let old_approval = std::env::var("AGENT_BUS_GEMINI_APPROVAL_MODE").ok();
+        std::env::set_var("AGENT_BUS_GEMINI_BIN", &fake_gemini);
+        std::env::set_var("AGENT_BUS_GEMINI_APPROVAL_MODE", "plan");
+
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
+
+        let result = handle_text_command(
+            &bot,
+            &config,
+            state,
+            &None,
+            100,
+            None,
+            "@gemini hello",
+            None,
+        )
+        .await;
+
+        restore_env("AGENT_BUS_GEMINI_BIN", old_bin);
+        restore_env("AGENT_BUS_GEMINI_APPROVAL_MODE", old_approval);
+        result.unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(sent[0].text.contains("gemini thinking"));
+        assert!(sent[1].text.contains("gemini reply:"));
+        assert!(sent[1].text.contains("--approval-mode plan"));
+        assert!(sent[1].text.contains("hello"));
+        assert!(sent[1].text.contains(&format!("cwd={}", repo.display())));
     }
 
     #[tokio::test]
