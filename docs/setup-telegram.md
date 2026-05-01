@@ -116,6 +116,7 @@ Send these messages to your bot:
 /list_claude
 /list_codex
 /list_gemini
+/flush_gemini
 @gemini hello from Telegram
 ```
 
@@ -123,9 +124,15 @@ Use `/switch_rp` without arguments to choose from Telegram buttons. Use
 `/switch_rp <repo_id>` when you already know the repo ID. Run
 `agent-bus repo list` locally to see repo IDs.
 
-`@gemini <message>` runs Gemini CLI headless in the current default repo. It
-uses `--approval-mode plan` by default; set `AGENT_BUS_GEMINI_APPROVAL_MODE`
-only if you want to test a less restrictive mode.
+Use `/list_gemini` to pick a Gemini session for the current repo. After that,
+`@gemini <message>` resumes that selected Gemini session. If no Gemini session
+has been selected yet, `@gemini <message>` falls back to headless Gemini CLI in
+the current default repo.
+
+Gemini uses `--approval-mode plan` by default; set
+`AGENT_BUS_GEMINI_APPROVAL_MODE` only if you want to test a less restrictive
+mode. `@flush_gemini` is a no-op informational command because the Gemini
+bridge is resume-based and does not maintain transcript sync files.
 
 After adding or removing repos, restart the daemon so Telegram sees the updated
 registry:

@@ -25,6 +25,12 @@ pub struct CodexSessionInfo {
     pub updated_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeminiSessionInfo {
+    pub id: String,
+    pub title: Option<String>,
+}
+
 pub fn parse_bridge_command(text: &str) -> Option<BridgeCommand> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -52,6 +58,9 @@ pub fn parse_bridge_command(text: &str) -> Option<BridgeCommand> {
     }
     if trimmed == "@flush_codex" {
         return Some(BridgeCommand::Flush(AgentKind::Codex));
+    }
+    if trimmed == "@flush_gemini" {
+        return Some(BridgeCommand::Flush(AgentKind::Gemini));
     }
 
     if let Some(rest) = trimmed.strip_prefix("@claude") {
@@ -91,7 +100,56 @@ pub fn parse_callback_data(data: &str) -> Option<(AgentKind, String)> {
     if let Some(id) = data.strip_prefix("sel_codex:") {
         return Some((AgentKind::Codex, id.to_string()));
     }
+    if let Some(id) = data.strip_prefix("sel_gemini:") {
+        return Some((AgentKind::Gemini, id.to_string()));
+    }
     None
+}
+
+pub fn parse_gemini_list_sessions(output: &str, limit: usize) -> Vec<GeminiSessionInfo> {
+    let mut sessions = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((prefix, rest)) = trimmed.split_once(". ") else {
+            continue;
+        };
+        if !prefix.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let Some(open_bracket) = rest.rfind('[') else {
+            continue;
+        };
+        let Some(close_bracket) = rest.rfind(']') else {
+            continue;
+        };
+        if close_bracket <= open_bracket + 1 {
+            continue;
+        }
+        let id = rest[open_bracket + 1..close_bracket].trim();
+        if id.is_empty() {
+            continue;
+        }
+        let mut title_part = rest[..open_bracket].trim();
+        if let Some(idx) = title_part.rfind(" (") {
+            title_part = title_part[..idx].trim_end();
+        }
+        let title = if title_part.is_empty() {
+            None
+        } else {
+            Some(title_part.to_string())
+        };
+        sessions.push(GeminiSessionInfo {
+            id: id.to_string(),
+            title,
+        });
+        if sessions.len() >= limit {
+            break;
+        }
+    }
+    sessions
 }
 
 pub fn detect_codex_sessions(
@@ -466,6 +524,14 @@ pub fn sync_cycle(
 
 pub fn sync_bridged_session(bridge: &mut BridgedSessionState) -> anyhow::Result<BridgeSyncStats> {
     let agent = AgentKind::from_str(&bridge.agent)?;
+    if agent == AgentKind::Gemini {
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc().unix_timestamp().to_string());
+        bridge.sync.last_synced_at = Some(now);
+        bridge.sync.last_error = None;
+        return Ok(BridgeSyncStats::default());
+    }
     let desktop_path = validate_bridge_path(Path::new(&bridge.desktop_path), true)?;
     let mobile_path = validate_bridge_path(Path::new(&bridge.mobile_path), false)?;
     if desktop_path == mobile_path {
@@ -1117,6 +1183,30 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_bridged_session_gemini_is_noop() {
+        let mut bridge = BridgedSessionState {
+            agent: AgentKind::Gemini.to_string(),
+            repo_id: "repo".to_string(),
+            desktop_session_id: "g-1".to_string(),
+            desktop_path: String::new(),
+            mobile_session_id: "g-1".to_string(),
+            mobile_path: String::new(),
+            selected_at: "2026-04-19T00:00:00Z".to_string(),
+            sync: agent_bus_core::state::SessionSyncCursor {
+                desktop_offset: 0,
+                mobile_offset: 0,
+                last_synced_at: None,
+                last_error: None,
+            },
+        };
+
+        let stats = sync_bridged_session(&mut bridge).unwrap();
+        assert_eq!(stats, BridgeSyncStats::default());
+        assert!(bridge.sync.last_synced_at.is_some());
+        assert_eq!(bridge.sync.last_error, None);
+    }
+
+    #[test]
     fn test_detect_codex_sessions_filters_by_repo_and_sorts_recent_first() {
         let dir = tempfile::tempdir().unwrap();
         let codex_home = dir.path().join("codex");
@@ -1218,6 +1308,10 @@ mod tests {
             parse_bridge_command("@flush_codex"),
             Some(BridgeCommand::Flush(AgentKind::Codex))
         );
+        assert_eq!(
+            parse_bridge_command("@flush_gemini"),
+            Some(BridgeCommand::Flush(AgentKind::Gemini))
+        );
     }
 
     #[test]
@@ -1262,6 +1356,23 @@ mod tests {
             parse_callback_data("sel_codex:hash456"),
             Some((AgentKind::Codex, "hash456".to_string()))
         );
+        assert_eq!(
+            parse_callback_data("sel_gemini:uuid789"),
+            Some((AgentKind::Gemini, "uuid789".to_string()))
+        );
         assert_eq!(parse_callback_data("other:data"), None);
+    }
+
+    #[test]
+    fn test_parse_gemini_list_sessions() {
+        let sessions = parse_gemini_list_sessions(
+            "Available sessions for this project (2):\n  1. Hi there (3 minutes ago) [abc-123]\n  2. Another task (2 hours ago) [def-456]\n",
+            10,
+        );
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "abc-123");
+        assert_eq!(sessions[0].title.as_deref(), Some("Hi there"));
+        assert_eq!(sessions[1].id, "def-456");
+        assert_eq!(sessions[1].title.as_deref(), Some("Another task"));
     }
 }

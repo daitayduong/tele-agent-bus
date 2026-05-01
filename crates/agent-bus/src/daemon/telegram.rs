@@ -544,7 +544,11 @@ fn lead_has_selected_session(
             .get(&chat_key)
             .and_then(|by_agent| by_agent.get("codex"))
             .is_some(),
-        AgentKind::Gemini => false,
+        AgentKind::Gemini => snapshot
+            .bridged_sessions
+            .get(&chat_key)
+            .and_then(|by_agent| by_agent.get("gemini"))
+            .is_some(),
     }
 }
 
@@ -620,6 +624,9 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
         BridgeCommand::List(AgentKind::Codex) => {
             handle_list_codex_command(bot, config, state, chat_id).await
         }
+        BridgeCommand::List(AgentKind::Gemini) => {
+            handle_list_gemini_command(bot, config, state, chat_id).await
+        }
         BridgeCommand::Chat(AgentKind::Claude, body) => {
             handle_claude_mobile_msg(bot, config, state, chat_id, body, agent_runner).await
         }
@@ -627,24 +634,21 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
             handle_codex_bridge_msg(bot, config, state, chat_id, body, agent_runner).await
         }
         BridgeCommand::Chat(AgentKind::Gemini, body) => {
-            handle_gemini_headless_msg(bot, config, state, chat_id, body).await
+            handle_gemini_bridge_msg(bot, config, state, chat_id, body).await
         }
         BridgeCommand::Flush(AgentKind::Claude) => {
             flush_bridge_session(bot, state, chat_id, AgentKind::Claude).await
         }
-        BridgeCommand::List(agent) | BridgeCommand::Flush(agent) => {
-            bot.send_message(
-                chat_id,
-                format!("/list_{agent} / @flush_{agent} bridge is not implemented yet."),
-                None,
-            )
-            .await?;
-            Ok(())
+        BridgeCommand::Flush(AgentKind::Gemini) => {
+            flush_bridge_session(bot, state, chat_id, AgentKind::Gemini).await
+        }
+        BridgeCommand::Flush(AgentKind::Codex) => {
+            flush_bridge_session(bot, state, chat_id, AgentKind::Codex).await
         }
     }
 }
 
-async fn handle_gemini_headless_msg<B: BotClient + ?Sized>(
+async fn handle_gemini_bridge_msg<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
     state: StateHandle,
@@ -656,10 +660,20 @@ async fn handle_gemini_headless_msg<B: BotClient + ?Sized>(
     }
 
     let snapshot = state.snapshot().await;
-    let Some(repo_id) = snapshot
-        .default_repo_by_chat
+    let selected_session = snapshot
+        .bridged_sessions
         .get(&chat_id.to_string())
-        .map(String::as_str)
+        .and_then(|by_agent| by_agent.get("gemini"))
+        .cloned();
+    let Some(repo_id) = selected_session
+        .as_ref()
+        .map(|bridge| bridge.repo_id.as_str())
+        .or_else(|| {
+            snapshot
+                .default_repo_by_chat
+                .get(&chat_id.to_string())
+                .map(String::as_str)
+        })
     else {
         bot.send_message(
             chat_id,
@@ -692,14 +706,24 @@ async fn handle_gemini_headless_msg<B: BotClient + ?Sized>(
     .await
     .ok();
 
-    let reply = match run_gemini_headless(
-        &PathBuf::from(&repo.path),
-        &body,
-        timeout_secs,
-        &approval_mode,
-    )
-    .await
-    {
+    let reply = match if let Some(bridge) = selected_session {
+        run_gemini_resume(
+            &PathBuf::from(&repo.path),
+            &bridge.desktop_session_id,
+            &body,
+            timeout_secs,
+            &approval_mode,
+        )
+        .await
+    } else {
+        run_gemini_headless(
+            &PathBuf::from(&repo.path),
+            &body,
+            timeout_secs,
+            &approval_mode,
+        )
+        .await
+    } {
         Ok(reply) => reply,
         Err(msg) => {
             bot.send_message(chat_id, msg, None).await?;
@@ -925,7 +949,7 @@ async fn flush_bridge_session<B: BotClient + ?Sized>(
     else {
         bot.send_message(
             chat_id,
-            format!("No {agent} session selected. Send @list_{agent} first."),
+            format!("No {agent} session selected. Send /list_{agent} first."),
             None,
         )
         .await?;
@@ -956,6 +980,10 @@ async fn flush_bridge_session<B: BotClient + ?Sized>(
 }
 
 fn format_bridge_sync_stats(agent: AgentKind, stats: BridgeSyncStats) -> String {
+    if agent == AgentKind::Gemini {
+        return "@flush_gemini: Gemini bridge is resume-based; no transcript sync is needed."
+            .to_string();
+    }
     format!(
         "@flush_{agent} synced\n\
 desktop -> mobile: copied {}, skipped {}, errors {}\n\
@@ -1103,10 +1131,78 @@ pub async fn handle_list_codex_command<B: BotClient + ?Sized>(
     Ok(())
 }
 
+pub async fn handle_list_gemini_command<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
+        bot.send_message(
+            chat_id,
+            "No default repo for this chat. Use /switch_rp first.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.clone()));
+    };
+
+    let sessions = match list_gemini_sessions(Path::new(&repo.path), 10).await {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            bot.send_message(chat_id, err, None).await?;
+            return Ok(());
+        }
+    };
+
+    if sessions.is_empty() {
+        bot.send_message(
+            chat_id,
+            format!("No Gemini sessions for {}.", repo.display),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let rows = sessions
+        .iter()
+        .map(|session| {
+            let short = session.id.get(..8).unwrap_or(&session.id);
+            vec![(
+                gemini_session_button_label(session.title.as_deref(), short),
+                format!("sel_gemini:{}", session.id),
+            )]
+        })
+        .collect();
+    bot.send_message(
+        chat_id,
+        format!("Active Gemini sessions ({}):", repo.display),
+        Some(InlineKeyboard { rows }),
+    )
+    .await?;
+    Ok(())
+}
+
 fn codex_session_button_label(title: Option<&str>, short_id: &str) -> String {
     match title {
         Some(title) => format!("{title} ({short_id})"),
         None => format!("Codex {short_id}"),
+    }
+}
+
+fn gemini_session_button_label(title: Option<&str>, short_id: &str) -> String {
+    match title {
+        Some(title) => format!("{title} ({short_id})"),
+        None => format!("Gemini {short_id}"),
     }
 }
 
@@ -1303,6 +1399,84 @@ pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
     Ok(())
 }
 
+pub async fn handle_callback_sel_gemini<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    message: MessageRef,
+    callback_id: String,
+    callback_data: String,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let Some((AgentKind::Gemini, gemini_id)) = session_bridge::parse_callback_data(&callback_data)
+    else {
+        return Err(TelegramError::InvalidCallback(callback_data));
+    };
+
+    let snapshot = state.snapshot().await;
+    let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
+        bot.answer_callback(callback_id, "No default repo".to_string())
+            .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_id(config, repo_id) else {
+        return Err(TelegramError::UnknownRepo(repo_id.clone()));
+    };
+
+    let sessions = match list_gemini_sessions(Path::new(&repo.path), 50).await {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            bot.answer_callback(callback_id, short_err("scan failed", &err))
+                .await?;
+            return Ok(());
+        }
+    };
+    let Some(session) = sessions.into_iter().find(|session| session.id == gemini_id) else {
+        bot.answer_callback(callback_id, "Session not found".to_string())
+            .await?;
+        return Ok(());
+    };
+
+    let now = time::OffsetDateTime::now_utc();
+    let selected_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string());
+
+    let bridge = BridgedSessionState {
+        agent: AgentKind::Gemini.to_string(),
+        repo_id: repo.id.clone(),
+        desktop_session_id: session.id.clone(),
+        desktop_path: String::new(),
+        mobile_session_id: session.id.clone(),
+        mobile_path: String::new(),
+        selected_at,
+        sync: SessionSyncCursor {
+            desktop_offset: 0,
+            mobile_offset: 0,
+            last_synced_at: None,
+            last_error: None,
+        },
+    };
+    state
+        .set_bridged_session(chat_id.to_string(), AgentKind::Gemini.to_string(), bridge)
+        .await?;
+
+    let short = session.id.get(..8).unwrap_or(&session.id);
+    let label = session.title.as_deref().unwrap_or(short);
+    bot.edit_message_text(
+        message,
+        format!("{label} selected. Send @gemini <msg> to continue."),
+    )
+    .await?;
+    bot.answer_callback(callback_id, "Selected".to_string())
+        .await?;
+    Ok(())
+}
+
 /// AC-3 + AC-4 + Phase 4a.8: Handle `@claude <msg>` — when an `AgentRunner`
 /// is present, dispatch through it for quota tracking + rotation; otherwise
 /// fall back to the legacy `spawn_claude_resume` path (AC-Q9).
@@ -1416,22 +1590,19 @@ async fn run_gemini_headless(
     timeout_secs: u64,
     approval_mode: &str,
 ) -> Result<String, String> {
-    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-        tokio::process::Command::new(gemini_bin_path())
-            .arg("--prompt")
-            .arg(body)
-            .arg("--output-format")
-            .arg("text")
-            .arg("--approval-mode")
-            .arg(approval_mode)
-            .current_dir(cwd)
-            .kill_on_drop(true)
-            .output()
-            .await
-    })
-    .await
-    .map_err(|_| format!("❌ gemini timed out after {timeout_secs}s"))?
-    .map_err(|err| format!("❌ gemini failed to start: {err}"))?;
+    let output = run_gemini_command(
+        cwd,
+        &[
+            "--prompt",
+            body,
+            "--output-format",
+            "text",
+            "--approval-mode",
+            approval_mode,
+        ],
+        timeout_secs,
+    )
+    .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1448,6 +1619,86 @@ async fn run_gemini_headless(
         output.status.code(),
         short_err("stderr", detail)
     ))
+}
+
+async fn run_gemini_resume(
+    cwd: &Path,
+    session_id: &str,
+    body: &str,
+    timeout_secs: u64,
+    approval_mode: &str,
+) -> Result<String, String> {
+    let output = run_gemini_command(
+        cwd,
+        &[
+            "--resume",
+            session_id,
+            "--prompt",
+            body,
+            "--output-format",
+            "text",
+            "--approval-mode",
+            approval_mode,
+        ],
+        timeout_secs,
+    )
+    .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(format!(
+        "❌ gemini resume failed (exit {:?}): {}",
+        output.status.code(),
+        short_err("stderr", detail)
+    ))
+}
+
+async fn list_gemini_sessions(
+    cwd: &Path,
+    limit: usize,
+) -> Result<Vec<session_bridge::GeminiSessionInfo>, String> {
+    let output = run_gemini_command(cwd, &["--list-sessions"], 15).await?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(format!(
+            "Failed to list Gemini sessions: {}",
+            short_err("stderr", detail)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(session_bridge::parse_gemini_list_sessions(&stdout, limit))
+}
+
+async fn run_gemini_command(
+    cwd: &Path,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        tokio::process::Command::new(gemini_bin_path())
+            .args(args)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .output()
+            .await
+    })
+    .await
+    .map_err(|_| format!("❌ gemini timed out after {timeout_secs}s"))?
+    .map_err(|err| format!("❌ gemini failed to start: {err}"))
 }
 
 async fn run_claude_via_runner(
@@ -2078,6 +2329,21 @@ pub async fn teloxide_callback_handler(
         )
         .await
         .map_err(to_teloxide_error)?;
+    } else if data.starts_with("sel_gemini:") {
+        handle_callback_sel_gemini(
+            &client,
+            &config,
+            state,
+            chat.id.0,
+            MessageRef {
+                chat_id: chat.id.0,
+                message_id: message_id.0,
+            },
+            query.id,
+            data,
+        )
+        .await
+        .map_err(to_teloxide_error)?;
     } else if data.starts_with("perm:") {
         let user_name = query
             .from
@@ -2138,6 +2404,7 @@ mod mobile_tests {
     use tempfile::tempdir;
 
     static CODEX_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static GEMINI_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_config() -> TelegramConfig {
         config_with_repo_path("/tmp/sample_repo-test")
@@ -2164,6 +2431,34 @@ mod mobile_tests {
             std::env::set_var(key, value);
         } else {
             std::env::remove_var(key);
+        }
+    }
+
+    fn write_fake_gemini_script(path: &Path) {
+        std::fs::write(
+            path,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"--list-sessions\" ]; then\n\
+  echo \"Available sessions for this project (2):\"\n\
+  echo \"  1. Session One (3 minutes ago) [gem-11111111]\"\n\
+  echo \"  2. Session Two (2 hours ago) [gem-22222222]\"\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"--resume\" ]; then\n\
+  session=\"$2\"\n\
+  shift 2\n\
+  echo \"gemini resume: $session $*\"\n\
+  echo \"cwd=$PWD\"\n\
+  exit 0\n\
+fi\n\
+echo \"gemini headless: $*\"\n\
+echo \"cwd=$PWD\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 
@@ -2455,24 +2750,35 @@ mod mobile_tests {
     }
 
     #[tokio::test]
-    async fn list_gemini_reports_bridge_not_implemented() {
+    #[allow(clippy::await_holding_lock)]
+    async fn list_gemini_lists_sessions() {
+        let _guard = GEMINI_OVERRIDE_TEST_LOCK.lock().unwrap();
         let bot = MockBot::default();
-        let config = test_config();
         let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let fake_gemini = dir.path().join("fake-gemini.sh");
+        write_fake_gemini_script(&fake_gemini);
+
+        let old_bin = std::env::var("AGENT_BUS_GEMINI_BIN").ok();
+        std::env::set_var("AGENT_BUS_GEMINI_BIN", &fake_gemini);
+
+        let config = config_with_repo_path(repo.display().to_string());
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
 
-        handle_text_command(&bot, &config, state, &None, 100, None, "/list_gemini", None)
-            .await
-            .unwrap();
+        let result =
+            handle_text_command(&bot, &config, state, &None, 100, None, "/list_gemini", None).await;
+        restore_env("AGENT_BUS_GEMINI_BIN", old_bin);
+        result.unwrap();
 
         let sent = bot.sent_messages();
-        assert!(
-            sent[0].text.contains("/list_gemini"),
-            "expected slash command guidance, got: {:?}",
-            sent[0].text
-        );
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("Active Gemini sessions"));
+        let keyboard = sent[0].keyboard.as_ref().expect("gemini session keyboard");
+        assert_eq!(keyboard.rows[0][0].1, "sel_gemini:gem-11111111");
     }
 
     #[tokio::test]
@@ -2507,25 +2813,61 @@ mod mobile_tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn gemini_chat_runs_headless_cli() {
-        static GEMINI_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-        let _guard = GEMINI_TEST_LOCK.lock().unwrap();
+    async fn selecting_gemini_writes_bridge_state() {
+        let _guard = GEMINI_OVERRIDE_TEST_LOCK.lock().unwrap();
         let bot = MockBot::default();
         let dir = tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let fake_gemini = dir.path().join("fake-gemini.sh");
-        std::fs::write(
-            &fake_gemini,
-            "#!/bin/sh\necho \"gemini reply: $*\"\necho \"cwd=$PWD\"\n",
+        write_fake_gemini_script(&fake_gemini);
+
+        let old_bin = std::env::var("AGENT_BUS_GEMINI_BIN").ok();
+        std::env::set_var("AGENT_BUS_GEMINI_BIN", &fake_gemini);
+
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
+
+        let result = handle_callback_sel_gemini(
+            &bot,
+            &config,
+            state.clone(),
+            100,
+            MessageRef {
+                chat_id: 100,
+                message_id: 1,
+            },
+            "cb1".to_string(),
+            "sel_gemini:gem-11111111".to_string(),
         )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake_gemini, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        .await;
+        restore_env("AGENT_BUS_GEMINI_BIN", old_bin);
+        result.unwrap();
+
+        let snapshot = state.snapshot().await;
+        let bridge = &snapshot.bridged_sessions["100"]["gemini"];
+        assert_eq!(bridge.agent, "gemini");
+        assert_eq!(bridge.desktop_session_id, "gem-11111111");
+        assert_eq!(bridge.mobile_session_id, "gem-11111111");
+        assert_eq!(bridge.desktop_path, "");
+        assert_eq!(bridge.mobile_path, "");
+        assert_eq!(bot.answered_callbacks(), vec!["cb1".to_string()]);
+        assert!(bot.edited_messages()[0].text.contains("@gemini <msg>"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gemini_chat_runs_headless_cli_without_selected_session() {
+        let _guard = GEMINI_OVERRIDE_TEST_LOCK.lock().unwrap();
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let fake_gemini = dir.path().join("fake-gemini.sh");
+        write_fake_gemini_script(&fake_gemini);
 
         let old_bin = std::env::var("AGENT_BUS_GEMINI_BIN").ok();
         let old_approval = std::env::var("AGENT_BUS_GEMINI_APPROVAL_MODE").ok();
@@ -2556,10 +2898,77 @@ mod mobile_tests {
 
         let sent = bot.sent_messages();
         assert!(sent[0].text.contains("gemini thinking"));
-        assert!(sent[1].text.contains("gemini reply:"));
+        assert!(sent[1].text.contains("gemini headless:"));
         assert!(sent[1].text.contains("--approval-mode plan"));
         assert!(sent[1].text.contains("hello"));
         assert!(sent[1].text.contains(&format!("cwd={}", repo.display())));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gemini_chat_uses_selected_session() {
+        let _guard = GEMINI_OVERRIDE_TEST_LOCK.lock().unwrap();
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let fake_gemini = dir.path().join("fake-gemini.sh");
+        write_fake_gemini_script(&fake_gemini);
+
+        let old_bin = std::env::var("AGENT_BUS_GEMINI_BIN").ok();
+        let old_approval = std::env::var("AGENT_BUS_GEMINI_APPROVAL_MODE").ok();
+        std::env::set_var("AGENT_BUS_GEMINI_BIN", &fake_gemini);
+        std::env::set_var("AGENT_BUS_GEMINI_APPROVAL_MODE", "plan");
+
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
+        state
+            .set_bridged_session(
+                "100",
+                AgentKind::Gemini.to_string(),
+                BridgedSessionState {
+                    agent: AgentKind::Gemini.to_string(),
+                    repo_id: "sample_repo".to_string(),
+                    desktop_session_id: "gem-22222222".to_string(),
+                    desktop_path: String::new(),
+                    mobile_session_id: "gem-22222222".to_string(),
+                    mobile_path: String::new(),
+                    selected_at: "2026-04-19T00:00:00Z".to_string(),
+                    sync: SessionSyncCursor {
+                        desktop_offset: 0,
+                        mobile_offset: 0,
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = handle_text_command(
+            &bot,
+            &config,
+            state,
+            &None,
+            100,
+            None,
+            "@gemini hello",
+            None,
+        )
+        .await;
+
+        restore_env("AGENT_BUS_GEMINI_BIN", old_bin);
+        restore_env("AGENT_BUS_GEMINI_APPROVAL_MODE", old_approval);
+        result.unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(sent[0].text.contains("gemini thinking"));
+        assert!(sent[1].text.contains("gemini resume: gem-22222222"));
+        assert!(sent[1].text.contains("--approval-mode plan"));
+        assert!(sent[1].text.contains("hello"));
     }
 
     #[tokio::test]

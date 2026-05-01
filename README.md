@@ -164,10 +164,10 @@ systemctl --user restart agent-bus
 - `/current` shows the current default repo.
 - `/list_claude` lists Claude desktop sessions for the current repo.
 - `/list_codex` lists Codex desktop sessions for the current repo.
-- `/list_gemini` reports that Gemini desktop session bridging is not implemented yet.
+- `/list_gemini` lists Gemini sessions for the current repo.
 - `@claude <message>` sends a message to the selected Claude session.
 - `@codex <message>` sends a message to the selected Codex session.
-- `@gemini <message>` runs Gemini CLI headless in the current default repo.
+- `@gemini <message>` resumes the selected Gemini session. If none is selected yet, it falls back to headless Gemini CLI in the current default repo.
 - `@agent:<repo_id> <message>` routes explicitly to a repo and bypasses the default repo selection.
 
 See `docs/setup-telegram.md` for the detailed Telegram setup flow.
