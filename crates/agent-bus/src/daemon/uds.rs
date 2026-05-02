@@ -264,7 +264,7 @@ fn chmod_socket_private(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::perm::{BlacklistLoader, MergedBlacklistLoader, PendingPermRegistry};
+    use crate::daemon::perm::{GateLoader, MergedGateLoader, PendingPermRegistry};
     use crate::daemon::telegram::{MockBot, TelegramConfig};
     use agent_bus_core::peer_uid::MockPeerUid;
     use std::os::unix::fs::PermissionsExt;
@@ -272,7 +272,7 @@ mod tests {
     use std::time::SystemTime;
 
     struct EmptyLoader;
-    impl BlacklistLoader for EmptyLoader {
+    impl GateLoader for EmptyLoader {
         fn load(&self) -> anyhow::Result<Vec<String>> {
             Ok(vec![])
         }
@@ -290,7 +290,7 @@ mod tests {
             allowed_chats: vec!["123".to_string()],
             repos: vec![],
         });
-        let loader = Arc::new(MergedBlacklistLoader::new(
+        let loader = Arc::new(MergedGateLoader::new(
             Arc::new(EmptyLoader),
             Box::new(|_| Arc::new(EmptyLoader)),
         ));

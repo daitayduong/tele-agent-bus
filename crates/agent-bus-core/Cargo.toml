@@ -1,6 +1,6 @@
 [package]
 name = "agent-bus-core"
-description = "Shared non-wire logic: config, state actor, blacklist, redaction, path validation."
+description = "Shared non-wire logic: config, state actor, approval gate, redaction, path validation."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

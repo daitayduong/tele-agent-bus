@@ -35,9 +35,9 @@ pub enum AuthConfigError {
     BadId { agent: String, id: String },
     #[error("duplicate context id '{id}' for agent {agent}")]
     DuplicateId { agent: String, id: String },
-    #[error("agent '{agent}' not supported (must be claude|codex|gemini)")]
+    #[error("agent '{agent}' not supported (must be claude|codex|gemini|antigravity)")]
     UnsupportedAgent { agent: String },
-    #[error("invalid lead agent '{agent}': must be claude|codex|gemini")]
+    #[error("invalid lead agent '{agent}': must be claude|codex|gemini|antigravity")]
     BadLeadAgent { agent: String },
     #[error("profile_dir for {agent}/{id} must be under {expected}: got {actual}")]
     BadProfileDir {
@@ -56,7 +56,7 @@ pub enum AuthConfigError {
     UnknownActiveId { agent: String, id: String },
 }
 
-pub const SUPPORTED_AGENTS: &[&str] = &["claude", "codex", "gemini"];
+pub const SUPPORTED_AGENTS: &[&str] = &["claude", "codex", "gemini", "antigravity"];
 
 fn id_regex() -> Regex {
     Regex::new(r"^[a-z][a-z0-9_-]{0,31}$").expect("static regex")
@@ -203,6 +203,7 @@ pub enum AgentKind {
     Claude,
     Codex,
     Gemini,
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +229,7 @@ impl AgentKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
         }
     }
 }
@@ -246,6 +248,7 @@ impl FromStr for AgentKind {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "gemini" => Ok(Self::Gemini),
+            "antigravity" => Ok(Self::Antigravity),
             other => Err(AuthConfigError::BadLeadAgent {
                 agent: other.to_string(),
             }),

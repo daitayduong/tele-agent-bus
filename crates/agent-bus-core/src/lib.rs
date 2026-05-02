@@ -3,7 +3,7 @@
 //! Modules per spec §3–§10:
 //!   - `config`     — YAML loader with `env:` prefix resolution
 //!   - `state`      — State actor (tokio mpsc), atomic write (`state.json.tmp` → fsync → rename)
-//!   - `blacklist`  — regex matcher with `destructive` flag awareness + "suspicious" heuristic
+//!   - `gate`  — regex matcher with `destructive` flag awareness + "suspicious" heuristic
 //!   - `redact`     — logging redaction (secrets, chat_ids, command hashes)
 //!   - `path_validate` — canonicalize + traversal + forbidden-root check
 //!   - `repo_id`    — `<slug>_<hash8(abs_path)>` collision-free internal IDs
@@ -11,9 +11,9 @@
 
 #![deny(unsafe_code)]
 
+pub mod approval_gate;
+pub mod approval_gate_integrity;
 pub mod auth_context;
-pub mod blacklist;
-pub mod blacklist_integrity;
 pub mod classifier;
 pub mod config;
 pub mod jsonl_scan;

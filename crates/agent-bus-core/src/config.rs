@@ -33,7 +33,7 @@ pub struct PermissionsConfig {
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
     pub fail_mode: FailMode,
-    pub blacklist_file: String,
+    pub gate_file: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -99,7 +99,7 @@ telegram:
 permissions:
   timeout_seconds: 10
   fail_mode: hybrid
-  blacklist_file: ~/.agent-bus/blacklist.txt
+  gate_file: ~/.agent-bus/gate.txt
 agents: {}
 repos: []
 ";
@@ -117,7 +117,7 @@ telegram:
 permissions:
   timeout_seconds: 10
   fail_mode: hybrid
-  blacklist_file: ~/.agent-bus/blacklist.txt
+  gate_file: ~/.agent-bus/gate.txt
 agents: {}
 repos: []
 ";
@@ -135,7 +135,7 @@ telegram:
 permissions:
   timeout_seconds: 10
   fail_mode: hybrid
-  blacklist_file: ~/.agent-bus/blacklist.txt
+  gate_file: ~/.agent-bus/gate.txt
 agents:
   claude:
     mode: ide-first
@@ -161,7 +161,7 @@ telegram:
   allowed_chats: [\"123\"]
 permissions:
   fail_mode: hybrid
-  blacklist_file: ~/.agent-bus/blacklist.txt
+  gate_file: ~/.agent-bus/gate.txt
 agents: {}
 repos: []
 ";

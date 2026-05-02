@@ -65,6 +65,8 @@ pub struct BridgedSessionState {
     pub mobile_path: String,
     pub selected_at: String,
     pub sync: SessionSyncCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -899,6 +901,7 @@ mod tests {
                 last_synced_at: Some("2026-04-19T00:00:30Z".to_string()),
                 last_error: None,
             },
+            display_name: None,
         };
 
         let mut chat_bridges = BTreeMap::new();

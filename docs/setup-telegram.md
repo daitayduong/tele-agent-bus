@@ -88,6 +88,10 @@ Optional, for Claude Code Bash permission approvals through Telegram:
 agent-bus repo install-hook /path/to/project
 ```
 
+Codex uses `live_bridge` by default. To switch one repo to the App Server-owned
+Codex flow, edit `~/.agent-bus/repos.yaml` and add `codex_mode: app_server`
+under that repo entry, then restart the daemon.
+
 ## Step 6 - Verify and start
 
 ```bash
@@ -129,6 +133,11 @@ Use `/list_gemini` to pick a Gemini session for the current repo. After that,
 has been selected yet, `@gemini <message>` falls back to headless Gemini CLI in
 the current default repo.
 
+For Codex, `@codex <message>` follows the selected session using the repo's
+`codex_mode`:
+- `live_bridge` keeps the existing desktop-owned live bridge.
+- `app_server` resumes the selected Codex thread through `codex app-server`.
+
 Gemini uses `--approval-mode plan` by default; set
 `AGENT_BUS_GEMINI_APPROVAL_MODE` only if you want to test a less restrictive
 mode. `@flush_gemini` is a no-op informational command because the Gemini
@@ -140,6 +149,42 @@ registry:
 ```bash
 systemctl --user restart agent-bus
 ```
+
+## Step 8 - Set up the approval gate (optional)
+
+The approval gate intercepts Bash commands from Claude Code and sends a
+Telegram message with **Approve** / **Deny** buttons before the command runs.
+Commands that do not match any pattern are silently approved.
+
+Initialize the gate and add your first rules (requires `sudo`):
+
+```bash
+# Add destructive patterns — denied when daemon is unreachable
+sudo agent-bus gate add '(^|\s)rm\s+-[rRfF]' --destructive
+sudo agent-bus gate add 'git\s+reset\s+--hard' --destructive
+sudo agent-bus gate add 'git\s+push\s+.*--force' --destructive
+sudo agent-bus gate add '(^|\s)dd\s+if=' --destructive
+sudo agent-bus gate add 'DROP\s+TABLE' --destructive
+sudo agent-bus gate add 'prisma\s+migrate\s+reset' --destructive
+
+# Add non-destructive patterns — approved silently when daemon is unreachable
+sudo agent-bus gate add 'npm\s+run\s+deploy'
+
+# Review what you have
+sudo agent-bus gate list
+```
+
+Install the hook in each project that should go through the gate:
+
+```bash
+agent-bus repo install-hook /path/to/project
+```
+
+After installing the hook, restart Claude Code in that project. The next time
+Claude runs a Bash command matching a pattern, you will receive a Telegram
+message with buttons to approve or deny it.
+
+Send `/help` to your bot at any time to see all available commands as buttons.
 
 ## Deprecated: TELE_BUS_TOKEN
 

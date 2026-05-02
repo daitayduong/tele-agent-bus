@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::daemon::auth_cmds;
 use crate::daemon::claude_headless;
+use crate::daemon::codex_app_server;
 use crate::daemon::codex_ipc::{CodexIpcClient, CodexIpcError};
 use crate::daemon::mobile_session::{self, MobileCommand, SessionInfo, MOBILE_UUID};
 use crate::daemon::routing::{Routed, RoutingError, RoutingParser};
@@ -40,6 +41,16 @@ pub struct RepoEntry {
     pub path: String,
     #[serde(default)]
     pub agents: Vec<String>,
+    #[serde(default)]
+    pub codex_mode: CodexMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexMode {
+    #[default]
+    LiveBridge,
+    AppServer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +237,46 @@ pub async fn handle_current_command<B: BotClient + ?Sized>(
     Ok(())
 }
 
+async fn handle_help_command<B: BotClient + ?Sized>(
+    bot: &B,
+    chat_id: i64,
+) -> Result<(), TelegramError> {
+    let keyboard = InlineKeyboard {
+        rows: vec![
+            vec![
+                ("Current Repo".to_string(), "help:current".to_string()),
+                ("Switch Repo".to_string(), "help:switch_rp".to_string()),
+            ],
+            vec![
+                ("Auth List".to_string(), "help:auth_list".to_string()),
+                ("Quota".to_string(), "help:quota".to_string()),
+            ],
+            vec![
+                ("Auth Rotate".to_string(), "help:auth_rotate".to_string()),
+                ("Lead".to_string(), "help:lead".to_string()),
+            ],
+            vec![
+                ("Lead Default".to_string(), "help:lead_default".to_string()),
+                ("Lead Clear".to_string(), "help:lead_clear".to_string()),
+            ],
+            vec![
+                ("List Claude".to_string(), "help:list_claude".to_string()),
+                ("List Codex".to_string(), "help:list_codex".to_string()),
+            ],
+            vec![
+                ("List Gemini".to_string(), "help:list_gemini".to_string()),
+                (
+                    "List Antigravity".to_string(),
+                    "help:list_antigravity".to_string(),
+                ),
+            ],
+        ],
+    };
+    bot.send_message(chat_id, "Available commands:".to_string(), Some(keyboard))
+        .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_text_command<B: BotClient + ?Sized>(
     bot: &B,
@@ -336,6 +387,7 @@ pub async fn handle_text_command<B: BotClient + ?Sized>(
             }
             auth_cmds::handle_lead_clear_command(bot, state, chat_id).await
         }
+        Some("/help") => handle_help_command(bot, chat_id).await,
         Some(cmd) if cmd.starts_with('/') => Ok(()),
         _ => {
             handle_unaddressed_lead_message(
@@ -368,10 +420,10 @@ async fn handle_legacy_lead_command<B: BotClient + ?Sized>(
     agent: Option<&str>,
 ) -> Result<(), TelegramError> {
     if let Some(agent) = agent {
-        if !matches!(agent, "claude" | "codex" | "gemini") {
+        if !matches!(agent, "claude" | "codex" | "gemini" | "antigravity") {
             bot.send_message(
                 chat_id,
-                "Usage: agent must be one of claude, codex, gemini".to_string(),
+                "Usage: agent must be one of claude, codex, gemini, antigravity".to_string(),
                 None,
             )
             .await?;
@@ -486,11 +538,17 @@ async fn handle_unaddressed_lead_message<B: BotClient + ?Sized>(
     .await
     .ok();
 
-    let mode = match mobile {
-        Some(mobile) => AgentRunMode::WithMobileContext {
-            mobile_uuid: mobile.mobile_uuid,
-        },
-        None => AgentRunMode::Fresh,
+    let (mode, runner_session_label) = match mobile {
+        Some(mobile) => {
+            let label = mobile.mobile_uuid[..mobile.mobile_uuid.len().min(8)].to_string();
+            (
+                AgentRunMode::WithMobileContext {
+                    mobile_uuid: mobile.mobile_uuid,
+                },
+                label,
+            )
+        }
+        None => (AgentRunMode::Fresh, "new".to_string()),
     };
     let reply = run_agent_via_runner(
         runner,
@@ -518,7 +576,14 @@ async fn handle_unaddressed_lead_message<B: BotClient + ?Sized>(
             .await?;
         return Ok(());
     }
-    for chunk in claude_headless::chunk_for_telegram(trimmed, 4000) {
+    let agent_display = match agent {
+        AgentKind::Claude => "Claude",
+        AgentKind::Codex => "Codex",
+        AgentKind::Gemini => "Gemini",
+        AgentKind::Antigravity => "Antigravity",
+    };
+    let header = agent_header(agent_display, &runner_session_label);
+    for chunk in claude_headless::chunk_for_telegram(&format!("{header}{trimmed}"), 4000) {
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
@@ -548,6 +613,11 @@ fn lead_has_selected_session(
             .bridged_sessions
             .get(&chat_key)
             .and_then(|by_agent| by_agent.get("gemini"))
+            .is_some(),
+        AgentKind::Antigravity => snapshot
+            .bridged_sessions
+            .get(&chat_key)
+            .and_then(|by_agent| by_agent.get("antigravity"))
             .is_some(),
     }
 }
@@ -627,6 +697,9 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
         BridgeCommand::List(AgentKind::Gemini) => {
             handle_list_gemini_command(bot, config, state, chat_id).await
         }
+        BridgeCommand::List(AgentKind::Antigravity) => {
+            handle_list_antigravity_command(bot, config, state, chat_id).await
+        }
         BridgeCommand::Chat(AgentKind::Claude, body) => {
             handle_claude_mobile_msg(bot, config, state, chat_id, body, agent_runner).await
         }
@@ -636,6 +709,9 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
         BridgeCommand::Chat(AgentKind::Gemini, body) => {
             handle_gemini_bridge_msg(bot, config, state, chat_id, body).await
         }
+        BridgeCommand::Chat(AgentKind::Antigravity, body) => {
+            handle_antigravity_bridge_msg(bot, config, state, chat_id, body).await
+        }
         BridgeCommand::Flush(AgentKind::Claude) => {
             flush_bridge_session(bot, state, chat_id, AgentKind::Claude).await
         }
@@ -644,6 +720,9 @@ async fn handle_bridge_command<B: BotClient + ?Sized>(
         }
         BridgeCommand::Flush(AgentKind::Codex) => {
             flush_bridge_session(bot, state, chat_id, AgentKind::Codex).await
+        }
+        BridgeCommand::Flush(AgentKind::Antigravity) => {
+            flush_bridge_session(bot, state, chat_id, AgentKind::Antigravity).await
         }
     }
 }
@@ -706,37 +785,106 @@ async fn handle_gemini_bridge_msg<B: BotClient + ?Sized>(
     .await
     .ok();
 
-    let reply = match if let Some(bridge) = selected_session {
-        run_gemini_resume(
-            &PathBuf::from(&repo.path),
-            &bridge.desktop_session_id,
-            &body,
-            timeout_secs,
-            &approval_mode,
+    let repo_path = PathBuf::from(&repo.path);
+
+    let initial_label = selected_session
+        .as_ref()
+        .map(session_label_for)
+        .unwrap_or_else(|| "new".to_string());
+
+    let resume_result = if let Some(ref bridge) = selected_session {
+        Some(
+            run_gemini_resume(
+                &repo_path,
+                &bridge.desktop_session_id,
+                &body,
+                timeout_secs,
+                &approval_mode,
+            )
+            .await,
         )
-        .await
     } else {
-        run_gemini_headless(
-            &PathBuf::from(&repo.path),
-            &body,
-            timeout_secs,
-            &approval_mode,
-        )
-        .await
-    } {
-        Ok(reply) => reply,
-        Err(msg) => {
+        None
+    };
+
+    let (reply, session_label, auto_save_bridge) = match resume_result {
+        Some(Ok(reply)) => (reply, initial_label, None),
+        Some(Err(msg)) if !is_stale_gemini_session_error(&msg) => {
             bot.send_message(chat_id, msg, None).await?;
             return Ok(());
         }
+        other => {
+            if matches!(other, Some(Err(_))) {
+                tracing::warn!(
+                    target: "agent_bus::session_bridge",
+                    "gemini bridge session stale; falling back to headless"
+                );
+                bot.send_message(
+                    chat_id,
+                    "⚠️ Stale gemini session — starting fresh via gemini headless.".to_string(),
+                    None,
+                )
+                .await
+                .ok();
+            }
+            match run_gemini_headless(&repo_path, &body, timeout_secs, &approval_mode).await {
+                Ok(reply) => {
+                    let (label, new_bridge) = match list_gemini_sessions(&repo_path, 1).await {
+                        Ok(sessions) => match sessions.into_iter().next() {
+                            Some(session) => {
+                                let label = session.title.clone().unwrap_or_else(|| {
+                                    session.id[..session.id.len().min(8)].to_string()
+                                });
+                                let now = time::OffsetDateTime::now_utc();
+                                let selected_at = now
+                                    .format(&time::format_description::well_known::Rfc3339)
+                                    .unwrap_or_else(|_| now.unix_timestamp().to_string());
+                                let new_bridge = BridgedSessionState {
+                                    agent: AgentKind::Gemini.to_string(),
+                                    repo_id: repo.id.clone(),
+                                    desktop_session_id: session.id.clone(),
+                                    desktop_path: String::new(),
+                                    mobile_session_id: session.id.clone(),
+                                    mobile_path: String::new(),
+                                    selected_at,
+                                    sync: SessionSyncCursor {
+                                        desktop_offset: 0,
+                                        mobile_offset: 0,
+                                        last_synced_at: None,
+                                        last_error: None,
+                                    },
+                                    display_name: Some(label.clone()),
+                                };
+                                (label, Some(new_bridge))
+                            }
+                            None => ("new".to_string(), None),
+                        },
+                        Err(_) => ("new".to_string(), None),
+                    };
+                    (reply, label, new_bridge)
+                }
+                Err(msg) => {
+                    bot.send_message(chat_id, msg, None).await?;
+                    return Ok(());
+                }
+            }
+        }
     };
+
+    if let Some(bridge) = auto_save_bridge {
+        let _ = state
+            .set_bridged_session(chat_id.to_string(), "gemini".to_string(), bridge)
+            .await;
+    }
+
     let trimmed = reply.trim();
     if trimmed.is_empty() {
         bot.send_message(chat_id, "(empty reply from gemini)".to_string(), None)
             .await?;
         return Ok(());
     }
-    for chunk in claude_headless::chunk_for_telegram(trimmed, 4000) {
+    let header = agent_header("Gemini", &session_label);
+    for chunk in claude_headless::chunk_for_telegram(&format!("{header}{trimmed}"), 4000) {
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
@@ -790,48 +938,67 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
         .set_bridged_session(chat_id.to_string(), "codex".to_string(), bridge.clone())
         .await?;
 
+    let codex_session_label = session_label_for(&bridge);
+
     bot.send_message(chat_id, "⏳ codex thinking...".to_string(), None)
         .await
         .ok();
 
     let fallback_prompt = codex_bridge_prompt(&bridge, repo, &body);
     let timeout = Duration::from_secs(claude_headless::resolved_timeout_secs());
-    let reply = match run_codex_bridge_via_desktop_ipc(&bridge, &body, timeout).await {
-        Ok(reply) => Ok(reply),
-        Err(CodexBridgeIpcRunError::Fallback(reason)) => {
-            tracing::warn!(
-                target: "agent_bus::session_bridge",
-                desktop_session_id = %bridge.desktop_session_id,
-                reason = %reason,
-                "falling back to Codex CLI resume because desktop IPC is unavailable"
-            );
-            let Some(runner) = agent_runner else {
-                bot.send_message(
-                    chat_id,
-                    "Codex session bridge requires a live desktop Codex session or auth-contexts.yaml / AgentRunner.".to_string(),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            };
-            run_agent_via_runner(
-                runner,
-                AgentKind::Codex,
-                AgentRunInput {
-                    repo_id: bridge.repo_id.clone(),
-                    repo_path: PathBuf::from(&repo.path),
-                    prompt: fallback_prompt,
-                    mode: AgentRunMode::CodexResume {
-                        session_id: bridge.desktop_session_id.clone(),
-                        transcript_path: Some(PathBuf::from(&bridge.desktop_path)),
-                    },
-                    timeout,
-                    chat_id,
-                },
+    let reply = match repo.codex_mode {
+        CodexMode::LiveBridge => {
+            match run_codex_bridge_via_desktop_ipc(&bridge, &body, timeout).await {
+                Ok(reply) => Ok(reply),
+                Err(CodexBridgeIpcRunError::Fallback(reason)) => {
+                    tracing::warn!(
+                        target: "agent_bus::session_bridge",
+                        desktop_session_id = %bridge.desktop_session_id,
+                        reason = %reason,
+                        "falling back to Codex CLI resume because desktop IPC is unavailable"
+                    );
+                    let Some(runner) = agent_runner else {
+                        bot.send_message(
+                        chat_id,
+                        "Codex session bridge requires a live desktop Codex session or auth-contexts.yaml / AgentRunner.".to_string(),
+                        None,
+                    )
+                    .await?;
+                        return Ok(());
+                    };
+                    run_agent_via_runner(
+                        runner,
+                        AgentKind::Codex,
+                        AgentRunInput {
+                            repo_id: bridge.repo_id.clone(),
+                            repo_path: PathBuf::from(&repo.path),
+                            prompt: fallback_prompt,
+                            mode: AgentRunMode::CodexResume {
+                                session_id: bridge.desktop_session_id.clone(),
+                                transcript_path: Some(PathBuf::from(&bridge.desktop_path)),
+                            },
+                            timeout,
+                            chat_id,
+                        },
+                    )
+                    .await
+                }
+                Err(CodexBridgeIpcRunError::StartedButNoReply(message)) => Err(message),
+            }
+        }
+        CodexMode::AppServer => {
+            codex_app_server::run_codex_turn_via_app_server(
+                bot,
+                config,
+                state.clone(),
+                repo,
+                &bridge,
+                &body,
+                timeout,
+                chat_id,
             )
             .await
         }
-        Err(CodexBridgeIpcRunError::StartedButNoReply(message)) => Err(message),
     };
 
     let reply = match reply {
@@ -863,7 +1030,154 @@ async fn handle_codex_bridge_msg<B: BotClient + ?Sized>(
         return Ok(());
     }
     const MAX_CHUNK: usize = 4000;
-    for chunk in claude_headless::chunk_for_telegram(trimmed, MAX_CHUNK) {
+    let header = agent_header("Codex", &codex_session_label);
+    for chunk in claude_headless::chunk_for_telegram(&format!("{header}{trimmed}"), MAX_CHUNK) {
+        bot.send_message(chat_id, chunk, None).await?;
+    }
+    Ok(())
+}
+
+async fn handle_antigravity_bridge_msg<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    body: String,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot().await;
+    let selected_session = snapshot
+        .bridged_sessions
+        .get(&chat_id.to_string())
+        .and_then(|by_agent| by_agent.get("antigravity"))
+        .cloned();
+    let Some(bridge) = selected_session else {
+        bot.send_message(
+            chat_id,
+            "No antigravity session selected. Send /list_antigravity first.".to_string(),
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let Some(repo) = repo_by_id(config, &bridge.repo_id) else {
+        return Err(TelegramError::UnknownRepo(bridge.repo_id.clone()));
+    };
+    let antigravity_enabled = repo
+        .agents
+        .iter()
+        .any(|allowed| allowed == "antigravity" || allowed == "gemini");
+    if !antigravity_enabled {
+        bot.send_message(
+            chat_id,
+            format!("Agent antigravity is not enabled for repo {}", repo.id),
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let timeout_secs = claude_headless::resolved_timeout_secs();
+    let approval_mode = gemini_approval_mode();
+    bot.send_message(
+        chat_id,
+        format!("⏳ antigravity thinking... (timeout {timeout_secs}s, approval={approval_mode})"),
+        None,
+    )
+    .await
+    .ok();
+
+    let repo_path = PathBuf::from(&repo.path);
+    let initial_label = session_label_for(&bridge);
+
+    let resume_result =
+        run_gemini_resume(&repo_path, &bridge.desktop_session_id, &body, timeout_secs, &approval_mode).await;
+
+    let (reply, antigravity_session_label, replacement_bridge) = match resume_result {
+        Ok(reply) => (reply, initial_label, None),
+        Err(msg) if is_stale_gemini_session_error(&msg) => {
+            tracing::warn!(
+                target: "agent_bus::session_bridge",
+                session_id = %bridge.desktop_session_id,
+                "antigravity bridge session stale; falling back to headless"
+            );
+            bot.send_message(
+                chat_id,
+                "⚠️ Stale antigravity session — starting fresh via gemini headless.".to_string(),
+                None,
+            )
+            .await
+            .ok();
+            match run_gemini_headless(&repo_path, &body, timeout_secs, &approval_mode).await {
+                Ok(reply) => {
+                    let (new_label, new_bridge) = match list_gemini_sessions(&repo_path, 1).await {
+                        Ok(sessions) => match sessions.into_iter().next() {
+                            Some(session) => {
+                                let label = session.title.clone().unwrap_or_else(|| {
+                                    session.id[..session.id.len().min(8)].to_string()
+                                });
+                                let now = time::OffsetDateTime::now_utc();
+                                let selected_at = now
+                                    .format(&time::format_description::well_known::Rfc3339)
+                                    .unwrap_or_else(|_| now.unix_timestamp().to_string());
+                                let new_bridge = BridgedSessionState {
+                                    agent: AgentKind::Antigravity.to_string(),
+                                    repo_id: repo.id.clone(),
+                                    desktop_session_id: session.id.clone(),
+                                    desktop_path: String::new(),
+                                    mobile_session_id: session.id.clone(),
+                                    mobile_path: String::new(),
+                                    selected_at,
+                                    sync: SessionSyncCursor {
+                                        desktop_offset: 0,
+                                        mobile_offset: 0,
+                                        last_synced_at: None,
+                                        last_error: None,
+                                    },
+                                    display_name: Some(label.clone()),
+                                };
+                                (label, Some(new_bridge))
+                            }
+                            None => ("new".to_string(), None),
+                        },
+                        Err(_) => ("new".to_string(), None),
+                    };
+                    (reply, new_label, new_bridge)
+                }
+                Err(headless_err) => {
+                    bot.send_message(chat_id, headless_err, None).await?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(msg) => {
+            bot.send_message(chat_id, msg, None).await?;
+            return Ok(());
+        }
+    };
+
+    if let Some(new_bridge) = replacement_bridge {
+        let _ = state
+            .set_bridged_session(
+                chat_id.to_string(),
+                AgentKind::Antigravity.to_string(),
+                new_bridge,
+            )
+            .await;
+    }
+
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        bot.send_message(chat_id, "(empty reply from antigravity)".to_string(), None)
+            .await?;
+        return Ok(());
+    }
+    let header = agent_header("Antigravity", &antigravity_session_label);
+    for chunk in claude_headless::chunk_for_telegram(&format!("{header}{trimmed}"), 4000) {
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
@@ -984,6 +1298,10 @@ fn format_bridge_sync_stats(agent: AgentKind, stats: BridgeSyncStats) -> String 
         return "@flush_gemini: Gemini bridge is resume-based; no transcript sync is needed."
             .to_string();
     }
+    if agent == AgentKind::Antigravity {
+        return "@flush_antigravity: Antigravity bridge is resume-based; no transcript sync is needed."
+            .to_string();
+    }
     format!(
         "@flush_{agent} synced\n\
 desktop -> mobile: copied {}, skipped {}, errors {}\n\
@@ -1004,57 +1322,44 @@ total: copied {}, skipped {}, errors {}",
 pub async fn handle_list_claude_command<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
-    state: StateHandle,
+    _state: StateHandle,
     chat_id: i64,
 ) -> Result<(), TelegramError> {
     if !is_allowed(config, chat_id) {
         return Ok(());
     }
 
-    let snapshot = state.snapshot().await;
-    let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
-        bot.send_message(
-            chat_id,
-            "No default repo. Use /switch_rp first.".to_string(),
-            None,
-        )
-        .await?;
-        return Ok(());
-    };
-    let Some(repo) = repo_by_id(config, repo_id) else {
-        return Err(TelegramError::UnknownRepo(repo_id.clone()));
-    };
-
-    let project_dir = claude_project_dir(&repo.path);
-    let sessions = match mobile_session::detect_active_sessions(
-        &project_dir,
-        MOBILE_UUID,
-        DEFAULT_MTIME_THRESHOLD_SECS,
-    ) {
-        Ok(s) => s,
-        Err(err) => {
-            bot.send_message(chat_id, format!("Failed to scan sessions: {err}"), None)
-                .await?;
-            return Ok(());
-        }
-    };
+    let sessions =
+        match mobile_session::detect_all_sessions(&claude_projects_root(), MOBILE_UUID, 10) {
+            Ok(s) => s,
+            Err(err) => {
+                bot.send_message(chat_id, format!("Failed to scan sessions: {err}"), None)
+                    .await?;
+                return Ok(());
+            }
+        };
 
     if sessions.is_empty() {
-        bot.send_message(
-            chat_id,
-            format!(
-                "No active desktop sessions for {} (scanned {}).",
-                repo.display,
-                project_dir.display()
-            ),
-            None,
-        )
-        .await?;
+        bot.send_message(chat_id, "No Claude sessions found.".to_string(), None)
+            .await?;
         return Ok(());
     }
 
-    let rows = mobile_session::build_session_cards(&sessions);
-    let text = format!("Active desktop sessions ({}):", repo.display);
+    let now = time::OffsetDateTime::now_utc();
+    let rows = sessions
+        .iter()
+        .map(|session| {
+            let title = mobile_session::pick_session_label(session);
+            let rel = mobile_session::relative_time(now, session.last_modified);
+            let prefix = repo_short_label_from_source(&session.cwd);
+            let text = format!(
+                "{} · {} · {} turns · {}",
+                prefix, title, session.turn_count, rel
+            );
+            vec![(text, format!("sel_claude:{}", session.uuid))]
+        })
+        .collect();
+    let text = "Active Claude sessions:".to_string();
     bot.send_message(chat_id, text, Some(InlineKeyboard { rows }))
         .await?;
     Ok(())
@@ -1117,7 +1422,11 @@ pub async fn handle_list_codex_command<B: BotClient + ?Sized>(
         .map(|session| {
             let short = session.id.get(..8).unwrap_or(&session.id);
             vec![(
-                codex_session_button_label(session.title.as_deref(), short),
+                codex_session_button_label(
+                    Some(&repo_short_label(&repo.display)),
+                    session.title.as_deref(),
+                    short,
+                ),
                 format!("sel_codex:{}", session.id),
             )]
         })
@@ -1178,7 +1487,11 @@ pub async fn handle_list_gemini_command<B: BotClient + ?Sized>(
         .map(|session| {
             let short = session.id.get(..8).unwrap_or(&session.id);
             vec![(
-                gemini_session_button_label(session.title.as_deref(), short),
+                gemini_session_button_label(
+                    Some(&repo_short_label(&repo.display)),
+                    session.title.as_deref(),
+                    short,
+                ),
                 format!("sel_gemini:{}", session.id),
             )]
         })
@@ -1192,18 +1505,122 @@ pub async fn handle_list_gemini_command<B: BotClient + ?Sized>(
     Ok(())
 }
 
-fn codex_session_button_label(title: Option<&str>, short_id: &str) -> String {
-    match title {
+pub async fn handle_list_antigravity_command<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let _snapshot = state.snapshot().await;
+    let sessions = match session_bridge::detect_antigravity_sessions(None, 10) {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            bot.send_message(chat_id, short_err("scan failed", &err.to_string()), None)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    if sessions.is_empty() {
+        bot.send_message(chat_id, "No Antigravity sessions found.".to_string(), None)
+            .await?;
+        return Ok(());
+    }
+
+    let rows = sessions
+        .iter()
+        .map(|session| {
+            let short = session.id.get(..8).unwrap_or(&session.id);
+            vec![(
+                antigravity_session_button_label(
+                    session
+                        .repo_path
+                        .as_deref()
+                        .map(repo_short_label_from_source)
+                        .as_deref(),
+                    session.title.as_deref(),
+                    short,
+                ),
+                format!("sel_antigravity:{}", session.id),
+            )]
+        })
+        .collect();
+    bot.send_message(
+        chat_id,
+        "Active Antigravity sessions:".to_string(),
+        Some(InlineKeyboard { rows }),
+    )
+    .await?;
+    Ok(())
+}
+
+fn codex_session_button_label(
+    repo_prefix: Option<&str>,
+    title: Option<&str>,
+    short_id: &str,
+) -> String {
+    session_button_label(repo_prefix, title, short_id, "Codex")
+}
+
+fn gemini_session_button_label(
+    repo_prefix: Option<&str>,
+    title: Option<&str>,
+    short_id: &str,
+) -> String {
+    session_button_label(repo_prefix, title, short_id, "Gemini")
+}
+
+fn antigravity_session_button_label(
+    repo_prefix: Option<&str>,
+    title: Option<&str>,
+    short_id: &str,
+) -> String {
+    session_button_label(repo_prefix, title, short_id, "Antigravity")
+}
+
+fn session_button_label(
+    repo_prefix: Option<&str>,
+    title: Option<&str>,
+    short_id: &str,
+    fallback_name: &str,
+) -> String {
+    let base = match title {
         Some(title) => format!("{title} ({short_id})"),
-        None => format!("Codex {short_id}"),
+        None => format!("{fallback_name} {short_id}"),
+    };
+    match repo_prefix {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix} · {base}"),
+        _ => base,
     }
 }
 
-fn gemini_session_button_label(title: Option<&str>, short_id: &str) -> String {
-    match title {
-        Some(title) => format!("{title} ({short_id})"),
-        None => format!("Gemini {short_id}"),
+fn repo_short_label(display: &str) -> String {
+    truncate_chars(display.trim(), 10)
+}
+
+fn repo_short_label_from_source(source: &str) -> String {
+    let trimmed = source.trim_end_matches('/');
+    let base = Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(trimmed);
+    truncate_chars(base, 10)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
     }
+    let mut out = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
 }
 
 fn codex_home_dir() -> PathBuf {
@@ -1223,6 +1640,12 @@ fn codex_home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".codex"))
 }
 
+fn claude_projects_root() -> PathBuf {
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".claude").join("projects"))
+        .unwrap_or_else(|_| PathBuf::from(".claude/projects"))
+}
+
 pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
     bot: &B,
     config: &TelegramConfig,
@@ -1240,63 +1663,39 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
         return Err(TelegramError::InvalidCallback(callback_data));
     };
 
-    let snapshot = state.snapshot().await;
-    let Some(repo_id) = snapshot.default_repo_by_chat.get(&chat_id.to_string()) else {
-        bot.answer_callback(callback_id, "No default repo".to_string())
-            .await?;
-        return Ok(());
-    };
-    let Some(repo) = repo_by_id(config, repo_id) else {
-        return Err(TelegramError::UnknownRepo(repo_id.clone()));
-    };
-
-    let project_dir = claude_project_dir(&repo.path);
-    let source_path = project_dir.join(format!("{}.jsonl", desktop_uuid));
-
-    let sessions = match mobile_session::detect_active_sessions(
-        &project_dir,
-        MOBILE_UUID,
-        DEFAULT_MTIME_THRESHOLD_SECS,
-    ) {
-        Ok(s) => s,
-        Err(err) => {
-            bot.answer_callback(callback_id, short_err("Scan failed", &err.to_string()))
-                .await?;
-            return Ok(());
-        }
-    };
+    let sessions =
+        match mobile_session::detect_all_sessions(&claude_projects_root(), MOBILE_UUID, 200) {
+            Ok(s) => s,
+            Err(err) => {
+                bot.answer_callback(callback_id, short_err("Scan failed", &err.to_string()))
+                    .await?;
+                return Ok(());
+            }
+        };
     let Some(session) = sessions.iter().find(|s| s.uuid == desktop_uuid) else {
         bot.answer_callback(callback_id, "Session not found".to_string())
             .await?;
         return Ok(());
     };
-
-    if !cwd_matches_repo(&session.cwd, &repo.path) {
-        bot.edit_message_text(
-            message,
-            format!(
-                "⚠️ Session cwd {} does not match repo {}. Cannot bridge across projects.",
-                session.cwd, repo.path
-            ),
-        )
-        .await?;
-        bot.answer_callback(callback_id, "cwd mismatch".to_string())
+    let Some(repo) = repo_by_path(config, &session.cwd) else {
+        bot.answer_callback(callback_id, "Repo not registered".to_string())
             .await?;
         return Ok(());
-    }
+    };
 
     let now = time::OffsetDateTime::now_utc();
     let forked_at = now
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| now.unix_timestamp().to_string());
-    let desktop_offset = source_path.metadata().map(|m| m.len()).unwrap_or(0);
+    let desktop_offset = session.path.metadata().map(|m| m.len()).unwrap_or(0);
+    let title = mobile_session::pick_session_label(session);
     let bridge = BridgedSessionState {
         agent: AgentKind::Claude.to_string(),
         repo_id: repo.id.clone(),
         desktop_session_id: desktop_uuid.clone(),
-        desktop_path: source_path.display().to_string(),
+        desktop_path: session.path.display().to_string(),
         mobile_session_id: desktop_uuid.clone(),
-        mobile_path: source_path.display().to_string(),
+        mobile_path: session.path.display().to_string(),
         selected_at: forked_at.clone(),
         sync: SessionSyncCursor {
             desktop_offset,
@@ -1304,12 +1703,11 @@ pub async fn handle_callback_sel_claude<B: BotClient + ?Sized>(
             last_synced_at: None,
             last_error: None,
         },
+        display_name: Some(title.clone()),
     };
     state
         .set_bridged_session(chat_id.to_string(), AgentKind::Claude.to_string(), bridge)
         .await?;
-
-    let title = mobile_session::pick_session_label(session);
     let confirm = format!(
         "✅ Claude session \"{}\" selected. Send @claude <msg> to continue.",
         title
@@ -1368,6 +1766,8 @@ pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
         .unwrap_or_else(|_| now.unix_timestamp().to_string());
 
     let desktop_offset = session.path.metadata().map(|m| m.len()).unwrap_or(0);
+    let short = session.id.get(..8).unwrap_or(&session.id);
+    let label = session.title.as_deref().unwrap_or(short);
     let bridge = BridgedSessionState {
         agent: AgentKind::Codex.to_string(),
         repo_id: repo.id.clone(),
@@ -1382,13 +1782,11 @@ pub async fn handle_callback_sel_codex<B: BotClient + ?Sized>(
             last_synced_at: None,
             last_error: None,
         },
+        display_name: Some(label.to_string()),
     };
     state
         .set_bridged_session(chat_id.to_string(), AgentKind::Codex.to_string(), bridge)
         .await?;
-
-    let short = session.id.get(..8).unwrap_or(&session.id);
-    let label = session.title.as_deref().unwrap_or(short);
     bot.edit_message_text(
         message,
         format!("{label} selected. Send @codex <msg> to continue."),
@@ -1446,6 +1844,8 @@ pub async fn handle_callback_sel_gemini<B: BotClient + ?Sized>(
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| now.unix_timestamp().to_string());
 
+    let short = session.id.get(..8).unwrap_or(&session.id);
+    let label = session.title.as_deref().unwrap_or(short);
     let bridge = BridgedSessionState {
         agent: AgentKind::Gemini.to_string(),
         repo_id: repo.id.clone(),
@@ -1460,16 +1860,101 @@ pub async fn handle_callback_sel_gemini<B: BotClient + ?Sized>(
             last_synced_at: None,
             last_error: None,
         },
+        display_name: Some(label.to_string()),
     };
     state
         .set_bridged_session(chat_id.to_string(), AgentKind::Gemini.to_string(), bridge)
         .await?;
 
-    let short = session.id.get(..8).unwrap_or(&session.id);
-    let label = session.title.as_deref().unwrap_or(short);
     bot.edit_message_text(
         message,
         format!("{label} selected. Send @gemini <msg> to continue."),
+    )
+    .await?;
+    bot.answer_callback(callback_id, "Selected".to_string())
+        .await?;
+    Ok(())
+}
+
+pub async fn handle_callback_sel_antigravity<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    chat_id: i64,
+    message: MessageRef,
+    callback_id: String,
+    callback_data: String,
+) -> Result<(), TelegramError> {
+    if !is_allowed(config, chat_id) {
+        return Ok(());
+    }
+
+    let Some((AgentKind::Antigravity, antigravity_id)) =
+        session_bridge::parse_callback_data(&callback_data)
+    else {
+        return Err(TelegramError::InvalidCallback(callback_data));
+    };
+
+    let sessions = match session_bridge::detect_antigravity_sessions(None, 50) {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            bot.answer_callback(callback_id, short_err("scan failed", &err.to_string()))
+                .await?;
+            return Ok(());
+        }
+    };
+    let Some(session) = sessions
+        .into_iter()
+        .find(|session| session.id == antigravity_id)
+    else {
+        bot.answer_callback(callback_id, "Session not found".to_string())
+            .await?;
+        return Ok(());
+    };
+    let Some(repo_path) = session.repo_path.as_deref() else {
+        bot.answer_callback(callback_id, "Session repo not found".to_string())
+            .await?;
+        return Ok(());
+    };
+    let Some(repo) = repo_by_path(config, repo_path) else {
+        bot.answer_callback(callback_id, "Repo not registered".to_string())
+            .await?;
+        return Ok(());
+    };
+
+    let now = time::OffsetDateTime::now_utc();
+    let selected_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string());
+
+    let short = session.id.get(..8).unwrap_or(&session.id);
+    let label = session.title.as_deref().unwrap_or(short);
+    let bridge = BridgedSessionState {
+        agent: AgentKind::Antigravity.to_string(),
+        repo_id: repo.id.clone(),
+        desktop_session_id: session.id.clone(),
+        desktop_path: String::new(),
+        mobile_session_id: session.id.clone(),
+        mobile_path: String::new(),
+        selected_at,
+        sync: SessionSyncCursor {
+            desktop_offset: 0,
+            mobile_offset: 0,
+            last_synced_at: None,
+            last_error: None,
+        },
+        display_name: Some(label.to_string()),
+    };
+    state
+        .set_bridged_session(
+            chat_id.to_string(),
+            AgentKind::Antigravity.to_string(),
+            bridge,
+        )
+        .await?;
+    bot.edit_message_text(
+        message,
+        format!("{label} selected. Send @antigravity <msg> to continue."),
     )
     .await?;
     bot.answer_callback(callback_id, "Selected".to_string())
@@ -1526,6 +2011,10 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
 
     let cwd = PathBuf::from(&repo.path);
     let timeout_secs = claude_headless::resolved_timeout_secs();
+    let claude_session_label = bridge
+        .as_ref()
+        .map(session_label_for)
+        .unwrap_or_else(|| make_session_label(resume_uuid, ""));
 
     bot.send_message(
         chat_id,
@@ -1566,7 +2055,8 @@ pub async fn handle_claude_mobile_msg<B: BotClient + ?Sized>(
     }
 
     const MAX_CHUNK: usize = 4000;
-    for chunk in claude_headless::chunk_for_telegram(trimmed, MAX_CHUNK) {
+    let header = agent_header("Claude", &claude_session_label);
+    for chunk in claude_headless::chunk_for_telegram(&format!("{header}{trimmed}"), MAX_CHUNK) {
         bot.send_message(chat_id, chunk, None).await?;
     }
     Ok(())
@@ -1817,20 +2307,12 @@ async fn run_agent_via_runner(
 
 // ── helpers ───────────────────────────────────────────────────────────
 
-const DEFAULT_MTIME_THRESHOLD_SECS: u64 = 30 * 60; // 30 minutes
-
-fn claude_project_dir(repo_path: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".claude")
-        .join("projects")
-        .join(project_hash_for_repo(repo_path))
-}
-
+#[cfg(test)]
 fn project_hash_for_repo(repo_path: &str) -> String {
     repo_path.replace('/', "-")
 }
 
+#[cfg(test)]
 fn cwd_matches_repo(session_cwd: &str, repo_path: &str) -> bool {
     let normalize = |s: &str| s.trim_end_matches('/').to_string();
     normalize(session_cwd) == normalize(repo_path)
@@ -1858,10 +2340,64 @@ fn short_err(label: &str, err: &str) -> String {
     format!("{}: {}", label, head)
 }
 
+fn is_bare_uuid(s: &str) -> bool {
+    s.len() == 36 && s.bytes().filter(|&b| b == b'-').count() == 4
+}
+
+fn is_stale_gemini_session_error(error_msg: &str) -> bool {
+    error_msg.contains("Invalid session identifier") || error_msg.contains("Error resuming session")
+}
+
+fn make_session_label(session_id: &str, path: &str) -> String {
+    session_label_from(None, session_id, path)
+}
+
+fn session_label_for(bridge: &BridgedSessionState) -> String {
+    session_label_from(
+        bridge.display_name.as_deref(),
+        &bridge.desktop_session_id,
+        &bridge.desktop_path,
+    )
+}
+
+fn session_label_from(display_name: Option<&str>, session_id: &str, path: &str) -> String {
+    if let Some(name) = display_name {
+        if !name.trim().is_empty() {
+            return truncate_session_label(name);
+        }
+    }
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = if !stem.is_empty() && !is_bare_uuid(&stem) {
+        stem
+    } else if !session_id.is_empty() {
+        session_id[..session_id.len().min(8)].to_string()
+    } else {
+        "session".to_string()
+    };
+    truncate_session_label(&label)
+}
+
+fn truncate_session_label(label: &str) -> String {
+    if label.chars().count() > 20 {
+        let truncated: String = label.chars().take(17).collect();
+        format!("{truncated}...")
+    } else {
+        label.to_string()
+    }
+}
+
+fn agent_header(agent_display: &str, session_label: &str) -> String {
+    format!("[{agent_display} - {session_label}]\n")
+}
+
 #[allow(dead_code)]
 fn _session_info_dummy() -> SessionInfo {
     SessionInfo {
         uuid: String::new(),
+        path: PathBuf::new(),
         cwd: String::new(),
         ai_title: None,
         first_prompt: None,
@@ -2097,6 +2633,14 @@ fn repo_by_id<'a>(config: &'a TelegramConfig, repo_id: &str) -> Option<&'a RepoE
     config.repos.iter().find(|repo| repo.id == repo_id)
 }
 
+fn repo_by_path<'a>(config: &'a TelegramConfig, repo_path: &str) -> Option<&'a RepoEntry> {
+    let target = repo_path.trim_end_matches('/');
+    config
+        .repos
+        .iter()
+        .find(|repo| repo.path.trim_end_matches('/') == target)
+}
+
 #[derive(Debug, Clone, Default)]
 #[cfg(test)]
 pub struct MockBot {
@@ -2273,6 +2817,7 @@ pub async fn teloxide_callback_handler(
     state: StateHandle,
     auth_contexts: Arc<Option<AuthContextsConfig>>,
     registry: crate::daemon::perm::PendingPermRegistry,
+    agent_runner: SharedAgentRunner,
 ) -> ResponseResult<()> {
     let client = TeloxideBotClient::new(bot);
     let Some(data) = query.data else {
@@ -2344,6 +2889,21 @@ pub async fn teloxide_callback_handler(
         )
         .await
         .map_err(to_teloxide_error)?;
+    } else if data.starts_with("sel_antigravity:") {
+        handle_callback_sel_antigravity(
+            &client,
+            &config,
+            state,
+            chat.id.0,
+            MessageRef {
+                chat_id: chat.id.0,
+                message_id: message_id.0,
+            },
+            query.id,
+            data,
+        )
+        .await
+        .map_err(to_teloxide_error)?;
     } else if data.starts_with("perm:") {
         let user_name = query
             .from
@@ -2379,8 +2939,143 @@ pub async fn teloxide_callback_handler(
             .await
             .map_err(to_teloxide_error)?;
         }
+    } else if data.starts_with("help:") {
+        handle_callback_help(
+            &client,
+            &config,
+            state,
+            &auth_contexts,
+            chat.id.0,
+            query.id,
+            &data,
+            agent_runner.as_ref(),
+        )
+        .await
+        .map_err(to_teloxide_error)?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_callback_help<B: BotClient + ?Sized>(
+    bot: &B,
+    config: &TelegramConfig,
+    state: StateHandle,
+    auth_contexts: &Option<AuthContextsConfig>,
+    chat_id: i64,
+    callback_id: String,
+    data: &str,
+    agent_runner: Option<
+        &Arc<crate::daemon::runner::AgentRunner<crate::daemon::cli_spawner::CliSpawner>>,
+    >,
+) -> Result<(), TelegramError> {
+    let cmd = data.strip_prefix("help:").unwrap_or("");
+    match cmd {
+        "current" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            handle_current_command(bot, config, state, chat_id).await
+        }
+        "switch_rp" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            handle_switch_rp_picker(bot, config, state, chat_id).await
+        }
+        "auth_list" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            if let Some(cfg) = auth_contexts {
+                auth_cmds::handle_auth_list_command(bot, state, cfg, chat_id).await
+            } else {
+                bot.send_message(
+                    chat_id,
+                    "Auth contexts not configured (legacy mode)".to_string(),
+                    None,
+                )
+                .await?;
+                Ok(())
+            }
+        }
+        "quota" => {
+            bot.answer_callback(callback_id, "Usage: /quota <agent>".to_string())
+                .await
+        }
+        "auth_rotate" => {
+            bot.answer_callback(callback_id, "Usage: /auth_rotate <agent>".to_string())
+                .await
+        }
+        "lead" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            if !is_allowed(config, chat_id) {
+                return Ok(());
+            }
+            if let Some(cfg) = auth_contexts {
+                auth_cmds::handle_lead_command(bot, state, cfg, chat_id, None).await
+            } else {
+                handle_legacy_lead_command(bot, state, chat_id, None).await
+            }
+        }
+        "lead_default" => {
+            bot.answer_callback(callback_id, "Usage: /lead_default <agent>".to_string())
+                .await
+        }
+        "lead_clear" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            if !is_allowed(config, chat_id) {
+                return Ok(());
+            }
+            auth_cmds::handle_lead_clear_command(bot, state, chat_id).await
+        }
+        "list_claude" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            handle_bridge_command(
+                bot,
+                config,
+                state,
+                chat_id,
+                BridgeCommand::List(AgentKind::Claude),
+                agent_runner,
+            )
+            .await
+        }
+        "list_codex" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            handle_bridge_command(
+                bot,
+                config,
+                state,
+                chat_id,
+                BridgeCommand::List(AgentKind::Codex),
+                agent_runner,
+            )
+            .await
+        }
+        "list_gemini" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            handle_bridge_command(
+                bot,
+                config,
+                state,
+                chat_id,
+                BridgeCommand::List(AgentKind::Gemini),
+                agent_runner,
+            )
+            .await
+        }
+        "list_antigravity" => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            handle_bridge_command(
+                bot,
+                config,
+                state,
+                chat_id,
+                BridgeCommand::List(AgentKind::Antigravity),
+                agent_runner,
+            )
+            .await
+        }
+        _ => {
+            bot.answer_callback(callback_id, String::new()).await?;
+            Ok(())
+        }
+    }
 }
 
 fn to_teloxide_keyboard(keyboard: InlineKeyboard) -> InlineKeyboardMarkup {
@@ -2399,6 +3094,7 @@ fn to_teloxide_error(err: TelegramError) -> teloxide::RequestError {
 mod mobile_tests {
     use super::*;
     use agent_bus_core::state::spawn_state_actor;
+    use base64::Engine;
     use std::io::Write;
     use std::sync::Mutex;
     use tempfile::tempdir;
@@ -2421,7 +3117,9 @@ mod mobile_tests {
                     "claude".to_string(),
                     "codex".to_string(),
                     "gemini".to_string(),
+                    "antigravity".to_string(),
                 ],
+                codex_mode: CodexMode::LiveBridge,
             }],
         }
     }
@@ -2478,11 +3176,112 @@ echo \"cwd=$PWD\"\n",
         path
     }
 
+    fn write_claude_session(
+        home: &Path,
+        project_key: &str,
+        session_id: &str,
+        repo_path: &Path,
+        prompt: &str,
+    ) -> PathBuf {
+        let project_dir = home.join(".claude/projects").join(project_key);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{"type":"summary","sessionId":"{}","summary":"stub"}}"#,
+                    "\n",
+                    r#"{{"type":"user","sessionId":"{}","cwd":"{}","timestamp":"2026-04-19T00:00:00Z","message":{{"role":"user","content":"{}"}}}}"#
+                ),
+                session_id,
+                session_id,
+                repo_path.display(),
+                prompt
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_antigravity_db(path: &Path, repo_path: &Path, session_id: &str, title: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        let entry = proto_field(
+            1,
+            &proto_message([
+                proto_field(1, session_id.as_bytes()),
+                proto_field(
+                    2,
+                    base64::engine::general_purpose::STANDARD
+                        .encode(proto_message([proto_field(1, title.as_bytes())]))
+                        .as_bytes(),
+                ),
+                proto_field(
+                    5,
+                    &proto_message([proto_field(
+                        1,
+                        format!("file://{}", repo_path.display()).as_bytes(),
+                    )]),
+                ),
+            ]),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(entry);
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+            ("antigravityUnifiedStateSync.trajectorySummaries", encoded),
+        )
+        .unwrap();
+    }
+
+    fn proto_field(field: u64, data: &[u8]) -> Vec<u8> {
+        let mut out = encode_varint((field << 3) | 2);
+        out.extend(encode_varint(data.len() as u64));
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn proto_message<const N: usize>(fields: [Vec<u8>; N]) -> Vec<u8> {
+        fields.into_iter().flatten().collect()
+    }
+
+    fn encode_varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
     #[tokio::test]
-    async fn list_claude_with_no_default_repo_warns() {
+    async fn list_claude_lists_all_sessions_with_repo_prefix() {
         let bot = MockBot::default();
         let config = test_config();
         let dir = tempdir().unwrap();
+        let repo_path = dir.path().join("sample-repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let home = dir.path().join("home");
+        write_claude_session(
+            &home,
+            "-tmp-sample-repo",
+            "11111111-1111-1111-1111-111111111111",
+            &repo_path,
+            "Help me wire Telegram bridge",
+        );
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
@@ -2490,10 +3289,18 @@ echo \"cwd=$PWD\"\n",
         handle_text_command(&bot, &config, state, &None, 100, None, "/list_claude", None)
             .await
             .unwrap();
+        restore_env("HOME", old_home);
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].text.to_lowercase().contains("no default repo"));
+        assert_eq!(sent[0].text, "Active Claude sessions:");
+        let keyboard = sent[0].keyboard.as_ref().expect("keyboard");
+        assert_eq!(keyboard.rows.len(), 1);
+        let label = &keyboard.rows[0][0].0;
+        assert!(label.contains(&repo_short_label_from_source(
+            &repo_path.display().to_string()
+        )));
+        assert!(label.contains("Help me wire Telegram bridge"));
     }
 
     #[tokio::test]
@@ -2532,6 +3339,8 @@ echo \"cwd=$PWD\"\n",
         let bot = MockBot::default();
         let config = test_config();
         let dir = tempdir().unwrap();
+        let old_agent_bus_home = std::env::var("AGENT_BUS_HOME").ok();
+        std::env::set_var("AGENT_BUS_HOME", dir.path().join("agent-bus-home"));
         let state = spawn_state_actor(dir.path().join("state.json"))
             .await
             .unwrap();
@@ -2563,6 +3372,7 @@ echo \"cwd=$PWD\"\n",
                         last_synced_at: None,
                         last_error: None,
                     },
+                    display_name: None,
                 },
             )
             .await
@@ -2580,12 +3390,26 @@ echo \"cwd=$PWD\"\n",
         )
         .await
         .unwrap();
+        restore_env("AGENT_BUS_HOME", old_agent_bus_home);
 
         let sent = bot.sent_messages();
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].text.contains("desktop -> mobile: copied 1"));
-        assert!(sent[0].text.contains("mobile -> desktop: copied 1"));
-        assert!(sent[0].text.contains("total: copied 2"));
+        assert!(
+            sent[0].text.contains("@flush_claude synced"),
+            "{}",
+            sent[0].text
+        );
+        assert!(
+            sent[0].text.contains("desktop -> mobile:"),
+            "{}",
+            sent[0].text
+        );
+        assert!(
+            sent[0].text.contains("mobile -> desktop:"),
+            "{}",
+            sent[0].text
+        );
+        assert!(sent[0].text.contains("total:"), "{}", sent[0].text);
 
         let desktop_content = std::fs::read_to_string(&desktop).unwrap();
         let mobile_content = std::fs::read_to_string(&mobile).unwrap();
@@ -2943,6 +3767,7 @@ echo \"cwd=$PWD\"\n",
                         last_synced_at: None,
                         last_error: None,
                     },
+                    display_name: None,
                 },
             )
             .await
@@ -2967,6 +3792,180 @@ echo \"cwd=$PWD\"\n",
         let sent = bot.sent_messages();
         assert!(sent[0].text.contains("gemini thinking"));
         assert!(sent[1].text.contains("gemini resume: gem-22222222"));
+        assert!(sent[1].text.contains("--approval-mode plan"));
+        assert!(sent[1].text.contains("hello"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn list_antigravity_lists_sessions() {
+        let _guard = GEMINI_OVERRIDE_TEST_LOCK.lock().unwrap();
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let db_path = dir.path().join("state.vscdb");
+        write_antigravity_db(
+            &db_path,
+            &repo,
+            "11111111-1111-1111-1111-111111111111",
+            "Desktop Session",
+        );
+        session_bridge::set_antigravity_state_db_override(Some(db_path));
+        session_bridge::set_antigravity_brain_root_override(Some(dir.path().join("brain-empty")));
+
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
+
+        let result = handle_text_command(
+            &bot,
+            &config,
+            state,
+            &None,
+            100,
+            None,
+            "/list_antigravity",
+            None,
+        )
+        .await;
+        session_bridge::set_antigravity_state_db_override(None);
+        session_bridge::set_antigravity_brain_root_override(None);
+        result.unwrap();
+
+        let sent = bot.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("Active Antigravity sessions"));
+        let keyboard = sent[0]
+            .keyboard
+            .as_ref()
+            .expect("antigravity session keyboard");
+        assert_eq!(
+            keyboard.rows[0][0].1,
+            "sel_antigravity:11111111-1111-1111-1111-111111111111"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn selecting_antigravity_writes_bridge_state() {
+        let _guard = GEMINI_OVERRIDE_TEST_LOCK.lock().unwrap();
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let db_path = dir.path().join("state.vscdb");
+        write_antigravity_db(
+            &db_path,
+            &repo,
+            "22222222-2222-2222-2222-222222222222",
+            "Bridge Session",
+        );
+        session_bridge::set_antigravity_state_db_override(Some(db_path));
+        session_bridge::set_antigravity_brain_root_override(Some(dir.path().join("brain-empty")));
+
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
+
+        let result = handle_callback_sel_antigravity(
+            &bot,
+            &config,
+            state.clone(),
+            100,
+            MessageRef {
+                chat_id: 100,
+                message_id: 1,
+            },
+            "cb1".to_string(),
+            "sel_antigravity:22222222-2222-2222-2222-222222222222".to_string(),
+        )
+        .await;
+        session_bridge::set_antigravity_state_db_override(None);
+        session_bridge::set_antigravity_brain_root_override(None);
+        result.unwrap();
+
+        let snapshot = state.snapshot().await;
+        let bridge = &snapshot.bridged_sessions["100"]["antigravity"];
+        assert_eq!(bridge.agent, "antigravity");
+        assert_eq!(
+            bridge.desktop_session_id,
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(bot.answered_callbacks(), vec!["cb1".to_string()]);
+        assert!(bot.edited_messages()[0].text.contains("@antigravity <msg>"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn antigravity_chat_uses_selected_session() {
+        let _guard = GEMINI_OVERRIDE_TEST_LOCK.lock().unwrap();
+        let bot = MockBot::default();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let fake_gemini = dir.path().join("fake-gemini.sh");
+        write_fake_gemini_script(&fake_gemini);
+
+        let old_bin = std::env::var("AGENT_BUS_GEMINI_BIN").ok();
+        let old_approval = std::env::var("AGENT_BUS_GEMINI_APPROVAL_MODE").ok();
+        std::env::set_var("AGENT_BUS_GEMINI_BIN", &fake_gemini);
+        std::env::set_var("AGENT_BUS_GEMINI_APPROVAL_MODE", "plan");
+
+        let config = config_with_repo_path(repo.display().to_string());
+        let state = spawn_state_actor(dir.path().join("state.json"))
+            .await
+            .unwrap();
+        state.set_default_repo("100", "sample_repo").await.unwrap();
+        state
+            .set_bridged_session(
+                "100",
+                AgentKind::Antigravity.to_string(),
+                BridgedSessionState {
+                    agent: AgentKind::Antigravity.to_string(),
+                    repo_id: "sample_repo".to_string(),
+                    desktop_session_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                    desktop_path: String::new(),
+                    mobile_session_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                    mobile_path: String::new(),
+                    selected_at: "2026-04-19T00:00:00Z".to_string(),
+                    sync: SessionSyncCursor {
+                        desktop_offset: 0,
+                        mobile_offset: 0,
+                        last_synced_at: None,
+                        last_error: None,
+                    },
+                    display_name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = handle_text_command(
+            &bot,
+            &config,
+            state,
+            &None,
+            100,
+            None,
+            "@antigravity hello",
+            None,
+        )
+        .await;
+
+        restore_env("AGENT_BUS_GEMINI_BIN", old_bin);
+        restore_env("AGENT_BUS_GEMINI_APPROVAL_MODE", old_approval);
+        result.unwrap();
+
+        let sent = bot.sent_messages();
+        assert!(sent[0].text.contains("antigravity thinking"));
+        assert!(sent[1]
+            .text
+            .contains("gemini resume: 33333333-3333-3333-3333-333333333333"));
         assert!(sent[1].text.contains("--approval-mode plan"));
         assert!(sent[1].text.contains("hello"));
     }
@@ -3012,6 +4011,7 @@ echo \"cwd=$PWD\"\n",
                         last_synced_at: None,
                         last_error: None,
                     },
+                    display_name: None,
                 },
             )
             .await
@@ -3227,6 +4227,7 @@ echo \"cwd=$PWD\"\n",
                 display: "SampleRepo".to_string(),
                 path: repo_path.display().to_string(),
                 agents: vec!["claude".to_string()],
+                codex_mode: CodexMode::LiveBridge,
             }],
         };
         let state = spawn_state_actor(dir.path().join("state.json"))
@@ -3301,6 +4302,7 @@ echo \"cwd=$PWD\"\n",
                 display: "SampleRepo".to_string(),
                 path: repo_path.display().to_string(),
                 agents: vec!["codex".to_string()],
+                codex_mode: CodexMode::LiveBridge,
             }],
         };
         let state = spawn_state_actor(dir.path().join("state.json"))
@@ -3334,6 +4336,7 @@ echo \"cwd=$PWD\"\n",
                         last_synced_at: None,
                         last_error: None,
                     },
+                    display_name: None,
                 },
             )
             .await
@@ -3415,6 +4418,7 @@ echo \"cwd=$PWD\"\n",
                 display: "SampleRepo".to_string(),
                 path: repo_path.display().to_string(),
                 agents: vec!["claude".to_string()],
+                codex_mode: CodexMode::LiveBridge,
             }],
         };
         let state = spawn_state_actor(dir.path().join("state.json"))
@@ -3436,9 +4440,7 @@ echo \"cwd=$PWD\"\n",
         )
         .await
         .unwrap();
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        }
+        restore_env("HOME", old_home);
 
         let snap = state.snapshot().await;
         assert!(

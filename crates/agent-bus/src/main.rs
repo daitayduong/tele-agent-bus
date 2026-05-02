@@ -4,8 +4,8 @@
 mod cli;
 mod daemon;
 
+use crate::cli::approval_gate::GateCommands;
 use crate::cli::auth::RegisterArgs;
-use crate::cli::blacklist::BlacklistCommands;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -30,10 +30,10 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
-    /// Blacklist management
-    Blacklist {
+    /// Approval gate management (commands that require Telegram approval)
+    Gate {
         #[command(subcommand)]
-        command: BlacklistCommands,
+        command: GateCommands,
     },
     /// Auth-context management (per-agent OAuth profiles for rotation)
     Auth {
@@ -104,7 +104,7 @@ fn main() -> anyhow::Result<()> {
             ConfigCommands::Show => cli::config::show()?,
             ConfigCommands::Validate => cli::config::validate()?,
         },
-        Commands::Blacklist { command } => cli::blacklist::handle(command)?,
+        Commands::Gate { command } => cli::approval_gate::handle(command)?,
         Commands::Auth { command } => match command {
             AuthCommands::Register {
                 agent,

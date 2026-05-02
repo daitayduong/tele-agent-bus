@@ -2,7 +2,7 @@ use regex::{Regex, RegexSet};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum BlacklistError {
+pub enum GateError {
     #[error("Regex error: {0}")]
     Regex(#[from] regex::Error),
     #[error("IO error: {0}")]
@@ -10,23 +10,23 @@ pub enum BlacklistError {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct BlacklistRule {
+pub struct GateRule {
     pub pattern: String,
     pub destructive: bool,
 }
 
-pub struct Blacklist {
-    rules: Vec<BlacklistRule>,
+pub struct ApprovalGate {
+    rules: Vec<GateRule>,
     regex_set: Option<RegexSet>,
 }
 
-impl Default for Blacklist {
+impl Default for ApprovalGate {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Blacklist {
+impl ApprovalGate {
     pub fn new() -> Self {
         Self {
             rules: vec![],
@@ -34,7 +34,7 @@ impl Blacklist {
         }
     }
 
-    pub fn add_rule(&mut self, line: &str) -> Result<(), BlacklistError> {
+    pub fn add_rule(&mut self, line: &str) -> Result<(), GateError> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             return Ok(());
@@ -56,7 +56,7 @@ impl Blacklist {
         // Validate regex
         Regex::new(&pattern)?;
 
-        self.rules.push(BlacklistRule {
+        self.rules.push(GateRule {
             pattern,
             destructive,
         });
@@ -67,7 +67,7 @@ impl Blacklist {
         Ok(())
     }
 
-    pub fn load<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<(), BlacklistError> {
+    pub fn load<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<(), GateError> {
         let content = std::fs::read_to_string(path)?;
         for line in content.lines() {
             self.add_rule(line)?;
@@ -76,7 +76,7 @@ impl Blacklist {
         Ok(())
     }
 
-    pub fn compile(&mut self) -> Result<(), BlacklistError> {
+    pub fn compile(&mut self) -> Result<(), GateError> {
         if self.rules.is_empty() {
             return Ok(());
         }
@@ -85,10 +85,10 @@ impl Blacklist {
         Ok(())
     }
 
-    pub fn check(&self, command: &str) -> Option<BlacklistRule> {
+    pub fn check(&self, command: &str) -> Option<GateRule> {
         // First check hardcoded suspicious patterns (§10.1)
         if is_suspicious(command) {
-            return Some(BlacklistRule {
+            return Some(GateRule {
                 pattern: "heuristic:suspicious".to_string(),
                 destructive: true,
             });
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn test_basic_match() {
-        let mut bl = Blacklist::new();
+        let mut bl = ApprovalGate::new();
         bl.add_rule("rm\\s+-rf").unwrap();
         bl.compile().unwrap();
         let matched = bl.check("rm -rf /").unwrap();
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_flag_parsing() {
-        let mut bl = Blacklist::new();
+        let mut bl = ApprovalGate::new();
         bl.add_rule("rm\\s+-rf\tdestructive").unwrap();
         bl.compile().unwrap();
         let matched = bl.check("rm -rf /").unwrap();
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_suspicious_heuristic() {
-        let bl = Blacklist::new();
+        let bl = ApprovalGate::new();
         let matched = bl.check("echo cm0gLXJmCg==|base64 -d|sh").unwrap();
         assert!(matched.destructive);
         assert_eq!(matched.pattern, "heuristic:suspicious");
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_performance_large_set() {
-        let mut bl = Blacklist::new();
+        let mut bl = ApprovalGate::new();
         for i in 0..1000 {
             bl.add_rule(&format!("^pattern_{}$", i)).unwrap();
         }
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_malformed_regex() {
-        let mut bl = Blacklist::new();
+        let mut bl = ApprovalGate::new();
         let res = bl.add_rule("[a-z");
         assert!(res.is_err());
     }
