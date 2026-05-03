@@ -22,6 +22,7 @@ pub const MOBILE_UUID: &str = "00000000-0000-4000-8000-000000000001";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub uuid: String,
+    pub path: PathBuf,
     pub cwd: String,
     pub ai_title: Option<String>,
     /// First real user prompt (IDE/tool wrappers stripped), used as card label fallback.
@@ -149,10 +150,36 @@ pub fn fork_session(source: &Path, target: &Path, new_uuid: &str) -> Result<Fork
 }
 
 /// Discover active desktop sessions in \`project_dir\`, excluding \`exclude_uuid\` (mobile).
+#[cfg(test)]
 pub fn detect_active_sessions(
     project_dir: &Path,
     exclude_uuid: &str,
     mtime_threshold_secs: u64,
+) -> Result<Vec<SessionInfo>> {
+    detect_sessions_with_mode(project_dir, exclude_uuid, mtime_threshold_secs, true)
+}
+
+pub fn detect_all_sessions(
+    root: &Path,
+    exclude_uuid: &str,
+    limit: usize,
+) -> Result<Vec<SessionInfo>> {
+    let mut project_dirs = Vec::new();
+    collect_project_dirs(root, &mut project_dirs)?;
+    let mut sessions = Vec::new();
+    for dir in project_dirs {
+        sessions.extend(detect_sessions_with_mode(&dir, exclude_uuid, 0, false)?);
+    }
+    sessions.sort_by_key(|session| Reverse(session.last_modified));
+    sessions.truncate(limit);
+    Ok(sessions)
+}
+
+fn detect_sessions_with_mode(
+    project_dir: &Path,
+    exclude_uuid: &str,
+    mtime_threshold_secs: u64,
+    only_active_or_fresh: bool,
 ) -> Result<Vec<SessionInfo>> {
     let mut active_uuids = std::collections::HashSet::new();
 
@@ -197,7 +224,7 @@ pub fn detect_active_sessions(
                 let is_fresh = (now - mtime).whole_seconds() < mtime_threshold_secs as i64;
                 let is_active = active_uuids.contains(stem);
 
-                if is_fresh || is_active {
+                if !only_active_or_fresh || is_fresh || is_active {
                     let file = File::open(&path)?;
                     let reader = BufReader::new(file);
 
@@ -238,6 +265,7 @@ pub fn detect_active_sessions(
 
                     sessions.push(SessionInfo {
                         uuid: stem.to_string(),
+                        path: path.clone(),
                         cwd,
                         ai_title,
                         first_prompt,
@@ -253,16 +281,56 @@ pub fn detect_active_sessions(
     Ok(sessions)
 }
 
+fn collect_project_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        if has_jsonl_session_files(&path)? {
+            out.push(path);
+        } else {
+            collect_project_dirs(&path, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn has_jsonl_session_files(dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Build the inline keyboard rows for the `/list_claude` reply card.
 /// Each row is a Vec of (button_text, callback_data) tuples.
-pub fn build_session_cards(sessions: &[SessionInfo]) -> Vec<Vec<(String, String)>> {
+#[cfg(test)]
+pub fn build_session_cards(
+    sessions: &[SessionInfo],
+    repo_prefix: &str,
+) -> Vec<Vec<(String, String)>> {
     let now = OffsetDateTime::now_utc();
     sessions
         .iter()
         .map(|s| {
             let title = pick_session_label(s);
             let rel = relative_time(now, s.last_modified);
-            let text = format!("{} · {} turns · {}", title, s.turn_count, rel);
+            let text = format!(
+                "{} · {} · {} turns · {}",
+                repo_prefix, title, s.turn_count, rel
+            );
             let data = format!("sel_claude:{}", s.uuid);
             vec![(text, data)]
         })
@@ -346,7 +414,7 @@ fn clean_prompt_snippet(text: &str) -> Option<String> {
     Some(cleaned.to_string())
 }
 
-fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
+pub(crate) fn relative_time(now: OffsetDateTime, then: OffsetDateTime) -> String {
     let secs = (now - then).whole_seconds().max(0);
     if secs < 60 {
         format!("{}s ago", secs)
@@ -649,9 +717,11 @@ mod tests {
             session.ai_title.as_deref(),
             Some("Plan Phase 4 tele-agent-bus quota rotation")
         );
-        assert!(build_session_cards(std::slice::from_ref(session))[0][0]
-            .0
-            .contains("Plan Phase 4 tele-agent-bus quota rotation"));
+        assert!(
+            build_session_cards(std::slice::from_ref(session), "repo")[0][0]
+                .0
+                .contains("Plan Phase 4 tele-agent-bus quota rotation")
+        );
     }
 
     // ── build_session_cards ────────────────────────────────────────────────
@@ -661,6 +731,7 @@ mod tests {
         let sessions = vec![
             SessionInfo {
                 uuid: "11111111-1111-1111-1111-111111111111".to_string(),
+                path: PathBuf::from("/repo/11111111-1111-1111-1111-111111111111.jsonl"),
                 cwd: "/repo".to_string(),
                 ai_title: Some("2FA implementation".to_string()),
                 first_prompt: None,
@@ -669,6 +740,7 @@ mod tests {
             },
             SessionInfo {
                 uuid: "22222222-2222-2222-2222-222222222222".to_string(),
+                path: PathBuf::from("/other/22222222-2222-2222-2222-222222222222.jsonl"),
                 cwd: "/other".to_string(),
                 ai_title: None,
                 first_prompt: None,
@@ -676,7 +748,7 @@ mod tests {
                 turn_count: 12,
             },
         ];
-        let rows = build_session_cards(&sessions);
+        let rows = build_session_cards(&sessions, "repo");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].len(), 1);
         assert!(rows[0][0].1.starts_with("sel_claude:"));
@@ -689,13 +761,14 @@ mod tests {
         // Telegram callback_data must be ≤ 64 bytes.
         let sessions = vec![SessionInfo {
             uuid: "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+            path: PathBuf::from("/a/ffffffff-ffff-ffff-ffff-ffffffffffff.jsonl"),
             cwd: "/a".to_string(),
             ai_title: None,
             first_prompt: None,
             last_modified: OffsetDateTime::now_utc(),
             turn_count: 1,
         }];
-        let rows = build_session_cards(&sessions);
+        let rows = build_session_cards(&sessions, "repo");
         assert!(rows[0][0].1.len() <= 64);
     }
 
@@ -878,7 +951,7 @@ mod tests {
             );
         }
 
-        let cards = build_session_cards(&sessions);
+        let cards = build_session_cards(&sessions, "repo");
         println!("cards:");
         for row in &cards {
             for (text, data) in row {

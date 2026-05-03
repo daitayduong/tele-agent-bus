@@ -54,7 +54,7 @@ libc = "0.2"
 rand = "0.8"
 hmac = "0.12"
 
-# Regex (blacklist matcher)
+# Regex (approval-gate matcher)
 regex = "1"
 
 # Time

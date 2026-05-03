@@ -1,6 +1,7 @@
 pub mod auth_cmds;
 pub mod claude_headless;
 pub mod cli_spawner;
+pub mod codex_app_server;
 pub mod codex_ipc;
 pub mod context_lock;
 pub mod inbox;
@@ -31,7 +32,7 @@ use teloxide::prelude::Dispatcher;
 use teloxide::types::Update;
 
 use self::cli_spawner::CliSpawner;
-use self::perm::{FsBlacklistLoader, MergedBlacklistLoader, PendingPermRegistry, PermService};
+use self::perm::{FsGateLoader, MergedGateLoader, PendingPermRegistry, PermService};
 use self::runner::{AgentRunner, EventLog, SharedAgentRunner};
 use self::telegram::{RepoEntry, TelegramConfig, TeloxideBotClient};
 
@@ -140,23 +141,23 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let bot_client: Arc<dyn telegram::BotClient> = Arc::new(TeloxideBotClient::new(bot.clone()));
 
     let etc_dir = PathBuf::from("/etc/agent-bus");
-    let global_loader = Arc::new(FsBlacklistLoader::new(
-        etc_dir.join("blacklist.conf"),
-        etc_dir.join("blacklist.conf.hmac"),
-        etc_dir.join("blacklist.key"),
+    let global_loader = Arc::new(FsGateLoader::new(
+        etc_dir.join("approval-gate.conf"),
+        etc_dir.join("approval-gate.conf.hmac"),
+        etc_dir.join("approval-gate.key"),
     ));
 
     let home_dir = config.home.clone();
     let repo_loader_fn = move |repo_id: &agent_bus_core::repo_id::RepoId| {
         let repo_dir = home_dir.join("repos").join(repo_id.as_str());
-        Arc::new(FsBlacklistLoader::new(
-            repo_dir.join("blacklist.conf"),
-            repo_dir.join("blacklist.conf.hmac"),
-            etc_dir.join("blacklist.key"),
-        )) as Arc<dyn perm::BlacklistLoader>
+        Arc::new(FsGateLoader::new(
+            repo_dir.join("approval-gate.conf"),
+            repo_dir.join("approval-gate.conf.hmac"),
+            etc_dir.join("approval-gate.key"),
+        )) as Arc<dyn perm::GateLoader>
     };
 
-    let loader = Arc::new(MergedBlacklistLoader::new(
+    let loader = Arc::new(MergedGateLoader::new(
         global_loader,
         Box::new(repo_loader_fn),
     ));
@@ -369,12 +370,14 @@ mod tests {
                         "gemini".to_string(),
                         "codex".to_string(),
                     ],
+                    codex_mode: super::telegram::CodexMode::LiveBridge,
                 },
                 RepoEntry {
                     id: "docprivy_d4e5f6a7".to_string(),
                     display: "DocPrivy".to_string(),
                     path: "/tmp/DocPrivy".to_string(),
                     agents: vec!["claude".to_string()],
+                    codex_mode: super::telegram::CodexMode::LiveBridge,
                 },
             ],
         }
@@ -388,6 +391,7 @@ mod tests {
                 display: "SampleRepo".to_string(),
                 path: path.display().to_string(),
                 agents: vec!["codex".to_string()],
+                codex_mode: super::telegram::CodexMode::LiveBridge,
             }],
         }
     }
@@ -511,6 +515,7 @@ mod tests {
                 created_at: "2026-04-16T00:00:00Z".to_string(),
                 timeout_at: "2026-04-16T00:00:10Z".to_string(),
                 message_id: Some(42),
+                prompt_text: Some("Permission requested\nCommand: rm -rf /".to_string()),
             })
             .await
             .unwrap();
@@ -543,7 +548,10 @@ mod tests {
                 .map(|perm| &perm.status),
             Some(&PendingPermStatus::DeniedByTelegram)
         );
-        assert_eq!(bot.edited_messages()[0].text, "Denied by @alice");
+        assert_eq!(
+            bot.edited_messages()[0].text,
+            "Permission requested\nCommand: rm -rf /\n\n❌ Denied by @alice"
+        );
         assert_eq!(bot.answered_callbacks(), vec!["cb-perm".to_string()]);
     }
 
@@ -562,6 +570,7 @@ mod tests {
                 created_at: "2026-04-16T00:00:00Z".to_string(),
                 timeout_at: "2026-04-16T00:00:10Z".to_string(),
                 message_id: Some(42),
+                prompt_text: None,
             })
             .await
             .unwrap();
@@ -733,7 +742,7 @@ repos:
   - id: sample_repo_a1b2c3d4
     display: SampleRepo
     path: /tmp/SampleRepo
-    agents: [claude, gemini, codex]
+    agents: [claude, gemini, antigravity, codex]
 "#,
         )
         .unwrap();

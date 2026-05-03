@@ -36,11 +36,11 @@ fn setup_test_env(bus_home: &Path, etc_dir: &Path) -> anyhow::Result<()> {
 
     fs::create_dir_all(etc_dir)?;
     fs::write(
-        etc_dir.join("blacklist.key"),
+        etc_dir.join("approval-gate.key"),
         "01234567890123456789012345678901",
     )?;
     fs::set_permissions(
-        etc_dir.join("blacklist.key"),
+        etc_dir.join("approval-gate.key"),
         fs::Permissions::from_mode(0o640),
     )?;
 
@@ -61,20 +61,20 @@ fn test_cli_add_per_repo_writes_user_owned_file() -> anyhow::Result<()> {
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path()); // Custom env var for testing
-    cmd.args(["blacklist", "add", "--repo", "sample_repo", "^git push"]);
+    cmd.args(["gate", "add", "--repo", "sample_repo", "^git push"]);
     cmd.assert().success();
 
-    let blacklist_path = bus_home.join("repos/sample_repo/blacklist.conf");
-    let hmac_path = bus_home.join("repos/sample_repo/blacklist.conf.hmac");
+    let gate_path = bus_home.join("repos/sample_repo/approval-gate.conf");
+    let hmac_path = bus_home.join("repos/sample_repo/approval-gate.conf.hmac");
 
-    assert!(blacklist_path.exists());
+    assert!(gate_path.exists());
     assert!(hmac_path.exists());
 
     // On Unix, check ownership
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = fs::metadata(&blacklist_path)?;
+        let meta = fs::metadata(&gate_path)?;
         assert_eq!(meta.uid(), nix::unistd::geteuid().as_raw());
         assert_eq!(meta.gid(), nix::unistd::getegid().as_raw());
         use std::os::unix::fs::PermissionsExt;
@@ -92,18 +92,18 @@ fn test_cli_add_per_repo_fails_when_key_unreadable() -> anyhow::Result<()> {
     setup_test_env(&bus_home, etc_tmp.path())?;
 
     // Make key unreadable
-    let key_path = etc_tmp.path().join("blacklist.key");
+    let key_path = etc_tmp.path().join("approval-gate.key");
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o000))?;
 
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args(["blacklist", "add", "--repo", "sample_repo", "^git push"]);
+    cmd.args(["gate", "add", "--repo", "sample_repo", "^git push"]);
 
     cmd.assert()
         .failure()
         .stderr(predicates::str::contains(
-            "cannot read /etc/agent-bus/blacklist.key",
+            "cannot read /etc/agent-bus/approval-gate.key",
         ))
         .stderr(predicates::str::contains(
             "add current user to the agent-bus group",
@@ -126,20 +126,14 @@ fn test_cli_list_per_repo_no_sudo_required() -> anyhow::Result<()> {
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args([
-        "blacklist",
-        "add",
-        "--repo",
-        "sample_repo",
-        "secret-pattern",
-    ]);
+    cmd.args(["gate", "add", "--repo", "sample_repo", "secret-pattern"]);
     cmd.assert().success();
 
     // Now list it
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args(["blacklist", "list", "--repo", "sample_repo"]);
+    cmd.args(["gate", "list", "--repo", "sample_repo"]);
 
     cmd.assert()
         .success()
@@ -158,7 +152,7 @@ fn test_cli_add_rejects_unknown_repo() -> anyhow::Result<()> {
     let mut cmd = Command::cargo_bin("agent-bus").unwrap();
     cmd.env("AGENT_BUS_HOME", &bus_home);
     cmd.env("AGENT_BUS_ETC_DIR", etc_tmp.path());
-    cmd.args(["blacklist", "add", "--repo", "nonexistent-repo", "pattern"]);
+    cmd.args(["gate", "add", "--repo", "nonexistent-repo", "pattern"]);
 
     cmd.assert()
         .failure()

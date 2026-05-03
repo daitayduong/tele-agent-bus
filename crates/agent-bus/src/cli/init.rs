@@ -29,7 +29,7 @@ log_level: info
 permissions:
   timeout_seconds: 30
   fail_mode: hybrid
-  blacklist_file: ~/.agent-bus/blacklist.txt
+  gate_file: ~/.agent-bus/gate.txt
 agents: {}
 repos: []
 "#;

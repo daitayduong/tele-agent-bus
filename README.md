@@ -9,7 +9,9 @@ Multi-agent orchestration daemon (Claude Code / Gemini CLI / Codex CLI) over Tel
 A global daemon at `~/.agent-bus/` that:
 - Serves multiple projects (repos) from one always-on process
 - Routes Telegram commands to the right agent in the right repo
-- Gates dangerous Bash commands via a blacklist + Telegram approval UI
+- Intercepts Bash, Write, Edit, and MultiEdit commands from Claude Code and routes them through an approval gate + Telegram approval UI
+- Bridges Codex App Server turns in isolated mode (`codex_mode: app_server`)
+- Bridges Gemini CLI headless sessions
 - Runs independently of any IDE
 
 ## Workspace layout
@@ -17,7 +19,7 @@ A global daemon at `~/.agent-bus/` that:
 ```
 crates/
 ├── agent-bus-proto/    Wire types only. No runtime deps. Embedded by hook binary.
-├── agent-bus-core/     Shared logic: config, state actor, blacklist, redaction, path validation.
+├── agent-bus-core/     Shared logic: config, state actor, approval gate, redaction, path validation.
 ├── agent-bus-hook/     Minimal hook binary (cold-start <50ms, size <2MB).
 └── agent-bus/          Main daemon + CLI.
 ```
@@ -145,7 +147,23 @@ agent-bus repo add /path/to/project
 agent-bus repo list
 ```
 
-If you want Claude Code Bash permission approvals to go through Telegram, install the hook in that project:
+`agent-bus repo add` defaults Codex to `live_bridge`. If you want a repo to use
+the App Server-owned Codex flow instead, edit `~/.agent-bus/repos.yaml` and set:
+
+```yaml
+repos:
+  - id: tele-agent-bus_5979e1d0
+    display: tele-agent-bus
+    path: /home/you/Projects/tele-agent-bus
+    agents: [claude, gemini, antigravity, codex]
+    codex_mode: app_server
+```
+
+Available values:
+- `live_bridge`: follow the currently open desktop Codex session. This is the default.
+- `app_server`: let `agent-bus` own the Codex turn through `codex app-server`.
+
+To route Claude Code Bash commands through the approval gate, install the hook in that project:
 
 ```bash
 agent-bus repo install-hook /path/to/project
@@ -157,16 +175,72 @@ After adding or removing repos, restart the daemon so Telegram sees the updated 
 systemctl --user restart agent-bus
 ```
 
+## Approval Gate
+
+The approval gate intercepts Bash, Write, Edit, and MultiEdit commands from Claude Code before they execute.
+When a command matches a pattern in the gate, the daemon sends a Telegram
+message with **Approve** and **Deny** buttons. Commands that do not match any
+pattern are silently approved.
+
+Gate rules live in two places:
+- **`/etc/agent-bus/approval-gate.conf`** — global, requires `sudo`
+- **`~/.agent-bus/repos/<id>/approval-gate.conf`** — per-repo, no `sudo`
+
+Both files are HMAC-signed — tampering causes fail-closed denial of all commands.
+
+### Adding rules
+
+```bash
+# --destructive: deny when daemon is unreachable (fail-closed)
+sudo agent-bus gate add '(^|\s)rm\s+-[rRfF]' --destructive
+sudo agent-bus gate add 'git\s+reset\s+--hard' --destructive
+sudo agent-bus gate add 'git\s+push\s+.*--force' --destructive
+sudo agent-bus gate add '(^|\s)dd\s+if=' --destructive
+
+# Without --destructive: approve silently when daemon is unreachable
+sudo agent-bus gate add 'npm\s+run\s+deploy'
+
+# Per-repo rule (no sudo)
+agent-bus gate add --repo my-project '^make\s+deploy' --destructive
+```
+
+### Managing rules
+
+```bash
+sudo agent-bus gate list
+sudo agent-bus gate remove '<pattern>'
+sudo agent-bus gate verify        # check HMAC integrity
+```
+
+### Installing the hook
+
+The gate only applies to projects with the hook installed:
+
+```bash
+agent-bus repo install-hook /path/to/project
+```
+
+This adds a `PreToolUse` entry to `.claude/settings.json`. Restart Claude Code
+in that project after installing. Other agents (Gemini, Codex, Antigravity)
+use their own internal approval mechanisms and do not route through this gate.
+
+See `docs/per-repo-approval-gate.md` for file format, merge semantics, and
+fail behavior details.
+
 ## Telegram Commands
 
+- `/help` lists all available commands as inline buttons you can tap to run.
 - `/switch_rp` shows repository buttons and sets the current chat's default repo.
 - `/switch_rp <repo_id>` switches directly to a repo without showing the picker.
 - `/current` shows the current default repo.
 - `/list_claude` lists Claude desktop sessions for the current repo.
 - `/list_codex` lists Codex desktop sessions for the current repo.
-- `/list_gemini` reports that Gemini desktop session bridging is not implemented yet.
+- `/list_gemini` lists Gemini sessions for the current repo.
 - `@claude <message>` sends a message to the selected Claude session.
 - `@codex <message>` sends a message to the selected Codex session.
+  With `codex_mode: live_bridge` (default), agent-bus follows the live desktop-owned bridge.
+  With `codex_mode: app_server`, agent-bus owns the Codex turn via `codex app-server` with `sandbox=false`, isolated per turn.
+- `@gemini <message>` resumes the selected Gemini session. If none is selected yet, it falls back to headless Gemini CLI in the current default repo. Gemini uses `--approval-mode plan` by default.
 - `@agent:<repo_id> <message>` routes explicitly to a repo and bypasses the default repo selection.
 
 See `docs/setup-telegram.md` for the detailed Telegram setup flow.
@@ -174,7 +248,7 @@ See `docs/setup-windows.md` for the experimental Windows setup flow.
 
 ## Security disclaimer
 
-The permission-gate blacklist is a **heuristic UX guardrail**, not a sandbox. It is trivially bypassable by shell quoting, command substitution, aliases, interpreters, or encoded payloads. Do not rely on it as a security boundary against adversarial code. See spec §10.1.
+The approval-gate is a **heuristic UX guardrail**, not a sandbox. It is trivially bypassable by shell quoting, command substitution, aliases, interpreters, or encoded payloads. Do not rely on it as a security boundary against adversarial code. See spec §10.1.
 
 ## Build
 

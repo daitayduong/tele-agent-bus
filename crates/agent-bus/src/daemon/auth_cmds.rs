@@ -101,7 +101,7 @@ async fn parse_agent_for_command<B: BotClient + ?Sized>(
         Err(_) => {
             bot.send_message(
                 chat_id,
-                "Usage: agent must be one of claude, codex, gemini".to_string(),
+                "Usage: agent must be one of claude, codex, gemini, antigravity".to_string(),
                 None,
             )
             .await?;

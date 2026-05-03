@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::cli::get_bus_home;
+use crate::daemon::telegram::CodexMode;
 
-const DEFAULT_AGENTS: &[&str] = &["claude", "gemini", "codex"];
+const DEFAULT_AGENTS: &[&str] = &["claude", "gemini", "antigravity", "codex"];
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ReposFile {
@@ -26,6 +27,8 @@ struct RepoEntry {
     path: String,
     #[serde(default)]
     agents: Vec<String>,
+    #[serde(default)]
+    codex_mode: CodexMode,
 }
 
 fn default_schema_version() -> u32 {
@@ -82,6 +85,7 @@ fn add_inner(path: &str, home: &Path, bus_home: &Path) -> anyhow::Result<()> {
         display: display.clone(),
         path: canonical.to_string_lossy().into_owned(),
         agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
+        codex_mode: CodexMode::LiveBridge,
     });
 
     write_repos(&repos_path, &file)?;

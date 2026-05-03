@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context};
 use serde::Deserialize;
 
 use crate::cli::get_bus_home;
+use crate::daemon::telegram::CodexMode;
 
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
@@ -35,6 +36,8 @@ struct RepoEntry {
     path: String,
     #[serde(default)]
     agents: Vec<String>,
+    #[serde(default)]
+    codex_mode: CodexMode,
 }
 
 pub fn show() -> anyhow::Result<()> {
@@ -95,6 +98,9 @@ fn validate_inner(bus: &Path) -> anyhow::Result<()> {
         }
         if repo.agents.is_empty() {
             return Err(anyhow!("repos.yaml: repo {} has no agents", repo.id));
+        }
+        match repo.codex_mode {
+            CodexMode::LiveBridge | CodexMode::AppServer => {}
         }
     }
 
@@ -181,5 +187,22 @@ mod tests {
 
         let err = validate_inner(bus.path()).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn validate_accepts_explicit_codex_mode() {
+        let bus = tempfile::tempdir().unwrap();
+        std::fs::write(
+            bus.path().join("config.yaml"),
+            "telegram:\n  bot_token: abc\n  allowed_chats: [\"1\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bus.path().join("repos.yaml"),
+            "repos:\n  - id: a\n    display: A\n    path: /tmp/a\n    agents: [codex]\n    codex_mode: app_server\n",
+        )
+        .unwrap();
+
+        validate_inner(bus.path()).unwrap();
     }
 }

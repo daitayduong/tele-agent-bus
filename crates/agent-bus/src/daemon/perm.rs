@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent_bus_core::blacklist::Blacklist;
+use agent_bus_core::approval_gate::ApprovalGate;
 use agent_bus_core::repo_id::RepoId;
 use agent_bus_core::state::{PendingPerm, PendingPermStatus, ResolvePendingOutcome, StateHandle};
 use agent_bus_proto::{
@@ -16,21 +16,21 @@ use super::telegram::{
     pending_perm_status_text, send_perm_prompt, BotClient, MessageRef, TelegramConfig,
 };
 
-const BLACKLIST_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const APPROVAL_GATE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-pub trait BlacklistLoader: Send + Sync {
+pub trait GateLoader: Send + Sync {
     fn load(&self) -> anyhow::Result<Vec<String>>;
     fn modified(&self) -> anyhow::Result<Option<SystemTime>>;
 }
 
 #[derive(Debug, Clone)]
-pub struct FsBlacklistLoader {
+pub struct FsGateLoader {
     conf_path: PathBuf,
     hmac_path: PathBuf,
     key_path: PathBuf,
 }
 
-impl FsBlacklistLoader {
+impl FsGateLoader {
     pub fn new(conf_path: PathBuf, hmac_path: PathBuf, key_path: PathBuf) -> Self {
         Self {
             conf_path,
@@ -40,23 +40,23 @@ impl FsBlacklistLoader {
     }
 }
 
-impl BlacklistLoader for FsBlacklistLoader {
+impl GateLoader for FsGateLoader {
     fn load(&self) -> anyhow::Result<Vec<String>> {
         if !self.conf_path.exists() {
             return Ok(Vec::new());
         }
-        agent_bus_core::blacklist_integrity::load_and_verify(
+        agent_bus_core::approval_gate_integrity::load_and_verify(
             &self.conf_path,
             &self.hmac_path,
             &self.key_path,
         )
         .map_err(|e| {
             tracing::warn!(
-                event = "blacklist_integrity_failed",
+                event = "approval_gate_integrity_failed",
                 path = ?self.conf_path,
                 error = %e
             );
-            anyhow::anyhow!("blacklist integrity failed: {}", e)
+            anyhow::anyhow!("gate integrity failed: {}", e)
         })
     }
 
@@ -67,15 +67,15 @@ impl BlacklistLoader for FsBlacklistLoader {
     }
 }
 
-pub struct MergedBlacklistLoader {
-    global_loader: Arc<dyn BlacklistLoader>,
+pub struct MergedGateLoader {
+    global_loader: Arc<dyn GateLoader>,
     repo_loader_fn: RepoLoaderFn,
 }
 
-type RepoLoaderFn = Box<dyn Fn(&RepoId) -> Arc<dyn BlacklistLoader> + Send + Sync>;
+type RepoLoaderFn = Box<dyn Fn(&RepoId) -> Arc<dyn GateLoader> + Send + Sync>;
 
-impl MergedBlacklistLoader {
-    pub fn new(global_loader: Arc<dyn BlacklistLoader>, repo_loader_fn: RepoLoaderFn) -> Self {
+impl MergedGateLoader {
+    pub fn new(global_loader: Arc<dyn GateLoader>, repo_loader_fn: RepoLoaderFn) -> Self {
         Self {
             global_loader,
             repo_loader_fn,
@@ -140,13 +140,13 @@ pub struct PermService {
     state: StateHandle,
     telegram_config: Arc<TelegramConfig>,
     bot: Arc<dyn BotClient>,
-    loader: Arc<MergedBlacklistLoader>,
+    loader: Arc<MergedGateLoader>,
     registry: PendingPermRegistry,
-    cache: Arc<Mutex<HashMap<String, BlacklistCache>>>,
+    cache: Arc<Mutex<HashMap<String, GateCache>>>,
 }
 
 #[derive(Debug, Default, Clone)]
-struct BlacklistCache {
+struct GateCache {
     lines: Vec<String>,
     modified: Option<SystemTime>,
     last_checked: Option<SystemTime>,
@@ -158,7 +158,7 @@ impl PermService {
         state: StateHandle,
         telegram_config: Arc<TelegramConfig>,
         bot: Arc<dyn BotClient>,
-        loader: Arc<MergedBlacklistLoader>,
+        loader: Arc<MergedGateLoader>,
         registry: PendingPermRegistry,
         timeout: Duration,
     ) -> Self {
@@ -192,31 +192,31 @@ impl PermService {
             .map(|s| RepoId::new(s.to_string()))
             .transpose()?;
 
-        let lines = match self.blacklist_lines_for(repo_id.as_ref()).await {
+        let lines = match self.gate_lines_for(repo_id.as_ref()).await {
             Ok(lines) => lines,
             Err(err) => {
-                tracing::error!("CRITICAL: blacklist integrity failure: {err}");
+                tracing::error!("CRITICAL: gate integrity failure: {err}");
                 return Ok(response(
                     &req,
                     Decision::Deny,
-                    "blacklist_tampered",
+                    "approval_gate_tampered",
                     None,
                     true,
                 ));
             }
         };
 
-        let mut blacklist = Blacklist::new();
+        let mut gate = ApprovalGate::new();
         for line in lines {
-            blacklist.add_rule(&line)?;
+            gate.add_rule(&line)?;
         }
-        blacklist.compile()?;
+        gate.compile()?;
 
-        let Some(rule) = blacklist.check(&req.command) else {
+        let Some(rule) = gate.check(&req.command) else {
             return Ok(response(
                 &req,
                 Decision::Approve,
-                "no_blacklist_match",
+                "no_gate_match",
                 None,
                 false,
             ));
@@ -236,23 +236,26 @@ impl PermService {
             created_at: now,
             timeout_at,
             message_id: None,
+            prompt_text: None,
         };
         self.state.insert_pending(pending).await?;
 
-        let message = send_perm_prompt(
+        let sent = send_perm_prompt(
             self.bot.as_ref(),
             &self.telegram_config,
             &request_repo_id(&req),
             &id,
+            &req.command,
             &command_hash,
             &rule.pattern,
         )
         .await?;
-        if let Some(message) = message {
+        if let Some((message, prompt_text)) = sent {
             let mut snapshot = self.state.snapshot().await;
             if let Some(perm) = snapshot.pending_perms.get_mut(&id) {
                 perm.status = PendingPermStatus::Sent;
                 perm.message_id = Some(message.message_id);
+                perm.prompt_text = Some(prompt_text);
                 self.state.insert_pending(perm.clone()).await?;
             }
         }
@@ -382,7 +385,7 @@ impl PermService {
         Ok(())
     }
 
-    async fn blacklist_lines_for(&self, repo_id: Option<&RepoId>) -> anyhow::Result<Vec<String>> {
+    async fn gate_lines_for(&self, repo_id: Option<&RepoId>) -> anyhow::Result<Vec<String>> {
         let now = SystemTime::now();
         let cache_key = repo_id
             .map(|id| id.to_string())
@@ -391,12 +394,12 @@ impl PermService {
         let cache = cache_map.entry(cache_key).or_default();
 
         if cache.tampered {
-            anyhow::bail!("blacklist_tampered");
+            anyhow::bail!("approval_gate_tampered");
         }
         let should_check = cache
             .last_checked
             .and_then(|checked| now.duration_since(checked).ok())
-            .map_or(true, |elapsed| elapsed >= BLACKLIST_POLL_INTERVAL);
+            .map_or(true, |elapsed| elapsed >= APPROVAL_GATE_POLL_INTERVAL);
 
         if !cache.lines.is_empty() && !should_check {
             return Ok(cache.lines.clone());
@@ -477,8 +480,8 @@ fn is_cached_destructive(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::telegram::{MockBot, RepoEntry, TelegramConfig};
-    use agent_bus_core::blacklist_integrity;
+    use crate::daemon::telegram::{CodexMode, MockBot, RepoEntry, TelegramConfig};
+    use agent_bus_core::approval_gate_integrity;
     use std::path::Path;
 
     #[derive(Clone)]
@@ -487,7 +490,7 @@ mod tests {
         err: Option<&'static str>,
     }
 
-    impl BlacklistLoader for StaticLoader {
+    impl GateLoader for StaticLoader {
         fn load(&self) -> anyhow::Result<Vec<String>> {
             if let Some(err) = self.err {
                 anyhow::bail!(err);
@@ -507,6 +510,7 @@ mod tests {
                 display: "SampleRepo".to_string(),
                 path: "/tmp/SampleRepo".to_string(),
                 agents: vec![],
+                codex_mode: CodexMode::LiveBridge,
             }],
         })
     }
@@ -524,13 +528,13 @@ mod tests {
         }
     }
 
-    fn write_blacklist_triplet(dir: &Path, name: &str, body: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
+    fn write_gate_triplet(dir: &Path, name: &str, body: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
         let conf_path = dir.join(format!("{}.conf", name));
         let hmac_path = dir.join(format!("{}.conf.hmac", name));
-        let key_path = dir.join("blacklist.key");
+        let key_path = dir.join("approval-gate.key");
         let key = b"01234567890123456789012345678901";
         std::fs::write(&key_path, key).unwrap();
-        let sig = blacklist_integrity::compute_hmac(key, body);
+        let sig = approval_gate_integrity::compute_hmac(key, body);
 
         std::fs::write(&conf_path, body).unwrap();
         std::fs::write(&hmac_path, sig).unwrap();
@@ -541,12 +545,12 @@ mod tests {
     #[test]
     fn test_fs_loader_accepts_valid_triplet() {
         let dir = tempfile::tempdir().unwrap();
-        let (conf_path, hmac_path, key_path) = write_blacklist_triplet(
+        let (conf_path, hmac_path, key_path) = write_gate_triplet(
             dir.path(),
-            "blacklist",
+            "gate",
             b"rm\\s+-rf\tdestructive\n^git push --force\n",
         );
-        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+        let loader = FsGateLoader::new(conf_path, hmac_path, key_path);
 
         let patterns = loader.load().unwrap();
 
@@ -563,9 +567,9 @@ mod tests {
     fn test_fs_loader_rejects_tampered_conf() {
         let dir = tempfile::tempdir().unwrap();
         let (conf_path, hmac_path, key_path) =
-            write_blacklist_triplet(dir.path(), "blacklist", b"rm\\s+-rf\tdestructive\n");
+            write_gate_triplet(dir.path(), "gate", b"rm\\s+-rf\tdestructive\n");
         std::fs::write(&conf_path, b"git\\s+push\\s+--force\tdestructive\n").unwrap();
-        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+        let loader = FsGateLoader::new(conf_path, hmac_path, key_path);
 
         assert!(loader.load().is_err());
     }
@@ -574,9 +578,9 @@ mod tests {
     fn test_fs_loader_rejects_missing_hmac() {
         let dir = tempfile::tempdir().unwrap();
         let (conf_path, hmac_path, key_path) =
-            write_blacklist_triplet(dir.path(), "blacklist", b"rm\\s+-rf\tdestructive\n");
+            write_gate_triplet(dir.path(), "gate", b"rm\\s+-rf\tdestructive\n");
         std::fs::remove_file(&hmac_path).unwrap();
-        let loader = FsBlacklistLoader::new(conf_path, hmac_path, key_path);
+        let loader = FsGateLoader::new(conf_path, hmac_path, key_path);
 
         assert!(loader.load().is_err());
     }
@@ -592,7 +596,7 @@ mod tests {
             lines: vec![r"rm\s+-rf	destructive".to_string()],
             err: None,
         });
-        let loader = Arc::new(MergedBlacklistLoader::new(
+        let loader = Arc::new(MergedGateLoader::new(
             global_loader,
             Box::new(|_| {
                 Arc::new(StaticLoader {
@@ -617,7 +621,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.verdict, Decision::Approve);
-        assert_eq!(resp.reason, "no_blacklist_match");
+        assert_eq!(resp.reason, "no_gate_match");
     }
 
     #[tokio::test]
@@ -630,7 +634,7 @@ mod tests {
             lines: vec![r"rm\s+-rf	destructive".to_string()],
             err: None,
         });
-        let loader = Arc::new(MergedBlacklistLoader::new(
+        let loader = Arc::new(MergedGateLoader::new(
             global_loader,
             Box::new(|_| {
                 Arc::new(StaticLoader {
@@ -678,7 +682,7 @@ mod tests {
             lines: vec![r"git\s+push\s+--force".to_string()],
             err: None,
         });
-        let loader = Arc::new(MergedBlacklistLoader::new(
+        let loader = Arc::new(MergedGateLoader::new(
             global_loader,
             Box::new(|_| {
                 Arc::new(StaticLoader {
@@ -732,7 +736,7 @@ mod tests {
             lines: vec![r"git\s+push\s+--force".to_string()],
             err: None,
         });
-        let loader = Arc::new(MergedBlacklistLoader::new(
+        let loader = Arc::new(MergedGateLoader::new(
             global_loader,
             Box::new(|_| {
                 Arc::new(StaticLoader {
@@ -795,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tampered_blacklist_denies_all() {
+    async fn tampered_gate_denies_all() {
         let dir = tempfile::tempdir().unwrap();
         let state = agent_bus_core::state::spawn_state_actor(dir.path().join("state.json"))
             .await
@@ -804,7 +808,7 @@ mod tests {
             lines: vec![],
             err: Some("hmac mismatch"),
         });
-        let loader = Arc::new(MergedBlacklistLoader::new(
+        let loader = Arc::new(MergedGateLoader::new(
             global_loader,
             Box::new(|_| {
                 Arc::new(StaticLoader {
@@ -828,7 +832,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.verdict, Decision::Deny);
-        assert_eq!(resp.reason, "blacklist_tampered");
+        assert_eq!(resp.reason, "approval_gate_tampered");
     }
 
     #[test]
@@ -842,7 +846,7 @@ mod tests {
             err: None,
         };
 
-        let loader = MergedBlacklistLoader::new(
+        let loader = MergedGateLoader::new(
             Arc::new(global_loader),
             Box::new(move |_| Arc::new(repo_loader.clone())),
         );
@@ -865,7 +869,7 @@ mod tests {
             lines: vec![],
             err: Some("tampered"),
         };
-        let loader = Arc::new(MergedBlacklistLoader::new(
+        let loader = Arc::new(MergedGateLoader::new(
             global_loader,
             Box::new(move |_| Arc::new(repo_loader.clone())),
         ));
@@ -883,7 +887,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.verdict, Decision::Deny);
-        assert_eq!(resp.reason, "blacklist_tampered");
+        assert_eq!(resp.reason, "approval_gate_tampered");
     }
 
     #[test]
@@ -895,7 +899,7 @@ mod tests {
         // This loader will simulate a file not found error, which should be handled gracefully.
         #[derive(Clone, Copy)]
         struct MissingFileLoader;
-        impl BlacklistLoader for MissingFileLoader {
+        impl GateLoader for MissingFileLoader {
             fn load(&self) -> anyhow::Result<Vec<String>> {
                 Ok(vec![])
             }
@@ -905,7 +909,7 @@ mod tests {
         }
         let repo_loader = MissingFileLoader;
 
-        let loader = MergedBlacklistLoader::new(
+        let loader = MergedGateLoader::new(
             Arc::new(global_loader),
             Box::new(move |_| Arc::new(repo_loader)),
         );
@@ -928,7 +932,7 @@ mod tests {
             lines: vec!["repo_rule".to_string()],
             err: None,
         };
-        let loader = Arc::new(MergedBlacklistLoader::new(
+        let loader = Arc::new(MergedGateLoader::new(
             global_loader,
             Box::new(move |_| Arc::new(repo_loader.clone())),
         ));
@@ -945,6 +949,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.verdict, Decision::Deny);
-        assert_eq!(resp.reason, "blacklist_tampered");
+        assert_eq!(resp.reason, "approval_gate_tampered");
     }
 }

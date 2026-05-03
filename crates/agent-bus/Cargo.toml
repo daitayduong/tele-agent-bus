@@ -36,6 +36,8 @@ hex = { workspace = true }
 time = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
+base64 = "0.21"
+rusqlite = { version = "0.31", features = ["bundled"] }
 shellexpand = "3.1.2"
 fs2 = "0.4"
 

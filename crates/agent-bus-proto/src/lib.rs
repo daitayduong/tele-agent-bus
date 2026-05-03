@@ -139,7 +139,7 @@ mod tests {
             request_id: "req-123".to_string(),
             req_id: "req-server-123".to_string(),
             verdict: Decision::Approve,
-            reason: "not blacklisted".to_string(),
+            reason: "not gated".to_string(),
             matched_pattern: None,
             destructive: false,
         };

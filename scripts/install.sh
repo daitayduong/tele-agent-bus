@@ -17,31 +17,31 @@ fi
 echo "Creating /etc/agent-bus..."
 install -d -o root -g agent-bus -m 2750 /etc/agent-bus
 
-# Initialize blacklist if binary is present
+# Initialize approval-gate if binary is present
 if [ -f "/usr/local/bin/agent-bus" ]; then
-  echo "Initializing blacklist via binary..."
-  /usr/local/bin/agent-bus blacklist init
+  echo "Initializing approval-gate via binary..."
+  /usr/local/bin/agent-bus gate init
   # Binary creates files with root's primary group; fix to agent-bus
-  chgrp agent-bus /etc/agent-bus/blacklist.conf /etc/agent-bus/blacklist.conf.hmac /etc/agent-bus/blacklist.key 2>/dev/null || true
+  chgrp agent-bus /etc/agent-bus/approval-gate.conf /etc/agent-bus/approval-gate.conf.hmac /etc/agent-bus/approval-gate.key 2>/dev/null || true
 else
   echo "Binary not found at /usr/local/bin/agent-bus, performing manual init..."
-  if [ ! -f "/etc/agent-bus/blacklist.key" ]; then
-    dd if=/dev/urandom of=/etc/agent-bus/blacklist.key bs=32 count=1 status=none
-    chmod 0640 /etc/agent-bus/blacklist.key
-    chown root:agent-bus /etc/agent-bus/blacklist.key
+  if [ ! -f "/etc/agent-bus/approval-gate.key" ]; then
+    dd if=/dev/urandom of=/etc/agent-bus/approval-gate.key bs=32 count=1 status=none
+    chmod 0640 /etc/agent-bus/approval-gate.key
+    chown root:agent-bus /etc/agent-bus/approval-gate.key
   fi
-  
-  if [ ! -f "/etc/agent-bus/blacklist.conf" ]; then
-    touch /etc/agent-bus/blacklist.conf
-    chmod 0640 /etc/agent-bus/blacklist.conf
-    chown root:agent-bus /etc/agent-bus/blacklist.conf
-    
+
+  if [ ! -f "/etc/agent-bus/approval-gate.conf" ]; then
+    touch /etc/agent-bus/approval-gate.conf
+    chmod 0640 /etc/agent-bus/approval-gate.conf
+    chown root:agent-bus /etc/agent-bus/approval-gate.conf
+
     # Simple HMAC if binary missing (requires openssl)
-    KEY_HEX=$(xxd -p -c 32 /etc/agent-bus/blacklist.key)
+    KEY_HEX=$(xxd -p -c 32 /etc/agent-bus/approval-gate.key)
     HMAC=$(echo -n "" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$KEY_HEX" | sed 's/.*= //')
-    echo -n "$HMAC" > /etc/agent-bus/blacklist.conf.hmac
-    chmod 0640 /etc/agent-bus/blacklist.conf.hmac
-    chown root:agent-bus /etc/agent-bus/blacklist.conf.hmac
+    echo -n "$HMAC" > /etc/agent-bus/approval-gate.conf.hmac
+    chmod 0640 /etc/agent-bus/approval-gate.conf.hmac
+    chown root:agent-bus /etc/agent-bus/approval-gate.conf.hmac
   fi
 fi
 

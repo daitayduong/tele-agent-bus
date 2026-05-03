@@ -1,5 +1,5 @@
+pub mod approval_gate;
 pub mod auth;
-pub mod blacklist;
 pub mod config;
 pub mod init;
 pub mod repo;

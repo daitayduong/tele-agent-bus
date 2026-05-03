@@ -91,12 +91,24 @@ Send these commands to your bot:
 /current
 /list_claude
 /list_codex
+/list_gemini
+@flush_gemini
 @claude hello from Windows
 @codex hello from Windows
+@gemini hello from Windows
 ```
 
-If `@claude` or `@codex` fails, confirm the matching CLI is installed and
+If `@claude`, `@codex`, or `@gemini` fails, confirm the matching CLI is installed and
 available in the same PowerShell `PATH` used to start the daemon.
+
+Use `/list_gemini` to choose a Gemini session for the current repo. After that,
+`@gemini <message>` resumes the selected session. If none is selected yet,
+`@gemini` falls back to headless Gemini CLI in the current default repo.
+
+Gemini uses `--approval-mode plan` by default. Override with
+`AGENT_BUS_GEMINI_APPROVAL_MODE` only if you understand the tool-approval
+tradeoff. `@flush_gemini` is informational only because this bridge is
+resume-based and does not maintain transcript sync files.
 
 ## Persistent Environment
 
