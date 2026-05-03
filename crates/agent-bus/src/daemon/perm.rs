@@ -236,23 +236,26 @@ impl PermService {
             created_at: now,
             timeout_at,
             message_id: None,
+            prompt_text: None,
         };
         self.state.insert_pending(pending).await?;
 
-        let message = send_perm_prompt(
+        let sent = send_perm_prompt(
             self.bot.as_ref(),
             &self.telegram_config,
             &request_repo_id(&req),
             &id,
+            &req.command,
             &command_hash,
             &rule.pattern,
         )
         .await?;
-        if let Some(message) = message {
+        if let Some((message, prompt_text)) = sent {
             let mut snapshot = self.state.snapshot().await;
             if let Some(perm) = snapshot.pending_perms.get_mut(&id) {
                 perm.status = PendingPermStatus::Sent;
                 perm.message_id = Some(message.message_id);
+                perm.prompt_text = Some(prompt_text);
                 self.state.insert_pending(perm.clone()).await?;
             }
         }

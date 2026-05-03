@@ -44,20 +44,16 @@ async fn main() {
 
 async fn run() -> Result<Verdict, HookError> {
     let input = read_input()?;
-    let command = input
-        .pointer("/tool_input/command")
-        .or_else(|| input.get("command"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| HookError::Config("missing tool_input.command".to_string()))?;
+    let command = build_command(&input)?;
 
     let socket = socket_path()?;
     if !socket.exists() {
-        return Ok(local_fallback(command, "socket missing"));
+        return Ok(local_fallback(&command, "socket missing"));
     }
 
     let mut last_err = "connect failed".to_string();
     for _ in 0..3 {
-        match ask_daemon(&socket, &input, command).await {
+        match ask_daemon(&socket, &input, &command).await {
             Ok(verdict) => return Ok(verdict),
             Err(HookError::Protocol(err)) => return Err(HookError::Protocol(err)),
             Err(err) => {
@@ -66,7 +62,106 @@ async fn run() -> Result<Verdict, HookError> {
             }
         }
     }
-    Ok(local_fallback(command, &last_err))
+    Ok(local_fallback(&command, &last_err))
+}
+
+fn build_command(input: &Value) -> Result<String, HookError> {
+    let tool = input
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("Bash");
+
+    match tool {
+        "Write" => {
+            let file_path = input
+                .pointer("/tool_input/file_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HookError::Config("missing tool_input.file_path".to_string()))?;
+            let content = input
+                .pointer("/tool_input/content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Ok(format!(
+                "Write {file_path} ({bytes} bytes)\n──── content ────\n{preview}\n──── end ────",
+                bytes = content.len(),
+                preview = preview_text(content, 600),
+            ))
+        }
+        "Edit" => {
+            let file_path = input
+                .pointer("/tool_input/file_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HookError::Config("missing tool_input.file_path".to_string()))?;
+            let old_str = input
+                .pointer("/tool_input/old_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let new_str = input
+                .pointer("/tool_input/new_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let replace_all = input
+                .pointer("/tool_input/replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let scope = if replace_all { " (replace_all)" } else { "" };
+            Ok(format!(
+                "Edit {file_path}{scope} (-{old_b} +{new_b} bytes)\n──── old ────\n{old_p}\n──── new ────\n{new_p}\n──── end ────",
+                old_b = old_str.len(),
+                new_b = new_str.len(),
+                old_p = preview_text(old_str, 300),
+                new_p = preview_text(new_str, 300),
+            ))
+        }
+        "MultiEdit" => {
+            let file_path = input
+                .pointer("/tool_input/file_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HookError::Config("missing tool_input.file_path".to_string()))?;
+            let edits = input
+                .pointer("/tool_input/edits")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut body = format!("MultiEdit {file_path} ({} edits)", edits.len());
+            for (i, edit) in edits.iter().enumerate() {
+                let old_str = edit
+                    .get("old_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let new_str = edit
+                    .get("new_string")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                body.push_str(&format!(
+                    "\n──── edit {idx}: -{old_b} +{new_b} bytes ────\nOLD:\n{old_p}\nNEW:\n{new_p}",
+                    idx = i + 1,
+                    old_b = old_str.len(),
+                    new_b = new_str.len(),
+                    old_p = preview_text(old_str, 200),
+                    new_p = preview_text(new_str, 200),
+                ));
+            }
+            body.push_str("\n──── end ────");
+            Ok(body)
+        }
+        _ => input
+            .pointer("/tool_input/command")
+            .or_else(|| input.pointer("/tool_input/file_path"))
+            .or_else(|| input.get("command"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| HookError::Config("missing tool_input.command".to_string())),
+    }
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{truncated}…(truncated, {} bytes total)", text.len())
+    }
 }
 
 fn read_input() -> Result<Value, HookError> {
@@ -114,7 +209,7 @@ fn build_request_body(input: &Value, command: &str) -> Value {
         "tool": input.get("tool_name").and_then(Value::as_str).unwrap_or("Bash"),
         "command": command,
         "repo_id": input.get("cwd").and_then(Value::as_str).and_then(repo_hint),
-        "timeout_ms": 30000
+        "timeout_ms": 300000
     })
 }
 

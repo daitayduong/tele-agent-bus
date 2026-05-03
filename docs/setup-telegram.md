@@ -88,9 +88,18 @@ Optional, for Claude Code Bash permission approvals through Telegram:
 agent-bus repo install-hook /path/to/project
 ```
 
-Codex uses `live_bridge` by default. To switch one repo to the App Server-owned
-Codex flow, edit `~/.agent-bus/repos.yaml` and add `codex_mode: app_server`
-under that repo entry, then restart the daemon.
+Codex defaults to `live_bridge`, which follows the currently open desktop session.
+To switch a repo to the isolated App Server-owned Codex flow instead, edit
+`~/.agent-bus/repos.yaml` and set `codex_mode: app_server` under that repo,
+then restart the daemon.
+
+### Codex App Server Mode
+
+The `app_server` mode spawns `codex app-server --listen stdio:// -c sandbox=false`
+in a dedicated process per turn, rather than following a live desktop session.
+This is useful when the desktop session is unavailable or you want isolated,
+turn-scoped execution. The daemon owns the turn lifecycle: `initialize` →
+`resume thread` → `start turn` → poll for output/approvals → `turn/completed`.
 
 ## Step 6 - Verify and start
 
@@ -152,9 +161,13 @@ systemctl --user restart agent-bus
 
 ## Step 8 - Set up the approval gate (optional)
 
-The approval gate intercepts Bash commands from Claude Code and sends a
-Telegram message with **Approve** / **Deny** buttons before the command runs.
+The approval gate intercepts Bash, Write, Edit, and MultiEdit commands from Claude Code
+and sends a Telegram message with **Approve** / **Deny** buttons before execution.
 Commands that do not match any pattern are silently approved.
+
+The hook waits up to 180 seconds for the daemon (or longer if configured via
+`~/.agent-bus/config.yaml` → `permissions.timeout_seconds`). The daemon default
+is 30s. Effective timeout = min(hook_timeout_ms, daemon_timeout_seconds * 1000).
 
 Initialize the gate and add your first rules (requires `sudo`):
 

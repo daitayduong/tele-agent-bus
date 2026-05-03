@@ -53,6 +53,28 @@ pub struct StateSnapshot {
     // Phase 5 additions:
     #[serde(default)]
     pub bridged_sessions: BTreeMap<String, BTreeMap<String, BridgedSessionState>>,
+    /// User-selected model per chat per agent. Outer key is chat_id, inner
+    /// key is the agent kind (e.g. "antigravity"). Empty/missing means the
+    /// agent uses its default.
+    #[serde(default)]
+    pub selected_model_by_chat: BTreeMap<String, BTreeMap<String, String>>,
+    /// Pending Antigravity tool approval prompts that have been forwarded to
+    /// Telegram and are awaiting a user click. Key is a short approval id
+    /// embedded in the inline button callback data.
+    #[serde(default)]
+    pub pending_antigravity_approvals: BTreeMap<String, PendingAntigravityApprovalEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingAntigravityApprovalEntry {
+    pub chat_id: String,
+    pub repo_id: String,
+    pub cascade_id: String,
+    pub trajectory_id: String,
+    pub step_index: i64,
+    pub kind: String,
+    pub summary: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,6 +208,8 @@ pub struct PendingPerm {
     pub created_at: String,
     pub timeout_at: String,
     pub message_id: Option<i32>,
+    #[serde(default)]
+    pub prompt_text: Option<String>,
 }
 
 impl Default for StateSnapshot {
@@ -202,6 +226,8 @@ impl Default for StateSnapshot {
             pending_rotations: BTreeMap::new(),
             lead_overrides: LeadOverrides::default(),
             bridged_sessions: BTreeMap::new(),
+            selected_model_by_chat: BTreeMap::new(),
+            pending_antigravity_approvals: BTreeMap::new(),
         }
     }
 }
@@ -286,6 +312,21 @@ enum StateCmd {
     },
     ClearLeadForChat {
         chat_id: String,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    SetSelectedModel {
+        chat_id: String,
+        agent: String,
+        model: Option<String>,
+        reply: oneshot::Sender<Result<(), StateError>>,
+    },
+    InsertPendingAntigravityApproval {
+        approval_id: String,
+        entry: PendingAntigravityApprovalEntry,
+        reply: oneshot::Sender<Result<bool, StateError>>,
+    },
+    RemovePendingAntigravityApproval {
+        approval_id: String,
         reply: oneshot::Sender<Result<(), StateError>>,
     },
 }
@@ -521,6 +562,64 @@ impl StateHandle {
         rx.await.map_err(|_| StateError::ActorClosed)?
     }
 
+    /// Set or clear the user-selected model for a (chat, agent) pair.
+    /// Pass `None` to clear and fall back to the agent's default.
+    pub async fn set_selected_model(
+        &self,
+        chat_id: impl Into<String>,
+        agent: impl Into<String>,
+        model: Option<String>,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::SetSelectedModel {
+                chat_id: chat_id.into(),
+                agent: agent.into(),
+                model,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    /// Atomically insert a pending approval entry IF the approval_id is not
+    /// already present. Returns `Ok(true)` if a new entry was inserted, or
+    /// `Ok(false)` if an entry under the same id already exists. The check
+    /// and the insert are serialized through the state actor, so concurrent
+    /// callers cannot both observe "absent" and both insert.
+    pub async fn insert_pending_antigravity_approval(
+        &self,
+        approval_id: impl Into<String>,
+        entry: PendingAntigravityApprovalEntry,
+    ) -> Result<bool, StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::InsertPendingAntigravityApproval {
+                approval_id: approval_id.into(),
+                entry,
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
+    pub async fn remove_pending_antigravity_approval(
+        &self,
+        approval_id: impl Into<String>,
+    ) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(StateCmd::RemovePendingAntigravityApproval {
+                approval_id: approval_id.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StateError::ActorClosed)?;
+        rx.await.map_err(|_| StateError::ActorClosed)?
+    }
+
     pub async fn resolve_lead(&self, chat_id: impl AsRef<str>) -> Option<AgentKind> {
         let snapshot = self.snapshot.read().await;
         snapshot
@@ -677,6 +776,53 @@ pub async fn spawn_state_actor(path: PathBuf) -> Result<StateHandle, StateError>
                     let result = publish_and_flush(&actor_snapshot, &path, &state).await;
                     let _ = reply.send(result);
                 }
+                StateCmd::SetSelectedModel {
+                    chat_id,
+                    agent,
+                    model,
+                    reply,
+                } => {
+                    let entry = state
+                        .selected_model_by_chat
+                        .entry(chat_id.clone())
+                        .or_default();
+                    match model {
+                        Some(m) if !m.trim().is_empty() => {
+                            entry.insert(agent, m);
+                        }
+                        _ => {
+                            entry.remove(&agent);
+                            if entry.is_empty() {
+                                state.selected_model_by_chat.remove(&chat_id);
+                            }
+                        }
+                    }
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
+                StateCmd::InsertPendingAntigravityApproval {
+                    approval_id,
+                    entry,
+                    reply,
+                } => {
+                    let was_absent = !state
+                        .pending_antigravity_approvals
+                        .contains_key(&approval_id);
+                    if was_absent {
+                        state
+                            .pending_antigravity_approvals
+                            .insert(approval_id, entry);
+                        let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                        let _ = reply.send(result.map(|()| true));
+                    } else {
+                        let _ = reply.send(Ok(false));
+                    }
+                }
+                StateCmd::RemovePendingAntigravityApproval { approval_id, reply } => {
+                    state.pending_antigravity_approvals.remove(&approval_id);
+                    let result = publish_and_flush(&actor_snapshot, &path, &state).await;
+                    let _ = reply.send(result);
+                }
             }
         }
     });
@@ -800,6 +946,7 @@ mod tests {
             created_at: "2026-04-16T00:00:00Z".to_string(),
             timeout_at: "2026-04-16T00:00:10Z".to_string(),
             message_id: None,
+            prompt_text: None,
         }
     }
 
@@ -983,6 +1130,43 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(reloaded.lead_overrides.default.as_deref(), Some("codex"));
         assert!(!reloaded.lead_overrides.per_chat.contains_key("123"));
+    }
+
+    #[tokio::test]
+    async fn selected_model_persists_and_can_be_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+
+        handle
+            .set_selected_model("123", "antigravity", Some("gemini-3-flash".to_string()))
+            .await
+            .unwrap();
+
+        let snap = handle.snapshot().await;
+        assert_eq!(
+            snap.selected_model_by_chat["123"]["antigravity"],
+            "gemini-3-flash"
+        );
+
+        drop(handle);
+        let reloaded: StateSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.selected_model_by_chat["123"]["antigravity"],
+            "gemini-3-flash"
+        );
+
+        let handle = spawn_state_actor(path.clone()).await.unwrap();
+        handle
+            .set_selected_model("123", "antigravity", None)
+            .await
+            .unwrap();
+        drop(handle);
+
+        let reloaded: StateSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!reloaded.selected_model_by_chat.contains_key("123"));
     }
 
     #[tokio::test]

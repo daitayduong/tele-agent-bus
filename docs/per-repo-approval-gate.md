@@ -4,9 +4,41 @@ The agent-bus supports per-repository approval gates, which allow for more granu
 
 ## How It Works
 
-When an agent (currently Claude Code) runs a Bash command, the `agent-bus-hook` binary intercepts it and sends it to the daemon via a Unix socket. The daemon checks whether the command matches any pattern in the approval gate. If it matches, the daemon sends a Telegram message with **Approve** and **Deny** buttons. If no pattern matches, the command is silently approved.
+When an agent (currently Claude Code) runs a Bash, Write, Edit, or MultiEdit command,
+the `agent-bus-hook` binary intercepts it and sends it to the daemon via a Unix socket.
+The daemon first checks if the command is suspicious (contains `base64`, `eval`, `$()`,
+backticks, `|sh`, `|bash`, `|python`, or `exec`); if so, it treats it as destructive
+and always requires approval. Otherwise, the daemon checks whether the command matches
+any pattern in the approval gate (global + per-repo union). If it matches, the daemon
+sends a Telegram message with **Approve** and **Deny** buttons; if no pattern matches,
+the command is silently approved.
 
-The hook is installed per-project via `agent-bus repo install-hook <path>`, which writes a `PreToolUse` entry into `.claude/settings.json`. Other agents (Gemini, Codex, Antigravity) use their own internal approval systems and do not route through the agent-bus gate today.
+Approved/denied commands are recorded in the Telegram chat with full original context
+appended: `✅ Approved by @user` or `❌ Denied by @user`. This creates an audit trail.
+
+The hook is installed per-project via `agent-bus repo install-hook <path>`, which writes
+a `PreToolUse` entry into `.claude/settings.json`. Other agents (Gemini, Codex,
+Antigravity) use their own internal approval systems and do not route through the
+agent-bus gate today.
+
+## Suspicious Command Heuristic
+
+Before checking against any approval gate patterns, the daemon runs a **suspicious pattern check**:
+any command containing the following substrings is automatically flagged as destructive and requires approval:
+
+```
+base64
+eval
+$(         (command substitution)
+`          (backtick substitution)
+|sh        (pipe to shell)
+|bash      (pipe to bash)
+|python    (pipe to python)
+exec       (exec invocation)
+```
+
+This heuristic bypasses all gate patterns and runs BEFORE per-repo/global gate regex matching.
+It catches encoded and indirect invocations that the gate patterns might miss.
 
 ## File Format
 

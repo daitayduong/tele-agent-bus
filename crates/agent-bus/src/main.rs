@@ -6,7 +6,11 @@ mod daemon;
 
 use crate::cli::approval_gate::GateCommands;
 use crate::cli::auth::RegisterArgs;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use fs2::FileExt;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "agent-bus")]
@@ -89,7 +93,7 @@ enum ConfigCommands {
     Validate,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -131,6 +135,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Daemon => {
             tracing_subscriber::fmt::init();
             let config = daemon::load_daemon_config()?;
+            let _daemon_lock = acquire_daemon_singleton_lock(&config.home)?;
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
@@ -139,4 +144,27 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn acquire_daemon_singleton_lock(home: &Path) -> Result<File> {
+    std::fs::create_dir_all(home)
+        .with_context(|| format!("failed to create agent-bus home {}", home.display()))?;
+    let lock_path = home.join("daemon.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open daemon lock {}", lock_path.display()))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(lock),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            anyhow::bail!(
+                "agent-bus daemon is already running (lock held at {})",
+                lock_path.display()
+            );
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to lock daemon lock {}", lock_path.display()))
+        }
+    }
 }

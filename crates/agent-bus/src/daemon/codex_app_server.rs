@@ -323,27 +323,30 @@ impl CodexAppServerClient {
             created_at: now,
             timeout_at: now_plus_string(APPROVAL_TIMEOUT),
             message_id: None,
+            prompt_text: None,
         };
         state
             .insert_pending(pending)
             .await
             .map_err(|err| format!("failed to persist pending approval: {err}"))?;
 
-        let message = send_perm_prompt(
+        let sent = send_perm_prompt(
             bot,
             config,
             &repo.id,
             &perm_id,
+            command,
             &command_hash,
             &rule.pattern,
         )
         .await
         .map_err(|err| format!("failed to send Telegram approval prompt: {err}"))?;
-        if let Some(message) = message {
+        if let Some((message, prompt_text)) = sent {
             let mut snapshot = state.snapshot().await;
             if let Some(perm) = snapshot.pending_perms.get_mut(&perm_id) {
                 perm.status = PendingPermStatus::Sent;
                 perm.message_id = Some(message.message_id);
+                perm.prompt_text = Some(prompt_text);
                 state
                     .insert_pending(perm.clone())
                     .await

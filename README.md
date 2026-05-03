@@ -9,7 +9,9 @@ Multi-agent orchestration daemon (Claude Code / Gemini CLI / Codex CLI) over Tel
 A global daemon at `~/.agent-bus/` that:
 - Serves multiple projects (repos) from one always-on process
 - Routes Telegram commands to the right agent in the right repo
-- Gates dangerous Bash commands via an approval gate + Telegram approval UI
+- Intercepts Bash, Write, Edit, and MultiEdit commands from Claude Code and routes them through an approval gate + Telegram approval UI
+- Bridges Codex App Server turns in isolated mode (`codex_mode: app_server`)
+- Bridges Gemini CLI headless sessions
 - Runs independently of any IDE
 
 ## Workspace layout
@@ -175,7 +177,7 @@ systemctl --user restart agent-bus
 
 ## Approval Gate
 
-The approval gate intercepts Bash commands from Claude Code before they run.
+The approval gate intercepts Bash, Write, Edit, and MultiEdit commands from Claude Code before they execute.
 When a command matches a pattern in the gate, the daemon sends a Telegram
 message with **Approve** and **Deny** buttons. Commands that do not match any
 pattern are silently approved.
@@ -236,9 +238,9 @@ fail behavior details.
 - `/list_gemini` lists Gemini sessions for the current repo.
 - `@claude <message>` sends a message to the selected Claude session.
 - `@codex <message>` sends a message to the selected Codex session.
-  With `codex_mode: live_bridge`, agent-bus uses the live desktop bridge.
-  With `codex_mode: app_server`, agent-bus resumes the selected thread through Codex App Server.
-- `@gemini <message>` resumes the selected Gemini session. If none is selected yet, it falls back to headless Gemini CLI in the current default repo.
+  With `codex_mode: live_bridge` (default), agent-bus follows the live desktop-owned bridge.
+  With `codex_mode: app_server`, agent-bus owns the Codex turn via `codex app-server` with `sandbox=false`, isolated per turn.
+- `@gemini <message>` resumes the selected Gemini session. If none is selected yet, it falls back to headless Gemini CLI in the current default repo. Gemini uses `--approval-mode plan` by default.
 - `@agent:<repo_id> <message>` routes explicitly to a repo and bypasses the default repo selection.
 
 See `docs/setup-telegram.md` for the detailed Telegram setup flow.

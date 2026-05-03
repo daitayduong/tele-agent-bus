@@ -515,6 +515,7 @@ mod tests {
                 created_at: "2026-04-16T00:00:00Z".to_string(),
                 timeout_at: "2026-04-16T00:00:10Z".to_string(),
                 message_id: Some(42),
+                prompt_text: Some("Permission requested\nCommand: rm -rf /".to_string()),
             })
             .await
             .unwrap();
@@ -547,7 +548,10 @@ mod tests {
                 .map(|perm| &perm.status),
             Some(&PendingPermStatus::DeniedByTelegram)
         );
-        assert_eq!(bot.edited_messages()[0].text, "Denied by @alice");
+        assert_eq!(
+            bot.edited_messages()[0].text,
+            "Permission requested\nCommand: rm -rf /\n\n❌ Denied by @alice"
+        );
         assert_eq!(bot.answered_callbacks(), vec!["cb-perm".to_string()]);
     }
 
@@ -566,6 +570,7 @@ mod tests {
                 created_at: "2026-04-16T00:00:00Z".to_string(),
                 timeout_at: "2026-04-16T00:00:10Z".to_string(),
                 message_id: Some(42),
+                prompt_text: None,
             })
             .await
             .unwrap();

@@ -49,6 +49,8 @@ struct AntigravitySessionRecord {
 static ANTIGRAVITY_DB_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 static ANTIGRAVITY_BRAIN_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+pub(crate) static ANTIGRAVITY_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn parse_bridge_command(text: &str) -> Option<BridgeCommand> {
     let trimmed = text.trim();
@@ -143,6 +145,46 @@ pub fn parse_callback_data(data: &str) -> Option<(AgentKind, String)> {
     None
 }
 
+/// Locate the gemini chats directory for a given repo. Gemini stores per-repo
+/// chats under `~/.gemini/tmp/<repo_basename>/chats/`.
+pub fn gemini_chats_dir_for(repo_path: &Path) -> Option<PathBuf> {
+    let basename = repo_path.file_name().and_then(|name| name.to_str())?;
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(
+        home.join(".gemini")
+            .join("tmp")
+            .join(basename)
+            .join("chats"),
+    )
+}
+
+/// Find the most recently modified gemini chat session for the given repo and
+/// return its full sessionId. Used after a headless run so we can save the
+/// just-created session to the bridge — `gemini --list-sessions` does not
+/// guarantee newest-first ordering, so file mtime is more reliable.
+pub fn find_latest_gemini_session_id(repo_path: &Path) -> Option<String> {
+    let dir = gemini_chats_dir_for(repo_path)?;
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            newest = Some((mtime, path));
+        }
+    }
+    let (_, path) = newest?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 pub fn parse_gemini_list_sessions(output: &str, limit: usize) -> Vec<GeminiSessionInfo> {
     let mut sessions = Vec::new();
     for line in output.lines() {
@@ -200,11 +242,21 @@ pub fn detect_antigravity_sessions(
 
     let repo_path = repo_path.map(normalize_path_text);
     if let Some(repo_path) = repo_path.as_ref() {
-        sessions.retain(|session| {
-            session
-                .repo_path
-                .as_deref()
-                .is_some_and(|path| normalize_path_text(path) == *repo_path)
+        let prefix = format!("{repo_path}/");
+        sessions.retain_mut(|session| {
+            let Some(path) = session.repo_path.as_deref() else {
+                return false;
+            };
+            let normalized = normalize_path_text(path);
+            if normalized == *repo_path || normalized.starts_with(&prefix) {
+                // Normalize the session's repo_path to the actual repo root so
+                // the display prefix matches the user's repo (not the file's
+                // parent dir extracted from the antigravity overview).
+                session.repo_path = Some(repo_path.clone());
+                true
+            } else {
+                false
+            }
         });
     }
 
@@ -275,10 +327,14 @@ fn read_antigravity_summary_sessions() -> anyhow::Result<Vec<AntigravitySessionR
             continue;
         };
 
-        let title = strings
-            .iter()
-            .find_map(|s| pick_antigravity_title_candidate(s))
-            .map(|title| title.to_string());
+        // Prefer the AI-generated title from the inner base64 protobuf; fall
+        // back to the heuristic candidate scan when the structure changes.
+        let title = extract_antigravity_summary_title(entry).or_else(|| {
+            strings
+                .iter()
+                .find_map(|s| pick_antigravity_title_candidate(s))
+                .map(|title| title.to_string())
+        });
 
         sessions.push(AntigravitySessionRecord {
             id,
@@ -450,6 +506,77 @@ pub(crate) fn set_antigravity_brain_root_override(path: Option<PathBuf>) {
     *ANTIGRAVITY_BRAIN_OVERRIDE
         .lock()
         .expect("antigravity brain override lock poisoned") = path;
+}
+
+/// Parse protobuf and return only length-delimited fields with their field
+/// numbers. Skips other wire types so callers can index into specific fields.
+fn protobuf_tagged_len_fields(bytes: &[u8]) -> Vec<(u64, &[u8])> {
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let Some(tag) = read_varint(bytes, &mut idx) else {
+            break;
+        };
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x07;
+        match wire_type {
+            0 => {
+                if read_varint(bytes, &mut idx).is_none() {
+                    break;
+                }
+            }
+            1 => {
+                if idx + 8 > bytes.len() {
+                    break;
+                }
+                idx += 8;
+            }
+            2 => {
+                let Some(len) = read_varint(bytes, &mut idx) else {
+                    break;
+                };
+                let len = len as usize;
+                if idx + len > bytes.len() {
+                    break;
+                }
+                out.push((field_num, &bytes[idx..idx + len]));
+                idx += len;
+            }
+            5 => {
+                if idx + 4 > bytes.len() {
+                    break;
+                }
+                idx += 4;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Extract the AI-generated title from an Antigravity trajectorySummaries
+/// entry. The structure is:
+///   Entry { 1: session_id, 2: Wrapper { 1: base64-encoded protobuf } }
+///   Decoded inner protobuf: { 1: title (utf-8) }
+fn extract_antigravity_summary_title(entry: &[u8]) -> Option<String> {
+    let wrapper = protobuf_tagged_len_fields(entry)
+        .into_iter()
+        .find_map(|(num, bytes)| if num == 2 { Some(bytes) } else { None })?;
+    let b64 = protobuf_tagged_len_fields(wrapper)
+        .into_iter()
+        .find_map(|(num, bytes)| if num == 1 { Some(bytes) } else { None })?;
+    let b64_text = std::str::from_utf8(b64).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64_text.trim())
+        .ok()?;
+    let title_bytes = protobuf_tagged_len_fields(&decoded)
+        .into_iter()
+        .find_map(|(num, bytes)| if num == 1 { Some(bytes) } else { None })?;
+    let title = std::str::from_utf8(title_bytes).ok()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.to_string())
 }
 
 fn protobuf_len_fields(bytes: &[u8]) -> Vec<&[u8]> {
@@ -1918,6 +2045,7 @@ mod tests {
 
     #[test]
     fn test_detect_antigravity_gemini_sessions_filters_repo_and_decodes_title() {
+        let _guard = ANTIGRAVITY_OVERRIDE_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.vscdb");
         let conn = Connection::open(&db_path).unwrap();
